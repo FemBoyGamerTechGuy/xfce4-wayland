@@ -1,0 +1,60 @@
+XFCE-WAYLAND PROPRIETARY SOURCE LICENSE, VERSION 1.0
+
+Copyright (c) 2026 The xfce4-wayland Project Authors.
+All rights reserved.
+
+1. DEFINITIONS
+
+  "Software" means this source code tree and all original computer code,
+  build scripts, documentation, and other works of authorship contained
+  in this repository that are not covered by Section 5 (Third-Party
+  Materials).
+
+  "Licensor" means the copyright holders of the Software.
+
+  "You" means any person or entity that obtains a copy of the Software.
+
+2. GRANT
+
+  Subject to the terms below, the Licensor grants You a limited,
+  non-exclusive, non-transferable, non-sublicensable license to:
+
+  (a) use, compile, and internally test the Software for evaluation and
+      development purposes; and
+  (b) create derivative works of the Software for Your own internal use,
+      provided such derivatives retain this license text and all
+      copyright notices.
+
+3. RESTRICTIONS
+
+  You may NOT:
+  (a) redistribute, publish, sublicense, sell, lease, or otherwise make
+      the Software or derivatives of it available to third parties,
+      whether in source or binary form, without prior written permission
+      of the Licensor;
+  (b) remove or obscure any copyright, attribution, or license notice
+      contained in the Software.
+
+4. NO WARRANTY
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+  OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+  CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION
+  WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+5. THIRD-PARTY MATERIALS
+
+  This repository contains, vendors, or builds against third-party
+  material governed by its own license (including permissively licensed
+  Wayland protocol definitions and build-time libraries). Those licenses
+  remain in force and are NOT superseded by this license. Nothing in
+  this license changes the licensing of third-party code, and no
+  third-party code is claimed as proprietary. See the file
+  THIRD-PARTY-LICENSES.md for the complete provenance and license audit
+  of all third-party material.
+
+6. CONTACT
+
+  Licensing inquiries: open an issue in the project issue tracker.
