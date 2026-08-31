@@ -102,6 +102,8 @@ void xwt_pump(struct xwt_ctx *t);
         _ok;                                                                  \
     })
 
+const char *g_runtimedir(void);
+
 /* test registration */
 struct xwt_test {
     const char *name;

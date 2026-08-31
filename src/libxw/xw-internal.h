@@ -407,6 +407,7 @@ struct xw_layer_surface {
     struct { int top, right, bottom, left; } margin;
     bool keyboard_interactivity;
     int configured_w, configured_h;
+    bool configured_sent;       /* initial configure answered a commit */
 
     int x, y, w, h;               /* current geometry, global coords */
     bool mapped;

@@ -589,6 +589,11 @@ void xwc_layer_resize(struct xwc_layer *l, int w, int h) {
     zwlr_layer_surface_v1_set_size(l->ls, w, h);
 }
 
+void xwc_layer_set_keyboard(struct xwc_layer *l, uint32_t mode) {
+    if (l->ls)
+        zwlr_layer_surface_v1_set_keyboard_interactivity(l->ls, mode);
+}
+
 /* ------------------------------------------------------ input routing */
 
 void xwc_input_key(struct xwc *c, uint32_t keycode, bool down,

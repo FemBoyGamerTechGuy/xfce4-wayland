@@ -172,6 +172,7 @@ static int reap_children(int sig, void *data) {
 static void on_repaint_idle(void *data) {
     struct xw_compositor *c = data;
     c->repaint_scheduled = false;
+    c->repaint_idle = NULL; /* idle sources free themselves after dispatch */
     struct xw_output *o;
     wl_list_for_each(o, &c->outputs, link) {
         if (pixman_region_not_empty(&o->damage))

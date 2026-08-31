@@ -58,6 +58,8 @@ static void pointer_release(struct wl_client *client, struct wl_resource *res) {
 
 /* ------------------------------------------------------------ wl_seat */
 
+static void send_modifiers(struct xw_seat *s);
+
 static void seat_get_pointer(struct wl_client *client, struct wl_resource *res,
                              uint32_t id) {
     struct xw_seat *s = wl_resource_get_user_data(res);
@@ -95,6 +97,17 @@ static void seat_get_keyboard(struct wl_client *client, struct wl_resource *res,
         }
         wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd,
                                 (uint32_t)s->keymap_len);
+    }
+    /* if this client already owns keyboard focus (surface mapped and
+     * focused before the keyboard object existed), send enter now */
+    if (s->kb_focus &&
+        wl_resource_get_client(s->kb_focus->res) == client) {
+        struct wl_array empty;
+        wl_array_init(&empty);
+        wl_keyboard_send_enter(k, ++s->serial, s->kb_focus->res, &empty);
+        wl_array_release(&empty);
+        s->sent_depressed = ~0u; /* force modifiers re-send */
+        send_modifiers(s);
     }
 }
 
@@ -239,6 +252,12 @@ void xw_seat_set_kb_focus(struct xw_seat *s, struct xw_surface *surface) {
     s->kb_focus = surface;
     if (newc) {
         struct wl_resource *k;
+        int nkb = 0;
+        wl_list_for_each(k, &s->keyboards, link)
+            if (wl_resource_get_client(k) == newc)
+                nkb++;
+        fprintf(stderr, "[kdbg] enter: focus client %p has %d keyboards\n",
+                (void*)newc, nkb);
         wl_list_for_each(k, &s->keyboards, link) {
             if (wl_resource_get_client(k) == newc) {
                 struct wl_array empty;

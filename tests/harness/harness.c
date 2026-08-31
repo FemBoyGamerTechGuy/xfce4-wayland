@@ -8,7 +8,9 @@ int xwt_failures = 0;
 int xwt_tests = 0;
 const char *xwt_current = "?";
 
-static char g_runtimedir[128];
+static char s_runtimedir[128];
+
+const char *g_runtimedir(void) { return s_runtimedir; }
 
 #define XWT_MAX_TESTS 64
 static struct xwt_test g_tests[XWT_MAX_TESTS];
@@ -44,11 +46,11 @@ int xwt_begin(struct xwt_ctx *t, const char *config_dir) {
     snprintf(t->socket_name, sizeof(t->socket_name), "xwt-%d-%d", getpid(),
              instance++);
 
-    if (!g_runtimedir[0]) {
-        snprintf(g_runtimedir, sizeof(g_runtimedir), "/tmp/xwt-%d", getpid());
-        mkdir(g_runtimedir, 0700);
+    if (!s_runtimedir[0]) {
+        snprintf(s_runtimedir, sizeof(s_runtimedir), "/tmp/xwt-%d", getpid());
+        mkdir(s_runtimedir, 0700);
     }
-    setenv("XDG_RUNTIME_DIR", g_runtimedir, 1);
+    setenv("XDG_RUNTIME_DIR", s_runtimedir, 1);
 
     struct xw_compositor_config cfg = {0};
     cfg.config_dir = config_dir;

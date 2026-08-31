@@ -54,9 +54,21 @@ static struct xw_layer_surface *ls_from_res(struct wl_resource *res) {
 static void ls_configure(struct xw_layer_surface *ls) {
     if (!ls->res || !ls->surface)
         return;
+    int w = ls->configured_w, h = ls->configured_h;
+    uint32_t a = ls->anchors;
+    struct xw_output *o = ls->output;
+    if (o) {
+        /* anchored to both edges: the compositor dictates the size */
+        if ((a & ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT) &&
+            (a & ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT))
+            w = o->width - ls->margin.left - ls->margin.right;
+        if ((a & ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP) &&
+            (a & ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM))
+            h = o->height - ls->margin.top - ls->margin.bottom;
+    }
     uint32_t serial = wl_display_next_serial(ls->comp->display);
-    zwlr_layer_surface_v1_send_configure(ls->res, serial, ls->configured_w,
-                                         ls->configured_h);
+    zwlr_layer_surface_v1_send_configure(ls->res, serial, (uint32_t)w,
+                                         (uint32_t)h);
     ls->surface->pending_config = true;
     ls->surface->pending_serial = serial;
 }
@@ -130,6 +142,10 @@ static void ls_set_anchor(struct wl_client *client, struct wl_resource *res,
         ls_configure(ls);
         xw_wm_recalculate_usable(ls->comp->wm);
         xw_damage_outputs_rect(ls->comp, ls->x, ls->y, ls->w, ls->h);
+    } else if (ls->configured_sent) {
+        /* anchors changed before mapping: update the pending configure
+         * so the client sizes itself against the new geometry */
+        ls_configure(ls);
     }
 }
 
@@ -283,9 +299,9 @@ static void shell_get_layer_surface(struct wl_client *client,
     wl_list_insert(c->wm->layers[layer].prev, &ls->link);
     s->role = XW_SURFACE_ROLE_LAYER;
     s->role_data = ls;
-
-    /* initial configure: 0,0 lets the client pick its size */
-    ls_configure(ls);
+    /* no configure here: the client sends anchor/margin/size requests
+     * first and commits; the configure is sent in response (with the
+     * size computed from the anchors) */
 }
 
 static void shell_destroy(struct wl_client *client, struct wl_resource *res) {
@@ -317,11 +333,25 @@ void xw_layer_role_commit(struct xw_surface *s) {
     struct xw_layer_surface *ls = s->role_data;
     if (!ls)
         return;
+    if (!ls->configured_sent) {
+        /* first commit: respond with the configure (anchor-derived
+         * size when anchored to opposite edges) */
+        ls->configured_sent = true;
+        ls_configure(ls);
+        return;
+    }
     ls_layout(ls);
     if (!ls->mapped) {
-        /* first commit with a buffer maps the layer surface */
+        /* a commit with a buffer maps the layer surface */
         if (s->buf_w > 0 || s->buf_h > 0 || ls->configured_w > 0) {
             ls->mapped = true;
+            /* a keyboard-interactivity layer claims the keyboard when
+             * it maps (the request typically arrives before mapping) */
+            if (ls->keyboard_interactivity) {
+                struct xw_seat *seat = xw_seat_first(s->comp);
+                if (seat)
+                    xw_seat_set_kb_focus(seat, s);
+            }
             xw_wm_recalculate_usable(s->comp->wm);
             xw_damage_outputs_rect(s->comp, ls->x, ls->y, ls->w, ls->h);
         }

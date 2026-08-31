@@ -104,8 +104,15 @@ $(OBJ)/gen/%-protocol.o: $(GEN)/%-protocol.c | $(OBJ)/gen
 LIBXWCL_SRC := $(wildcard src/libxwcl/*.c)
 LIBXWCL_OBJ := $(patsubst src/libxwcl/%.c,$(OBJ)/libxwcl/%.o,$(LIBXWCL_SRC))
 
-build/lib/libxwcl.a: $(LIBXWCL_OBJ) | build/lib
-	$(AR) rcs $@ $(LIBXWCL_OBJ)
+LIBXWCL_PROTO := $(OBJ)/gen/xdg-shell-protocol.o \
+	$(OBJ)/gen/xdg-activation-protocol.o \
+	$(OBJ)/gen/wlr-layer-shell-unstable-v1-protocol.o \
+	$(OBJ)/gen/wlr-foreign-toplevel-management-unstable-v1-protocol.o \
+	$(OBJ)/gen/ext-workspace-protocol.o \
+	$(OBJ)/gen/single-pixel-buffer-protocol.o
+
+build/lib/libxwcl.a: $(LIBXWCL_OBJ) $(LIBXWCL_PROTO) | build/lib
+	$(AR) rcs $@ $(LIBXWCL_OBJ) $(LIBXWCL_PROTO)
 
 $(OBJ)/libxwcl/%.o: src/libxwcl/%.c src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/libxwcl
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLC) $(CFLAGS_PIX) -c $< -o $@
@@ -129,13 +136,13 @@ $(OBJ)/session/%.o: src/session/%.c | $(OBJ)/session
 # ---------------------------------------------------------------- clients
 
 build/bin/xw-panel: $(OBJ)/clients/xw-panel.o build/lib/libxwcl.a | build/bin
-	$(CC) -o $@ $(OBJ)/clients/xw-panel.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_PIX) $(LDLIBS_M)
+	$(CC) -o $@ $(OBJ)/clients/xw-panel.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
 
 build/bin/xw-exit: $(OBJ)/clients/xw-exit.o build/lib/libxwcl.a | build/bin
-	$(CC) -o $@ $(OBJ)/clients/xw-exit.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_PIX) $(LDLIBS_M)
+	$(CC) -o $@ $(OBJ)/clients/xw-exit.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
 
 build/bin/xw-demo: $(OBJ)/clients/xw-demo.o build/lib/libxwcl.a | build/bin
-	$(CC) -o $@ $(OBJ)/clients/xw-demo.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_PIX) $(LDLIBS_M)
+	$(CC) -o $@ $(OBJ)/clients/xw-demo.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
 
 $(OBJ)/clients/%.o: src/clients/%.c src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/clients
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLC) $(CFLAGS_PIX) -c $< -o $@

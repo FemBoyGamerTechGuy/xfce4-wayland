@@ -107,6 +107,8 @@ bool xwc_win_mapped(struct xwc_win *w);
 struct xwc_layer *xwc_layer_create(struct xwc *c, const struct xwc_callbacks *cb,
                                   uint32_t layer, uint32_t anchors,
                                   int exclusive_zone, int w, int h);
+/* 0 = none, 1 = exclusive, 2 = on-demand (must precede mapping) */
+void xwc_layer_set_keyboard(struct xwc_layer *l, uint32_t mode);
 void xwc_layer_destroy(struct xwc_layer *l);
 uint32_t *xwc_layer_pixels(struct xwc_layer *l, int *stride);
 void xwc_layer_commit(struct xwc_layer *l);
