@@ -37,7 +37,7 @@ for status and what remains, and [BUILDING.md](BUILDING.md) to build it.
 | Session manager | `xw-session` | Session lifecycle, autostart, supervision, power actions |
 | Session control CLI | `xw-session-ctl` | Scriptable session commands (logout/restart/shutdown/...) |
 | Exit dialog | `xw-exit` | Graphical session-exit dialog |
-| Panel | `xw-panel` | *(planned — M8)* Layer-shell panel: workspaces, taskbar, launcher, clock |
+| Panel | `xw-panel` | Layer-shell desktop bar: workspace switcher, tasklist, launcher, clock, exit button |
 | Demo client | `xw-demo` | *(planned)* Test/demo toplevel client for development |
 
 ## Quick start (development)
@@ -53,11 +53,12 @@ make asan               # full sanitizer regression pass
 ## Status
 
 Early-stage but functional: the compositor core, window manager,
-shortcut engine, session manager, and graphical exit dialog exist and
-pass an automated suite (16 in-process tests + 18 process-level
-checks, ASAN/UBSAN/LSAN-clean). The panel is the next milestone. The
-[ROADMAP](ROADMAP.md) tracks remaining XFCE feature parity honestly —
-incomplete features are listed, never silently omitted.
+shortcut engine, session manager, graphical exit dialog, and the
+desktop panel exist and pass an automated suite (21 in-process tests +
+28 process-level checks, ASAN/UBSAN/LSAN-clean, incl. the forked panel
+and dialog children). The [ROADMAP](ROADMAP.md) tracks remaining XFCE
+feature parity honestly — incomplete features are listed, never
+silently omitted.
 
 ## License
 

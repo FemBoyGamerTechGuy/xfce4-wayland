@@ -182,3 +182,80 @@ runs the XW_ACTION_EXIT_DIALOG action. Reuse libxwcl + bitmap font.
 After that: notification daemon skeleton + wallpaper layer client;
 then back to the shortcut/theme settings GUI once the panel proves
 the client-library surface.
+
+
+## 2026-08-31 — session 4
+
+M7 panel v0 (M8 in TODO numbering): implemented, tested, hardened.
+The session started by triaging the interrupted tree: all 53 "modified"
+files were spurious 100644→100755 mode flips from the container
+snapshot machinery (zero content changes; no M8 work had landed).
+Added scripts/fix-modes.sh (restores every tracked file's mode from
+HEAD) and verified the M6/M7 baseline first (16/16, 18/18, tree clean).
+
+- libxwcl: new xwc-tasklist.c — wlr-foreign-toplevel + ext-workspace
+  client bindings for panels (xwc_tasklist/xwc_wspaces: announce,
+  title/app_id/state, activate/close, workspace names/active/switch).
+- xwc_dispatch was rewritten: the timeout argument was silently
+  ignored (blocking dispatch). Standalone clients now use the
+  prepare_read/poll/read-or-cancel dance — and must FLUSH first:
+  wl_display_dispatch flushed implicitly, poll() does not, so the
+  exit dialog silently stopped mapping its buffer until the flush
+  was added (caught by exit-dialog-rendered). Embedded (pump) mode
+  pumps + drains without ever sleeping.
+- xwc_layer_create now sends set_size when EITHER dimension is fixed
+  (a width-from-anchors bar previously could not specify height
+  alone); xwc_win_closed() accessor added.
+- xw-panel.c: one layer-shell surface, top bar, exclusive zone =
+  height. Launcher (ctl run), workspace switcher (ext-workspace),
+  tasklist (click activate / middle-right close), HH:MM clock,
+  exit button (ctl exit-dialog). Bitmap font, no toolkit.
+- xw-session: ctl `exit-dialog` (spawns the same command as the
+  compositor's XW_ACTION_EXIT_DIALOG; $XW_EXIT_CMD override) and
+  `run CMD` (session-scoped execution for the panel launcher) —
+  both as supervised children (SIGTERM at shutdown, SIGCHLD reaped,
+  bounded table). xw-session-ctl CLI updated; ctl wire factored into
+  src/clients/xw-ctl.c shared by xw-exit and xw-panel.
+- Makefile: xw-panel + xw-ctl wired in (byte-precise python patches;
+  the Edit tool still tab-mangles make). Learned: a no-recipe extra
+  prerequisite rule made $< resolve to the HEADER and gcc emitted a
+  precompiled-header "object"; fixed by putting src/clients/*.h into
+  the pattern rule. Also: test objects now depend on
+  src/libxwcl/*.h — struct xwc is embedded in the harness, and a
+  stale object with the old layout made the library memset overrun
+  into socket_name ("cannot connect to display", 16/16 failures).
+- **UBSan: wl_list_for_each empty-list sentinel (real bug)** — on an
+  EMPTY list the iterator is left pointing at the list HEAD cast as
+  an entry; the click-to-focus layer scan used the post-loop value,
+  so pressing a TOP-layer surface (panel) with an empty OVERLAY read
+  garbage wm memory as a bool (value 16). Same family as the session-3
+  sentinel UAF, survived because nothing ever clicked a TOP layer.
+  Rewritten with a separate found-iterator; regression: panel-clicks.
+- **LSan: eager manager binding leaked 5 x 96 B per client (real
+  bug)** — binding ext_workspace_manager_v1 at registry time makes
+  the server immediately create 1 group + 4 workspace proxies via
+  new_id events; clients that never use them (the exit dialog)
+  leaked exactly those 5. Fixed with LAZY binding (registry records
+  the global name; tasklist/wspaces bind on demand and own the
+  proxies). tests/debug-readevents.c documents the hunt (disasm of
+  the calloc call site + minimal reproducer).
+- tests: test_panel.c (5 tests: tasklist-client, workspace-client,
+  panel-maps, panel-clicks, panel-exit-button with a fake session
+  manager accepting the ctl line); test-session.sh session 3
+  (panel autostart + ctl run/exit-dialog + supervised teardown);
+  paced (wall-clock) waits for forked-client conditions — the
+  fast-spin XWT_WAIT races child processes under ASan (session-3
+  lesson, rediscovered the hard way).
+- dev-session.sh now autostarts the panel (isolated HOME) — full
+  desktop demo, clean logout verified.
+- Verified: 21/21 in-process, 28/28 process checks, full
+  ASan+UBSan+LSan pass incl. both forked children, dev-session
+  --logout rc=0. Docs updated (README/ROADMAP/TODO/TESTING/
+  ARCHITECTURE; ROADMAP M7 marked DONE with PART gaps).
+
+### Next
+Notification daemon skeleton (M7 backlog) or wallpaper/desktop
+layer client; then the settings GUI once more client surface is
+proven. Session restart (re-exec) still needs an automated test.
+Consider upstreaming the paced-wait helper into the harness (tests
+currently re-implement it in test_panel.c).

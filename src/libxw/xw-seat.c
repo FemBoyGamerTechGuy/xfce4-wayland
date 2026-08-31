@@ -483,13 +483,21 @@ void xw_seat_pointer_button(struct xw_seat *s, uint32_t linux_button,
             xw_wm_focus_window(c->wm, w, true);
         } else if (s->ptr_focus) {
             /* layer surfaces with on-demand interactivity take focus on
-             * click; exclusive ones already own it */
-            struct xw_layer_surface *ls = NULL;
+             * click; exclusive ones already own it.
+             *
+             * NOTE: wl_list_for_each on an EMPTY list leaves the
+             * iterator pointing at the list head (sentinel) — and a
+             * NULL assignment inside the body would make the loop
+             * increment dereference it.  A separate found-variable
+             * avoids both (found by UBSan via the panel click test:
+             * OVERLAY empty, panel on TOP). */
+            struct xw_layer_surface *ls = NULL, *it;
             for (int layer = 3; layer >= 0 && !ls; layer--) {
-                wl_list_for_each(ls, &c->wm->layers[layer], link) {
-                    if (ls->mapped && ls->surface == s->ptr_focus)
+                wl_list_for_each(it, &c->wm->layers[layer], link) {
+                    if (it->mapped && it->surface == s->ptr_focus) {
+                        ls = it;
                         break;
-                    ls = NULL;
+                    }
                 }
             }
             if (ls && ls->keyboard_interactivity)

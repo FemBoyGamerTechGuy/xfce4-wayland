@@ -32,6 +32,7 @@
 
 #define CTL_BACKLOG 8
 #define MAX_AUTOSTART 64
+#define MAX_RUNTIME_CHILDREN 16
 #define COMPOSITOR_MAX_RESTARTS 5
 
 static volatile sig_atomic_t g_terminate = 0;
@@ -53,6 +54,14 @@ struct session {
         char name[300];
     } autostart[MAX_AUTOSTART];
     int n_autostart;
+    /* children spawned at runtime via the ctl socket (exit dialog,
+     * "run" commands): supervised like autostart — SIGTERM at
+     * shutdown, reaped by the SIGCHLD loop */
+    struct {
+        pid_t pid;
+        char name[300];
+    } spawned[MAX_RUNTIME_CHILDREN];
+    int n_spawned;
 };
 
 static struct session S;
@@ -88,6 +97,13 @@ static void stop_autostart_apps(void) {
             log_msg("info", "stopping '%s' (pid %d)", S.autostart[i].name,
                     (int)S.autostart[i].pid);
             kill(S.autostart[i].pid, SIGTERM);
+        }
+    }
+    for (int i = 0; i < S.n_spawned; i++) {
+        if (S.spawned[i].pid > 0) {
+            log_msg("info", "stopping '%s' (pid %d)", S.spawned[i].name,
+                    (int)S.spawned[i].pid);
+            kill(S.spawned[i].pid, SIGTERM);
         }
     }
     /* children are reaped by the SIGCHLD loop during shutdown */
@@ -329,6 +345,46 @@ static void run_autostart(void) {
     autostart_scan_dir("/etc/xdg/autostart", user_dir[0] ? user_dir : NULL);
 }
 
+/* --------------------------------------------------------- runtime spawns */
+
+/* fork + exec via /bin/sh -c, tracked as a supervised session child
+ * (same environment as autostart).  Returns the pid or -1. */
+static pid_t spawn_runtime(const char *exec, const char *name) {
+    if (S.n_spawned >= MAX_RUNTIME_CHILDREN) {
+        log_msg("error", "runtime child table full");
+        return -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        setenv("XDG_RUNTIME_DIR", S.runtime_dir, 1);
+        setenv("WAYLAND_DISPLAY", S.socket_name, 1);
+        const char *sh = getenv("XW_SHELL") ? getenv("XW_SHELL") : "/bin/sh";
+        const char *args[] = {sh, "-c", exec, NULL};
+        execvp(args[0], (char *const *)args);
+        log_msg("error", "runtime exec '%s' failed: %s", exec,
+                strerror(errno));
+        _exit(127);
+    }
+    snprintf(S.spawned[S.n_spawned].name,
+             sizeof(S.spawned[0].name), "%s", name);
+    S.spawned[S.n_spawned].pid = pid;
+    S.n_spawned++;
+    log_msg("info", "spawned '%s' (pid %d)", name, (int)pid);
+    return pid;
+}
+
+/* the exit dialog: same binary the compositor's XW_ACTION_EXIT_DIALOG
+ * spawns (actions.conf [commands] exit-dialog, default "xw-exit");
+ * $XW_EXIT_CMD overrides for testing/development */
+static const char *exit_dialog_command(void) {
+    const char *env = getenv("XW_EXIT_CMD");
+    if (env && *env)
+        return env;
+    return "xw-exit";
+}
+
 /* ------------------------------------------------------------ control */
 
 /* power management via loginctl (works with logind and elogind) */
@@ -415,6 +471,38 @@ static void handle_ctl_line(int fd, char *line) {
                       "error power management unavailable (loginctl "
                       "failed)");
         }
+        return;
+    }
+    if (strcmp(line, "exit-dialog") == 0) {
+        /* same effect as the compositor's XW_ACTION_EXIT_DIALOG
+         * (Ctrl+Alt+Del): the graphical session-exit dialog */
+        if (!S.comp_ready) {
+            send_line(fd, "error no compositor");
+            return;
+        }
+        pid_t pid = spawn_runtime(exit_dialog_command(), "xw-exit");
+        if (pid > 0)
+            send_line(fd, "ok exit dialog spawned");
+        else
+            send_line(fd, "error cannot spawn the exit dialog");
+        return;
+    }
+    if (strncmp(line, "run ", 4) == 0) {
+        /* session-scoped command execution (panel launcher et al.):
+         * the socket is 0700 and single-user, so this is no more
+         * privileged than the user's own shell */
+        const char *cmd = line + 4;
+        while (*cmd == ' ')
+            cmd++;
+        if (!*cmd) {
+            send_line(fd, "error empty command");
+            return;
+        }
+        pid_t pid = spawn_runtime(cmd, cmd);
+        if (pid > 0)
+            send_line(fd, "ok spawned");
+        else
+            send_line(fd, "error cannot spawn");
         return;
     }
     if (strcmp(line, "ping") == 0) {
@@ -604,10 +692,17 @@ int main(int argc, char **argv) {
                         g_exit_code = 1;
                     }
                 } else {
-                    /* autostart app exited: bookkeeping only */
+                    /* autostart or runtime-spawned child exited:
+                     * bookkeeping only */
                     for (int i = 0; i < S.n_autostart; i++) {
                         if (S.autostart[i].pid == pid) {
                             S.autostart[i].pid = -1;
+                            break;
+                        }
+                    }
+                    for (int i = 0; i < S.n_spawned; i++) {
+                        if (S.spawned[i].pid == pid) {
+                            S.spawned[i].pid = -1;
                             break;
                         }
                     }

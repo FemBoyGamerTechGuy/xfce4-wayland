@@ -1,7 +1,7 @@
 #!/bin/sh
 # scripts/dev-session.sh — run a full development session (headless):
-# session manager + compositor + exit dialog, with an isolated runtime
-# dir. Usage: scripts/dev-session.sh [--logout]
+# session manager + compositor + panel (M7) + exit dialog, with an
+# isolated runtime dir. Usage: scripts/dev-session.sh [--logout]
 #
 # The session ends via the control socket (xw-session-ctl logout) or
 # Ctrl+C on the manager.
@@ -13,6 +13,19 @@ mkdir -p "$RT"
 chmod 700 "$RT"
 export XDG_RUNTIME_DIR="$RT"
 export XW_COMPOSITOR="$PWD/build/bin/xw-compositor"
+export XW_EXIT_CMD="$PWD/build/bin/xw-exit"
+
+# autostart the panel from an isolated HOME (full session demo)
+FAKE_HOME="$RT/home"
+mkdir -p "$FAKE_HOME/.config/autostart"
+cat >"$FAKE_HOME/.config/autostart/xw-panel.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=xw-panel
+Exec=$PWD/build/bin/xw-panel
+OnlyShowIn=XFCE;
+EOF
+export HOME="$FAKE_HOME"
 
 cleanup() {
     rm -rf "$RT"
@@ -32,6 +45,7 @@ done
 
 echo "== status:"
 ./build/bin/xw-session-ctl status
+echo "== panel autostarted (workspaces, tasklist, clock, exit button)"
 
 if [ "$1" = "--logout" ]; then
     echo "== requesting logout through the exit dialog path"
@@ -43,5 +57,6 @@ if [ "$1" = "--logout" ]; then
 else
     echo "== session running; control socket: $RT/xw-session.sock"
     echo "   try: XDG_RUNTIME_DIR=$RT ./build/bin/xw-session-ctl status"
+    echo "   panel exit button: XDG_RUNTIME_DIR=$RT ./build/bin/xw-session-ctl exit-dialog"
     wait $SESSION
 fi

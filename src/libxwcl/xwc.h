@@ -15,6 +15,9 @@
 struct xwc;
 struct xwc_win;
 struct xwc_layer;
+struct xwc_tasklist;
+struct xwc_task;
+struct xwc_wspaces;
 
 /* ---------------------------------------------------------- callbacks */
 struct xwc_callbacks {
@@ -57,6 +60,11 @@ struct xwc {
     void *pointer;          /* wl_pointer */
     void *output;           /* first wl_output */
     void *output_state;     /* pending output state (xwc-input.c) */
+
+    void *ftm;    /* zwlr_foreign_toplevel_manager_v1 (lazily bound) */
+    void *wsm;    /* ext_workspace_manager_v1 (lazily bound) */
+    uint32_t ftm_global; /* registry global name (0 = not advertised) */
+    uint32_t wsm_global;
 
     void *focused_owner;  /* win or layer with keyboard focus */
     struct xwc_callbacks focused_cb; /* callback block of the focused owner */
@@ -106,6 +114,8 @@ void *xwc_win_surface(struct xwc_win *w);
 void *xwc_win_xdg_surface(struct xwc_win *w);
 /* mapped state (configure + first commit done) */
 bool xwc_win_mapped(struct xwc_win *w);
+/* server asked the window to close (xdg_toplevel close event) */
+bool xwc_win_closed(struct xwc_win *w);
 
 /* ------------------------------------------------------ layer surface */
 struct xwc_layer *xwc_layer_create(struct xwc *c, const struct xwc_callbacks *cb,
@@ -119,6 +129,39 @@ void xwc_layer_destroy(struct xwc_layer *l);
 uint32_t *xwc_layer_pixels(struct xwc_layer *l, int *stride);
 void xwc_layer_commit(struct xwc_layer *l);
 void xwc_layer_resize(struct xwc_layer *l, int w, int h);
+
+/* -------------------------------------- tasklist (foreign-toplevel) */
+/* Tracks every toplevel window via wlr-foreign-toplevel-management:
+ * title/app_id/state updates arrive as events, `changed` fires after
+ * each batch (the panel re-lays-out and redraws).  activate/close map
+ * to the compositor's focus / close requests.  The tasklist takes
+ * ownership of the manager proxy (xwc_disconnect tolerates that). */
+struct xwc_tasklist *xwc_tasklist_create(struct xwc *c,
+                                         void (*changed)(void *ud), void *ud);
+void xwc_tasklist_destroy(struct xwc_tasklist *tl);
+/* list iteration, in mapping order */
+struct xwc_task *xwc_tasklist_first(struct xwc_tasklist *tl);
+struct xwc_task *xwc_task_next(struct xwc_task *task);
+/* attributes (buffers are owned by the tasklist) */
+const char *xwc_task_title(struct xwc_task *task);
+const char *xwc_task_app_id(struct xwc_task *task);
+bool xwc_task_active(struct xwc_task *task);
+bool xwc_task_minimized(struct xwc_task *task);
+/* requests: focus (+ un-minimize) / close the window */
+void xwc_tasklist_activate(struct xwc_tasklist *tl, struct xwc_task *task);
+void xwc_tasklist_close(struct xwc_tasklist *tl, struct xwc_task *task);
+
+/* ----------------------------------------- workspaces (ext-workspace) */
+/* Mirrors the compositor workspace list (names + active state);
+ * activate(i) requests a workspace switch.  `changed` fires after each
+ * manager `done` batch. */
+struct xwc_wspaces *xwc_wspaces_create(struct xwc *c,
+                                       void (*changed)(void *ud), void *ud);
+void xwc_wspaces_destroy(struct xwc_wspaces *wl);
+int xwc_wspaces_count(struct xwc_wspaces *wl);
+const char *xwc_wspaces_name(struct xwc_wspaces *wl, int idx);
+bool xwc_wspaces_active(struct xwc_wspaces *wl, int idx);
+void xwc_wspaces_activate(struct xwc_wspaces *wl, int idx);
 
 /* ------------------------------------------------------------- drawing */
 /* All drawing operates on ARGB8888 buffers; colors are 0xAARRGGBB with

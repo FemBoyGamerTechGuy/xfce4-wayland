@@ -122,9 +122,14 @@ This subsystem is a project priority. Design:
   entries (XDG autostart `.desktop` files, with `OnlyShowIn` filtered to
   `XFCE`/`xfce4-wayland`);
 - exposes a **control socket** (`ctl.sock`) with a tiny line protocol
-  (`LOGOUT`, `RESTART`, `SHUTDOWN`, `REBOOT`, `SUSPEND`, `HIBERNATE`,
-  `LOCK`, `PING`), used by `xw-exit`, `xw-session-ctl`, the panel, and
-  the test suite;
+  (`status`, `ping`, `logout`, `restart`, `shutdown`, `reboot`,
+  `suspend`, `hibernate`, `exit-dialog`, `run CMD`), used by `xw-exit`,
+  `xw-session-ctl`, the panel, and the test suite;
+- spawns runtime children on request (`exit-dialog` runs the same
+  command as the compositor's XW_ACTION_EXIT_DIALOG — $XW_EXIT_CMD
+  overrides, default `xw-exit`; `run` executes a command through
+  `/bin/sh -c`) and supervises them like autostart: SIGTERM at
+  shutdown, reaped by the SIGCHLD loop (bounded table);
 - on power actions, invokes `loginctl <action>` (works with both logind
   and elogind's loginctl); if absent, reports a clean error to the
   requester instead of failing silently.
@@ -135,6 +140,26 @@ probed at runtime.
 
 The graphical exit path is `xw-exit` (a native Wayland dialog) wired to
 `Ctrl+Alt+Delete` by default (XFCE parity) plus a panel button.
+
+## The panel (xw-panel)
+
+One process, one layer-shell surface: a top bar anchored LEFT|RIGHT
+(compositor dictates the width) with a fixed height and an exclusive
+zone of the same value, so windows can never render under it. The
+plugins of v0, left to right: a terminal launcher (ctl `run`), the
+workspace switcher (ext-workspace handles, click to switch), the
+tasklist (wlr-foreign-toplevel handles: click activates, middle/right
+click closes), then right-aligned clock (HH:MM, redrawn when the minute
+flips) and exit button (ctl `exit-dialog`). Layout is recomputed on
+every tasklist/workspace change and on configure; input is plain
+hit-testing against the button table. `libxwcl` exposes the two manager
+bindings (`xwc_tasklist`, `xwc_wspaces`) with lazy proxy binding —
+binding a manager immediately materializes `new_id` announcement
+proxies (workspace group + handles, window handles), so clients that
+never create these objects never pay for them (an eager version leaked
+5 proxies per client, caught by LSan). The panel main loop dispatches
+with a 1-second timeout ceiling: the poll timeout exists precisely so
+timer-driven redraws (the clock) can fire between server events.
 
 ## Surfaces, buffers, damage
 

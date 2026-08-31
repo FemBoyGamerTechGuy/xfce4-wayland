@@ -14,9 +14,11 @@ Persistent task list (mirrors the live development tracker). Status:
 - [x] M5 clipboard + drag&drop (core data-device)
 - [x] M6 xw-session (autostart, supervision, ctl socket, power)
 - [x] M7 xw-exit graphical session-exit dialog
-- [ ] M8 xw-panel v0 (next)
-- [~] M9 automated test suite + regression policy (16 in-process +
-      18 process checks, ASAN-clean; fuzzing/CI pending)
+- [x] M8 xw-panel v0 (M7 "Panel / desktop" in ROADMAP numbering:
+      bar + workspace switcher + tasklist + launcher + clock + exit
+      button, session-ctl `exit-dialog`/`run` wiring)
+- [~] M9 automated test suite + regression policy (21 in-process +
+      28 process checks, ASAN-clean; fuzzing/CI pending)
 - [ ] M10 docs/WORKLOG polish, git milestones, release archive
 
 ## Backlog highlights (tracked in detail in ROADMAP.md)

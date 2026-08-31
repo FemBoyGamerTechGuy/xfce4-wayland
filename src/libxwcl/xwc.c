@@ -1,7 +1,9 @@
 /* xwc.c — libxwcl implementation: connection, windows, layers, input. */
 #include "xwc.h"
 
+#include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +13,8 @@
 #include "wayland-client.h"
 #include "xdg-shell.h"
 #include "wlr-layer-shell-unstable-v1.h"
+#include "wlr-foreign-toplevel-management-unstable-v1.h"
+#include "ext-workspace.h"
 
 /* xwc-input.c */
 extern void xwc_seat_init(struct xwc *c);
@@ -128,6 +132,16 @@ static void registry_global(void *data, struct wl_registry *r, uint32_t name,
     } else if (strcmp(iface, "zwlr_layer_shell_v1") == 0) {
         c->layer_shell =
             wl_registry_bind(r, name, &zwlr_layer_shell_v1_interface, 4);
+    } else if (strcmp(iface, "zwlr_foreign_toplevel_manager_v1") == 0) {
+        /* recorded, NOT bound: binding would immediately create new_id
+         * proxies for every announcement (window handles) that clients
+         * not using a tasklist would leak — found by LSan in the
+         * exit-dialog child.  xwc_tasklist_create binds on demand. */
+        c->ftm_global = name;
+    } else if (strcmp(iface, "ext_workspace_manager_v1") == 0) {
+        /* same: xwc_wspaces_create binds on demand (1 group + N
+         * workspace proxies arrive as new_id events on bind) */
+        c->wsm_global = name;
     } else if (strcmp(iface, "wl_data_device_manager") == 0) {
         c->ddm =
             wl_registry_bind(r, name, &wl_data_device_manager_interface, 3);
@@ -241,6 +255,13 @@ void xwc_disconnect(struct xwc *c) {
         wl_data_device_manager_destroy(c->ddm);
     if (c->layer_shell)
         zwlr_layer_shell_v1_destroy(c->layer_shell);
+    /* ftm/wsm proxies are lazily bound and owned (and destroyed) by the
+     * tasklist / workspace objects — normally NULL here; destroy
+     * defensively if a caller ever stores one */
+    if (c->ftm)
+        zwlr_foreign_toplevel_manager_v1_destroy(c->ftm);
+    if (c->wsm)
+        ext_workspace_manager_v1_destroy(c->wsm);
     if (c->wm_base)
         xdg_wm_base_destroy(c->wm_base);
     if (c->seat)
@@ -257,8 +278,43 @@ void xwc_disconnect(struct xwc *c) {
 }
 
 int xwc_dispatch(struct xwc *c, int timeout_ms) {
-    (void)timeout_ms;
-    if (wl_display_dispatch(c->display) < 0)
+    if (c->pump) {
+        /* embedded (in-process) server: it runs in this thread and
+         * cannot make progress while we block — pump one cycle, drain
+         * whatever arrived, then flush (wl_display_dispatch used to
+         * do this implicitly) */
+        c->pump(c->pump_ud);
+        if (wl_display_dispatch_pending(c->display) < 0)
+            return -1;
+        if (wl_display_flush(c->display) < 0)
+            return -1;
+        return 0;
+    }
+    /* standalone client: flush requests queued by event handlers,
+     * then wait up to timeout_ms for events so timer-driven redraws
+     * (panel clocks) can fire; timeout_ms < 0 blocks.  NOTE:
+     * wl_display_dispatch flushed implicitly; poll() does not. */
+    if (wl_display_flush(c->display) < 0)
+        return -1;
+    while (wl_display_prepare_read(c->display) != 0) {
+        if (wl_display_dispatch_pending(c->display) < 0)
+            return -1;
+    }
+    struct pollfd pfd = {
+        .fd = wl_display_get_fd(c->display), .events = POLLIN,
+    };
+    int n = poll(&pfd, 1, timeout_ms < 0 ? -1 : timeout_ms);
+    if (n < 0) {
+        wl_display_cancel_read(c->display);
+        return errno == EINTR ? 0 : -1; /* signal: not fatal */
+    }
+    if (n > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR))) {
+        if (wl_display_read_events(c->display) < 0)
+            return -1; /* connection lost */
+    } else {
+        wl_display_cancel_read(c->display);
+    }
+    if (wl_display_dispatch_pending(c->display) < 0)
         return -1;
     return 0;
 }
@@ -495,6 +551,8 @@ void *xwc_win_xdg_surface(struct xwc_win *w) { return w->xdg_surface; }
 
 bool xwc_win_mapped(struct xwc_win *w) { return w->mapped; }
 
+bool xwc_win_closed(struct xwc_win *w) { return w->closed; }
+
 /* ------------------------------------------------------ layer surface */
 
 static void layer_configure(void *data, struct zwlr_layer_surface_v1 *ls,
@@ -551,7 +609,9 @@ struct xwc_layer *xwc_layer_create(struct xwc *c,
         c->layer_shell, l->surface, NULL, layer, "xw");
     zwlr_layer_surface_v1_set_anchor(l->ls, anchors);
     zwlr_layer_surface_v1_set_exclusive_zone(l->ls, exclusive_zone);
-    if (w > 0 && h > 0)
+    /* send set_size if either dimension is fixed; the anchored pair
+     * (e.g. LEFT|RIGHT) lets the compositor dictate the other one */
+    if (w > 0 || h > 0)
         zwlr_layer_surface_v1_set_size(l->ls, w, h);
     zwlr_layer_surface_v1_add_listener(l->ls, &layer_listener, l);
     wl_surface_commit(l->surface);

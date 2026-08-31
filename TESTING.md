@@ -18,14 +18,13 @@ against the **headless backend** with the pixman software renderer.
   Wayland objects are driven directly next to white-box assertions.
 - `tests/suite/test_session.c` — the graphical exit dialog as a real
   child process against the in-process compositor.
+- `tests/suite/test_panel.c` — panel coverage (see above).
 - `scripts/test-session.sh` — process-level session integration test
   (real `xw-session` + `xw-compositor` children, ctl socket, autostart
-  filtering, clean logout).
+  filtering, runtime spawns, panel autostart, clean logout).
 - `scripts/run-asan.sh` — full sanitizer regression pass (ASan + UBSan
   + LeakSanitizer) including the process-level test; restores the
   release build afterwards.
-- `tests/debug-layer.c` — scratch reproducer for layer-shell child
-  processes (not part of the suite; built ad hoc when debugging).
 
 ## Running
 
@@ -38,7 +37,7 @@ Filtering tests (triage):
     XWT_FILTER=popup build/tests/run-tests    # name substring
     XWT_PREINSTANCES=0 ...                    # debug-layer only
 
-## What is covered today (16 in-process tests + 18 process checks)
+## What is covered today (21 in-process tests + 28 process checks)
 
 - compositor bootstrap + clean shutdown; socket lifecycle
 - output creation, geometry, scale; multi-output
@@ -63,10 +62,21 @@ Filtering tests (triage):
   (replayed tokens rejected)
 - session exit: the exit dialog maps a modal overlay (pixel-verified),
   takes keyboard, Escape cancels with exit code 0
+- panel (in-process, client library): tasklist announce/title/state
+  tracking, activate focuses (+ un-minimizes), close reaches the
+  window as an xdg close event, closed tasks disappear; workspace
+  names/active mirror the wm, activate switches workspaces
+- panel (real binary): bar maps on the top layer, renders, reserves
+  its exclusive zone (windows placed below), workspace-switcher
+  clicks switch workspaces end-to-end, exit button sends the ctl
+  `exit-dialog` line (fake session manager accepts it), panel survives
+  the action
 - process-level: session manager supervises the compositor child, ctl
-  protocol (ping/status/logout), honest power failure without logind,
-  XDG autostart filtering (OnlyShowIn/NotShowIn/Hidden), clean logout
-  (exit code 0, sockets removed, no leftover processes)
+  protocol (ping/status/logout/run/exit-dialog), honest power failure
+  without logind, XDG autostart filtering (OnlyShowIn/NotShowIn/Hidden),
+  panel autostart, runtime spawns are supervised (killed + reaped at
+  logout), clean logout (exit code 0, sockets removed, no leftover
+  processes)
 
 Not yet covered (honest gaps): drag-and-drop flows, popup grabs,
 key repeat, multi-seat, D-Bus-free restart path, power actions against
@@ -86,6 +96,18 @@ Highlights (each verifiable by reverting the fix):
   (`popup-positioning`)
 - `wl_list_for_each` head-sentinel dereference when pressing on a
   layer surface (found by ASAN; `layer-shell-focus`)
+- wl_list_for_each leaves the iterator at the head sentinel on EMPTY
+  lists — pressing a TOP-layer surface (panel) with an empty OVERLAY
+  layer read garbage wm memory (found by UBSan, value 16 in a bool;
+  `panel-clicks`)
+- eager binding of ext-workspace/foreign-toplevel managers created
+  new_id announcement proxies that non-panel clients leaked (LSan,
+  5 x 96 bytes in the exit-dialog child; fixed with lazy binding;
+  `tests/debug-readevents.c` documents the hunt)
+- xwc_dispatch ignored its timeout argument and (after the poll()
+  rewrite) stopped flushing requests that wl_display_dispatch had
+  flushed implicitly — the exit dialog never mapped its buffer
+  (`exit-dialog-rendered`)
 - activation token double-free / premature server-side destroy
   (`foreign-toplevel-activation`)
 - NULL-source selection fabricated an empty offer to clients

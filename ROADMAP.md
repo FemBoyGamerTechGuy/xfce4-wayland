@@ -88,7 +88,9 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
   supervision with bounded restarts, control socket line protocol,
   clean shutdown ordering (clients → compositor → sockets).
 - DONE xw-session-ctl: status/ping/logout/restart/shutdown/reboot/
-  suspend/hibernate commands.
+  suspend/hibernate/exit-dialog/run commands. Runtime spawns (exit
+  dialog, `run CMD`) are supervised session children: SIGTERM at
+  shutdown, reaped by the SIGCHLD loop.
 - DONE power actions via loginctl CLI; fails honestly when logind/
   elogind is unavailable (asserted by the process-level test).
 - DONE xw-exit graphical exit dialog (layer-shell modal overlay,
@@ -102,8 +104,23 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
 - TODO session save/restore, screen lock, idle actions.
 
 ## M7 — Panel / desktop
-- TODO xw-panel: layer-shell bar, workspace switcher, tasklist
-  (foreign-toplevel), launcher, clock, exit button.
+- DONE xw-panel v0: layer-shell top bar (exclusive zone, windows never
+  render under it), workspace switcher (ext-workspace, click to
+  switch), tasklist (wlr-foreign-toplevel: click = activate,
+  middle/right click = close, active/minimized state), clock (HH:MM,
+  per-minute redraw), launcher button (terminal via ctl `run`), exit
+  button (session exit dialog via ctl `exit-dialog` — the same
+  XW_ACTION_EXIT_DIALOG behavior as Ctrl+Alt+Del). One process, one
+  surface, libxwcl + bitmap font, no toolkit.
+- DONE libxwcl tasklist/workspace bindings (xwc_tasklist,
+  xwc_wspaces) with lazy manager binding (eager binding leaked
+  new_id announcement proxies in clients that never used them —
+  LSan-caught); xwc_dispatch gained a real poll timeout (panel
+  clock ticks) and explicit flushing (wl_display_dispatch flushed
+  implicitly; poll() does not).
+- PART launcher v0 is a single terminal button (no menu, no
+  .desktop parsing, no icons — text labels only); single output;
+  fixed plugin order; no plugin API.
 - TODO panel plugin API, notification daemon, desktop icons,
   wallpaper, settings GUI, application finder.
 

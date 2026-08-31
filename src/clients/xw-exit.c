@@ -9,14 +9,12 @@
  * font. No toolkit.
  */
 #include "xwc.h"
+#include "xw-ctl.h"
 
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
+#include <xkbcommon/xkbcommon.h>
 
 #include "wlr-layer-shell-unstable-v1.h"
 
@@ -112,48 +110,6 @@ static void draw(struct exit_dialog *d, struct xwc_layer *layer) {
     xwc_layer_commit(layer);
 }
 
-/* ------------------------------------------------------------ ctl wire */
-
-static bool send_command(const char *cmd, char *reply, size_t reply_len) {
-    const char *rtd = getenv("XDG_RUNTIME_DIR");
-    if (!rtd || !*rtd) {
-        snprintf(reply, reply_len, "XDG_RUNTIME_DIR not set");
-        return false;
-    }
-    char path[512];
-    snprintf(path, sizeof(path), "%s/xw-session.sock", rtd);
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        snprintf(reply, reply_len, "socket: %s", strerror(errno));
-        return false;
-    }
-    struct sockaddr_un addr = {0};
-    addr.sun_family = AF_UNIX;
-    if (strlen(path) >= sizeof(addr.sun_path) ||
-        snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path) < 0) {
-        close(fd);
-        snprintf(reply, reply_len, "path too long");
-        return false;
-    }
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        snprintf(reply, reply_len, "no session manager (%s)", strerror(errno));
-        close(fd);
-        return false;
-    }
-    dprintf(fd, "%s\n", cmd);
-    ssize_t n = read(fd, reply, reply_len - 1);
-    close(fd);
-    if (n <= 0) {
-        snprintf(reply, reply_len, "no reply");
-        return false;
-    }
-    reply[n] = 0;
-    char *nl = strchr(reply, '\n');
-    if (nl)
-        *nl = 0;
-    return strncmp(reply, "ok", 2) == 0;
-}
-
 /* ------------------------------------------------------------- input */
 
 static void on_key(struct xwc_win *win, uint32_t keycode, bool down,
@@ -171,7 +127,7 @@ static void on_key(struct xwc_win *win, uint32_t keycode, bool down,
         break;
     case XK_Return:
         if (buttons[d->sel].cmd)
-            d->done = send_command(buttons[d->sel].cmd, d->reply,
+            d->done = xw_ctl_send(buttons[d->sel].cmd, d->reply,
                                    sizeof(d->reply)) ||
                       true; /* done either way; reply carries the error */
         else
@@ -195,7 +151,7 @@ static void on_key(struct xwc_win *win, uint32_t keycode, bool down,
                      : (xkb_keysym_t)0) == keysym) {
                 d->sel = i;
                 if (buttons[i].cmd)
-                    d->done = send_command(buttons[i].cmd, d->reply,
+                    d->done = xw_ctl_send(buttons[i].cmd, d->reply,
                                            sizeof(d->reply)) ||
                               true;
                 else
@@ -229,7 +185,7 @@ static void on_button(struct xwc_win *win, uint32_t button, bool down, int x,
         if (x >= bx && x < bx + BTN_W && y >= by && y < by + BTN_H) {
             if (buttons[i].cmd) {
                 d->sel = i;
-                d->done = send_command(buttons[i].cmd, d->reply,
+                d->done = xw_ctl_send(buttons[i].cmd, d->reply,
                                        sizeof(d->reply)) ||
                           true;
             } else {
