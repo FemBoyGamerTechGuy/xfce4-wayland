@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* -------------------------------------------------------- wl_compositor */
@@ -38,6 +39,7 @@ static void region_resource_destroy(struct wl_resource *res) {
 
 static void compositor_create_region(struct wl_client *client,
                                      struct wl_resource *res, uint32_t id) {
+    (void)res;
     pixman_region16_t *r = calloc(1, sizeof(*r));
     if (!r) {
         wl_client_post_no_memory(client);
@@ -104,6 +106,10 @@ static const struct wl_buffer_interface single_pixel_buffer_impl = {
     .destroy = single_pixel_destroy,
 };
 
+static void single_pixel_resource_destroy(struct wl_resource *res) {
+    free(wl_resource_get_user_data(res));
+}
+
 static void single_pixel_create(struct wl_client *client,
                                 struct wl_resource *res, uint32_t id,
                                 uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
@@ -125,7 +131,8 @@ static void single_pixel_create(struct wl_client *client,
         wl_client_post_no_memory(client);
         return;
     }
-    wl_resource_set_implementation(br, &single_pixel_buffer_impl, data, free);
+    wl_resource_set_implementation(br, &single_pixel_buffer_impl, data,
+                                   single_pixel_resource_destroy);
 }
 
 static const struct wp_single_pixel_buffer_manager_v1_interface
@@ -162,7 +169,7 @@ static int reap_children(int sig, void *data) {
     return 0;
 }
 
-static int on_repaint_idle(void *data) {
+static void on_repaint_idle(void *data) {
     struct xw_compositor *c = data;
     c->repaint_scheduled = false;
     struct xw_output *o;
@@ -171,7 +178,7 @@ static int on_repaint_idle(void *data) {
             xw_output_repaint(o);
     }
     wl_display_flush_clients(c->display);
-    return 0; /* idle sources are one-shot */
+    /* idle sources are one-shot */
 }
 
 void xw_schedule_repaint(struct xw_compositor *c) {
@@ -188,6 +195,8 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
     if (!c)
         return NULL;
     c->conf = *cfg;
+    if (cfg->log_level)
+        xw_log_set_level(cfg->log_level);
     c->running = false;
     c->exit_code = 0;
     c->bg_color = 0xff202530;
@@ -195,6 +204,9 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
     wl_list_init(&c->surfaces);
     wl_list_init(&c->seats);
     wl_list_init(&c->popups);
+    wl_list_init(&c->ft_managers);
+    wl_list_init(&c->ws_managers);
+    wl_list_init(&c->activation_tokens);
 
     c->display = wl_display_create();
     if (!c->display)
@@ -245,6 +257,7 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
         goto fail;
 
     /* shells and desktop integration protocols */
+    xw_actions_init(c);
     xw_xdg_shell_init(c);
     xw_layer_shell_init(c);
     xw_foreign_toplevel_init(c);
@@ -292,16 +305,40 @@ fail:
 void xw_compositor_destroy(struct xw_compositor *c) {
     if (!c)
         return;
-    if (c->display) {
+    /* order matters: client resources first (role teardown unmanages
+     * windows and clears seat focus), then seats/wm, then the backend
+     * (output globals must die while the display is still alive —
+     * wl_display_destroy would already have freed them) */
+    if (c->display)
         wl_display_destroy_clients(c->display);
+
+    if (c->sigint_src)
+        wl_event_source_remove(c->sigint_src);
+    if (c->sigterm_src)
+        wl_event_source_remove(c->sigterm_src);
+    if (c->sigchld_src)
+        wl_event_source_remove(c->sigchld_src);
+    if (c->repaint_idle)
+        wl_event_source_remove(c->repaint_idle);
+
+    xw_shortcuts_destroy(c->shortcuts);
+    c->shortcuts = NULL;
+
+    struct xw_seat *seat, *seat2;
+    wl_list_for_each_safe(seat, seat2, &c->seats, link)
+        xw_seat_destroy(seat);
+
+    xw_wm_destroy(c->wm);
+    c->wm = NULL;
+
+    xw_backend_headless_destroy(c->backend);
+    c->backend = NULL;
+
+    xw_layer_shell_fin(c);
+    xw_activation_fin(c);
+
+    if (c->display)
         wl_display_destroy(c->display);
-    }
-    if (c->shortcuts)
-        xw_shortcuts_destroy(c->shortcuts);
-    if (c->wm)
-        xw_wm_destroy(c->wm);
-    if (c->backend)
-        xw_backend_headless_destroy(c->backend);
     free(c->conf_dir_owned);
     free(c);
 }

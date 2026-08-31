@@ -89,8 +89,7 @@ def main() -> int:
            "    uint8_t adv;       /* advance to next character */",
            "    const uint8_t *bits; /* w*h alpha bytes */",
            "};",
-           "",
-           "static const uint8_t xw_bits_%d[] = {" % START]
+           ""]
 
     glyph_table = []
     for cp in range(START, END + 1):
@@ -99,7 +98,10 @@ def main() -> int:
             continue
         w, h, img = glyphs[cp]
         data = list(img.getdata())
-        out.append("    /* 0x%02x %r */ " % (cp, chr(cp)) + ", ".join(str(b) for b in data) + ",")
+        out.append("/* 0x%02x %r */" % (cp, chr(cp)))
+        out.append("static const uint8_t xw_bits_%d[] = {" % cp)
+        out.append("    " + ", ".join(str(b) for b in data) + ",")
+        out.append("};")
         bbox = font.getbbox(chr(cp))
         # Draw origin: pen at (0, ascent); image holds glyph starting at (xoff, ascent + yoff)
         xoff = bbox[0] - 1
@@ -107,7 +109,6 @@ def main() -> int:
         adv = font.getlength(chr(cp))
         glyph_table.append("    {%d, %d, %d, %d, %d, xw_bits_%d}," % (w, h, xoff, yoff, int(adv + 0.5), cp))
 
-    out.append("};")
     out.append("")
     out.append("static const struct xw_glyph xw_glyph_table[] = {")
     out.extend(glyph_table)

@@ -25,17 +25,18 @@ struct xw_backend *xw_backend_headless_create(struct xw_compositor *c,
     b->comp = c;
     b->name = "headless";
 
-    int n = cfg->n_outputs;
-    struct xw_output_spec def = { .name = "HEADLESS-1", .width = 1280,
-                                  .height = 720, .scale = 1 };
-    if (n <= 0) {
-        cfg->outputs = &def;
-        n = 1;
-    }
+    /* config is const; build a private spec array so a default output can
+     * be synthesized when none is configured */
+    int n = cfg->n_outputs > 0 ? cfg->n_outputs : 1;
+    struct xw_output_spec defspecs[1] = {
+        { .name = "HEADLESS-1", .width = 1280, .height = 720, .scale = 1 }
+    };
+    const struct xw_output_spec *specs =
+        cfg->outputs ? cfg->outputs : defspecs;
 
     int layout_x = 0;
     for (int i = 0; i < n; i++) {
-        struct xw_output_spec *sp = &cfg->outputs[i];
+        const struct xw_output_spec *sp = &specs[i];
         struct xw_output *o = calloc(1, sizeof(*o));
         if (!o)
             goto fail;

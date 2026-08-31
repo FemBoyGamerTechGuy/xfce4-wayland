@@ -47,6 +47,7 @@ enum xw_action {
     XW_ACTION_WINDOW_TILE_DOWN,  /* center / unmaximize */
     XW_ACTION_WINDOW_RAISE,
     XW_ACTION_WINDOW_LOWER,
+    XW_ACTION_WINDOW_STICK_TOGGLE, /* on all workspaces */
     XW_ACTION_CYCLE_WINDOWS,     /* Alt+Tab */
     XW_ACTION_CYCLE_WINDOWS_BACK,
     /* workspaces */
@@ -56,6 +57,8 @@ enum xw_action {
     XW_ACTION_MOVE_WINDOW_WORKSPACE_LEFT,
     XW_ACTION_MOVE_WINDOW_WORKSPACE_RIGHT,
     XW_ACTION_MOVE_WINDOW_WORKSPACE_N,
+    XW_ACTION_WORKSPACE_ADD,       /* xfwm4 Alt+Insert */
+    XW_ACTION_WORKSPACE_DELETE_LAST, /* xfwm4 Alt+Delete */
     XW_ACTION_SHOW_DESKTOP,
     /* system */
     XW_ACTION_EXIT_DIALOG,

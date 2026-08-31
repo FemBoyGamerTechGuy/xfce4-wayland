@@ -29,6 +29,23 @@ static const char *cursor_art[] = {
 #define CURSOR_W 12
 #define CURSOR_H 17
 
+/* pixman 0.44 has no fill_rects; fill via fill_boxes with a straight-alpha
+ * pixman_color_t (channels widened to 16 bit). `color` is straight (not
+ * premultiplied) ARGB8888. */
+void xw_render_fill_rect(pixman_image_t *dst, pixman_op_t op, uint32_t color,
+                         int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0)
+        return;
+    pixman_color_t c = {
+        .alpha = (uint16_t)(((color >> 24) & 0xff) * 0x101),
+        .red = (uint16_t)(((color >> 16) & 0xff) * 0x101),
+        .green = (uint16_t)(((color >> 8) & 0xff) * 0x101),
+        .blue = (uint16_t)((color & 0xff) * 0x101),
+    };
+    pixman_box32_t box = { x, y, x + w, y + h };
+    pixman_image_fill_boxes(op, dst, &c, 1, &box);
+}
+
 static void draw_cursor(struct xw_output *o, struct xw_seat *seat) {
     if (!seat)
         return;
@@ -47,8 +64,8 @@ static void draw_cursor(struct xw_output *o, struct xw_seat *seat) {
                 int px = cx + cc + dx, py = cy + r + dy;
                 if (px < 0 || py < 0 || px >= o->width || py >= o->height)
                     continue;
-                pixman_image_fill_rects(PIXMAN_OP_SRC, o->logical, &color, 1, px,
-                                        py, 1, 1);
+                xw_render_fill_rect(o->logical, PIXMAN_OP_SRC, color, px, py, 1,
+                                    1);
             }
         }
     }
@@ -81,10 +98,11 @@ static void blit_surface(struct xw_output *o, struct xw_surface *s, int gx,
 }
 
 static void render_window(struct xw_output *o, struct xw_window *w) {
-    if (!w->surface || !w->surface->shm && !w->surface->has_single_pixel)
+    if (!w->surface || (!w->surface->shm && !w->surface->has_single_pixel))
         return;
     blit_surface(o, w->surface, w->x, w->y, w->w, w->h);
 }
+
 
 static void render_layer(struct xw_output *o, struct xw_layer_surface *ls) {
     if (!ls->mapped || !ls->surface)
@@ -121,8 +139,8 @@ static void render_snap_preview(struct xw_output *o, struct xw_wm *wm,
         }
     }
     (void)wm;
-    pixman_image_fill_rects(PIXMAN_OP_OVER, o->logical, &color, 1, x - o->x,
-                            y - o->y, wdt, hgt);
+    xw_render_fill_rect(o->logical, PIXMAN_OP_OVER, color, x - o->x, y - o->y,
+                        wdt, hgt);
 }
 
 void xw_render_output(struct xw_output *o) {
@@ -138,7 +156,7 @@ void xw_render_output(struct xw_output *o) {
 
     /* 2. toplevels, bottom of stack first */
     struct xw_window *w;
-    wl_list_for_each_reverse(w, &wm->stack, link) {
+    wl_list_for_each_reverse(w, &wm->stack, stack_link) {
         if (!xw_wm_window_visible(wm, w))
             continue;
         render_window(o, w);
@@ -160,7 +178,7 @@ void xw_render_output(struct xw_output *o) {
     }
 
     /* 5. snap preview of the window being moved */
-    wl_list_for_each(w, &wm->stack, link) {
+    wl_list_for_each(w, &wm->stack, stack_link) {
         render_snap_preview(o, wm, w);
         if (w->inter.mode == 1)
             break; /* only the grabbed window can have a preview */

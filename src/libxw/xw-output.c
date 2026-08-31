@@ -84,8 +84,8 @@ void xw_output_repaint(struct xw_output *o) {
     struct xw_compositor *c = o->comp;
 
     /* 1. clear logical buffer to the background color */
-    pixman_image_fill_rects(PIXMAN_OP_SRC, o->logical, &c->bg_color, 1, 0, 0,
-                            o->width, o->height);
+    xw_render_fill_rect(o->logical, PIXMAN_OP_SRC, c->bg_color, 0, 0, o->width,
+                        o->height);
 
     /* 2. draw everything (layers, windows, popups, snap preview, cursor) */
     xw_render_output(o);

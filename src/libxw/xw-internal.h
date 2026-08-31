@@ -172,6 +172,7 @@ struct xw_seat {
     xkb_mod_index_t mod_shift, mod_ctrl, mod_alt, mod_super;
     char *keymap_area;
     size_t keymap_len;
+    int keymap_fd;               /* memfd holding the serialized keymap */
 
     uint32_t serial;            /* input event serial */
     int32_t cursor_x, cursor_y;
@@ -201,10 +202,14 @@ struct xw_seat {
     struct wl_resource *ptr_grab;  /* wl_pointer client resource that holds
                                       an implicit grab (popup/drag/move) */
     bool ptr_grab_is_drag;
+    struct xw_surface *grab_surface; /* surface receiving grab events */
 };
 
 struct xw_seat *xw_seat_create(struct xw_compositor *c, const char *name);
 void xw_seat_destroy(struct xw_seat *s);
+
+/* first seat of the compositor (defined in xw-wm.c) */
+struct xw_seat *xw_seat_first(struct xw_compositor *c);
 
 void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down);
 void xw_seat_pointer_motion(struct xw_seat *s, int x, int y);
@@ -257,6 +262,13 @@ struct xw_window {
     uint32_t acked_serial;
     bool have_config;
     bool need_reconfigure;
+
+    /* xdg_toplevel size hints (0 = unset) */
+    int min_w, min_h, max_w, max_h;
+    /* xdg_surface.set_window_geometry override (content bounds within the
+     * buffer); -1 = not set */
+    int geo_x, geo_y, geo_w, geo_h;
+    bool geometry_set;
 
     /* interactive move/resize (pointer or keyboard driven) */
     struct {
@@ -340,6 +352,8 @@ void xw_wm_interactive_end(struct xw_wm *wm, struct xw_window *w);
 /* keyboard move/resize: returns true if the key was used */
 bool xw_wm_interactive_key(struct xw_wm *wm, struct xw_window *w, uint32_t code,
                            bool down);
+/* the window currently in interactive move/resize, NULL if none */
+struct xw_window *xw_wm_interactive_window(struct xw_wm *wm);
 
 void xw_wm_recalculate_usable(struct xw_wm *wm);
 void xw_wm_damage_all(struct xw_wm *wm);
@@ -360,6 +374,10 @@ struct xw_shortcuts {
     struct wl_list bindings;
     struct wl_list commands;   /* xw_shortcut with action RUN_COMMAND */
     int conflicts;             /* detected at load time */
+    /* modifier indices (from the first seat's keymap) */
+    xkb_mod_index_t mod_shift, mod_ctrl, mod_alt, mod_super;
+    xkb_mod_mask_t tracked_mods;
+    xkb_mod_mask_t ignore_mask;
 };
 
 struct xw_shortcuts *xw_shortcuts_create(struct xw_compositor *c,
@@ -373,6 +391,7 @@ bool xw_shortcuts_dispatch(struct xw_shortcuts *sc, struct xw_seat *seat,
                            uint32_t keycode, bool down);
 
 /* --------------------------------------------------------------- actions */
+void xw_actions_init(struct xw_compositor *c);
 void xw_actions_dispatch(struct xw_compositor *c, int action, const char *arg);
 
 /* -------------------------------------------------------------- layer shell */
@@ -397,10 +416,15 @@ struct xw_layer_surface {
 void xw_layer_shell_init(struct xw_compositor *c);
 void xw_layer_shell_fin(struct xw_compositor *c);
 void xw_layer_surface_destroy(struct xw_layer_surface *ls);
+/* role hooks called from the role dispatcher in xw-xdg-shell.c */
+void xw_layer_role_commit(struct xw_surface *s);
+void xw_layer_role_unmap(struct xw_surface *s);
+void xw_layer_role_destroy(struct xw_surface *s);
 
 /* --------------------------------------------------- foreign toplevel mgmt */
 struct xw_foreign_toplevel_res {
     struct wl_resource *res;
+    struct xw_compositor *comp;
     struct wl_list link;  /* window.toplevel_handles */
     struct wl_list mgr_link;
 };
@@ -426,6 +450,11 @@ void xw_data_device_fin(struct xw_compositor *c);
 void xw_data_device_notify_focus(struct xw_compositor *c, struct xw_seat *seat);
 void xw_data_device_send_selection(struct xw_compositor *c, struct xw_seat *seat,
                                    struct wl_client *client);
+/* drag lifecycle, called from the seat */
+void xw_data_device_drag_motion(struct xw_compositor *c, struct xw_seat *seat,
+                                int x, int y);
+void xw_data_device_drag_drop(struct xw_compositor *c, struct xw_seat *seat);
+void xw_data_device_drag_cancel(struct xw_compositor *c, struct xw_seat *seat);
 
 /* --------------------------------------------------------- xdg shell glue */
 void xw_xdg_shell_init(struct xw_compositor *c);
@@ -440,6 +469,7 @@ struct xw_popup {
     struct wl_resource *res;       /* xdg_popup */
     struct wl_resource *xdg_surface_res;
     struct xw_surface *parent;     /* may be NULL (unparented) */
+    void *pos;                     /* struct xw_positioner (copy) */
     int anchor_x, anchor_y;        /* computed position (global coords) */
     int w, h;
     bool mapped;
@@ -486,6 +516,16 @@ struct xw_compositor {
 
     uint32_t bg_color; /* wallpaper fill (a8r8g8b8) */
 
+    /* module state (structs defined in the respective modules) */
+    struct wl_list ft_managers;      /* foreign toplevel managers */
+    struct wl_list ws_managers;      /* ext workspace managers */
+    struct wl_list activation_tokens; /* xw_activation_token.link */
+
+    /* resolved commands for spawn-based actions (actions.conf) */
+    char cmd_terminal[256], cmd_appfinder[256], cmd_exit[256], cmd_lock[256];
+    char cmd_screenshot[256], cmd_vol_up[256], cmd_vol_down[256];
+    char cmd_vol_mute[256], cmd_media[256];
+
     struct wl_event_source *repaint_idle;
     bool repaint_scheduled;
 
@@ -494,6 +534,9 @@ struct xw_compositor {
 
 void xw_schedule_repaint(struct xw_compositor *c);
 void xw_render_output(struct xw_output *o);
+/* straight (non-premultiplied) ARGB8888 rect fill */
+void xw_render_fill_rect(pixman_image_t *dst, pixman_op_t op, uint32_t color,
+                         int x, int y, int w, int h);
 
 /* protocol errors */
 enum {

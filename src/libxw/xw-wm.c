@@ -33,7 +33,7 @@ struct xw_seat *xw_seat_first(struct xw_compositor *c) {
 /* first visible window in MRU order, excluding a given window */
 static struct xw_window *next_visible(struct xw_wm *wm, struct xw_window *exclude) {
     struct xw_window *w;
-    wl_list_for_each(w, &wm->stack, link) {
+    wl_list_for_each(w, &wm->stack, stack_link) {
         if (w != exclude && xw_wm_window_visible(wm, w))
             return w;
     }
@@ -259,7 +259,7 @@ void xw_wm_cycle(struct xw_wm *wm, bool forward) {
     struct xw_window *visible[XW_MAX_WINDOWS];
     int n = 0;
     struct xw_window *w;
-    wl_list_for_each(w, &wm->stack, link) {
+    wl_list_for_each(w, &wm->stack, stack_link) {
         if (xw_wm_window_visible(wm, w))
             visible[n++] = w;
     }
@@ -287,7 +287,7 @@ void xw_wm_switch_workspace(struct xw_wm *wm, int idx) {
     /* refocus topmost visible window on the new workspace */
     struct xw_window *top = NULL;
     struct xw_window *w;
-    wl_list_for_each(w, &wm->stack, link) {
+    wl_list_for_each(w, &wm->stack, stack_link) {
         if (xw_wm_window_visible(wm, w)) {
             top = w;
             break;
@@ -316,7 +316,7 @@ void xw_wm_window_to_workspace(struct xw_wm *wm, struct xw_window *w, int idx) {
         if (seat)
             xw_seat_set_kb_focus(seat, NULL);
         struct xw_window *alt;
-        wl_list_for_each(alt, &wm->stack, link) {
+        wl_list_for_each(alt, &wm->stack, stack_link) {
             if (alt != w && xw_wm_window_visible(wm, alt)) {
                 xw_wm_focus_window(wm, alt, true);
                 break;
@@ -330,7 +330,7 @@ void xw_wm_show_desktop(struct xw_wm *wm) {
     if (!wm->sd_active) {
         wm->sd_count = 0;
         struct xw_window *w;
-        wl_list_for_each(w, &wm->stack, link) {
+        wl_list_for_each(w, &wm->stack, stack_link) {
             if (xw_wm_window_visible(wm, w) && wm->sd_count < XW_MAX_WINDOWS)
                 wm->sd_windows[wm->sd_count++] = w;
         }
@@ -420,7 +420,7 @@ void xw_wm_minimize(struct xw_wm *wm, struct xw_window *w, bool on) {
         if (seat)
             xw_seat_set_kb_focus(seat, NULL);
         struct xw_window *alt;
-        wl_list_for_each(alt, &wm->stack, link) {
+        wl_list_for_each(alt, &wm->stack, stack_link) {
             if (alt != w && xw_wm_window_visible(wm, alt)) {
                 xw_wm_focus_window(wm, alt, true);
                 break;
@@ -523,7 +523,7 @@ bool xw_wm_window_visible(struct xw_wm *wm, struct xw_window *w) {
 struct xw_window *xw_wm_window_at(struct xw_wm *wm, int x, int y,
                                   struct xw_surface **surface_out) {
     struct xw_window *w;
-    wl_list_for_each(w, &wm->stack, link) {
+    wl_list_for_each(w, &wm->stack, stack_link) {
         if (!xw_wm_window_visible(wm, w) || !w->surface)
             continue;
         if (xw_surface_has_input_at(w->surface, x, y)) {
@@ -556,6 +556,7 @@ bool xw_wm_interactive_begin_move(struct xw_wm *wm, struct xw_window *w, int px,
 
 bool xw_wm_interactive_begin_resize(struct xw_wm *wm, struct xw_window *w,
                                     int edges, int px, int py) {
+    (void)wm;
     (void)px;
     (void)py;
     if (!w || w->fullscreen || w->maximized)
@@ -637,6 +638,15 @@ void xw_wm_interactive_end(struct xw_wm *wm, struct xw_window *w) {
     w->inter.mode = 0;
     w->inter.snap = 0;
     w->inter.edges = 0;
+}
+
+struct xw_window *xw_wm_interactive_window(struct xw_wm *wm) {
+    struct xw_window *w;
+    wl_list_for_each(w, &wm->stack, stack_link) {
+        if (w->inter.mode != 0)
+            return w;
+    }
+    return NULL;
 }
 
 bool xw_wm_interactive_key(struct xw_wm *wm, struct xw_window *w, uint32_t code,
