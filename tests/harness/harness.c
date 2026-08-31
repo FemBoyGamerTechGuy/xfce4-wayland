@@ -83,10 +83,20 @@ void xwt_end(struct xwt_ctx *t) {
 void xwt_pump(struct xwt_ctx *t) { xwt_pump_server(t); }
 
 int xwt_run_all(void) {
-    printf("xw test suite: %d tests\n", g_n_tests);
+    const char *filter = getenv("XWT_FILTER");
+    int selected = 0;
+    for (int i = 0; i < g_n_tests; i++)
+        if (!filter || !*filter || strstr(g_tests[i].name, filter))
+            selected++;
+    printf("xw test suite: %d tests%s%s%s\n", selected,
+           filter && *filter ? " (filter: \"" : "",
+           filter && *filter ? filter : "",
+           filter && *filter ? "\")" : "");
     struct xwt_ctx t;
     int passed = 0;
     for (int i = 0; i < g_n_tests; i++) {
+        if (filter && *filter && !strstr(g_tests[i].name, filter))
+            continue;
         xwt_current = g_tests[i].name;
         xwt_tests++;
         printf("[%2d] %-40s", i + 1, g_tests[i].name);

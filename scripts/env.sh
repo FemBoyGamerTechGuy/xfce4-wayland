@@ -8,7 +8,8 @@
 # contains third-party binaries/headers under their own licenses; the
 # repository itself stays clean of prebuilt artifacts.
 
-XW_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# ${BASH_SOURCE:-$0}: when sourced with '.', $0 is the shell, not this file
+XW_ROOT="$(cd "$(dirname "${BASH_SOURCE:-$0}")/.." && pwd)"
 XW_SYSROOT="$(cd "$XW_ROOT/.." 2>/dev/null && pwd)/.toolchain/sysroot"
 
 if [ -d "$XW_SYSROOT/usr" ]; then
@@ -21,7 +22,8 @@ else
 fi
 
 # XDG_RUNTIME_DIR must exist for Wayland sockets.
-if [ -z "$XDG_RUNTIME_DIR" ]; then
+# ${VAR:-} so that set -u callers can source this file safely.
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
     XDG_RUNTIME_DIR="/tmp/xdg-runtime-$(id -u)"
     export XDG_RUNTIME_DIR
 fi

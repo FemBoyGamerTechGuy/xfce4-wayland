@@ -2,12 +2,18 @@
  * in-process compositor with tracing */
 #include "xwtest.h"
 #include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 int main(void) {
-    /* reproduce the suite's history: 9 compositor instances first */
-    for (int i = 0; i < 9; i++) {
+    /* reproduce the suite's history: N compositor instances first (default 9
+     * to match the full-suite run; set XWT_PREINSTANCES=0 to mimic an
+     * isolated session-test run) */
+    const char *pre = getenv("XWT_PREINSTANCES");
+    int n_pre = pre ? atoi(pre) : 9;
+    for (int i = 0; i < n_pre; i++) {
         struct xwt_ctx prev;
         if (xwt_begin(&prev, NULL) < 0)
             return 1;
@@ -23,9 +29,14 @@ int main(void) {
     if (pid == 0) {
         setenv("WAYLAND_DISPLAY", t.socket_name, 1);
         setenv("XDG_RUNTIME_DIR", g_runtimedir(), 1);
-        fprintf(stderr, "child: exec xw-exit\n");
-        execl("/tmp/xw-exit-dbg", "xw-exit", NULL);
-        fprintf(stderr, "child: exec failed: %s\n", strerror(errno));
+        int logfd = open("/tmp/xw-exit-child.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (logfd >= 0)
+            dup2(logfd, STDERR_FILENO);
+        const char *bin = getenv("XW_EXIT_BIN");
+        if (!bin)
+            bin = "build/bin/xw-exit";
+        execl(bin, "xw-exit", NULL);
+        fprintf(stderr, "child: exec %s failed: %s\n", bin, strerror(errno));
         _exit(127);
     }
     /* pump and watch layer state */
@@ -41,10 +52,18 @@ int main(void) {
             struct xw_layer_surface *ls = NULL;
             for (int l = 3; l >= 0 && !ls; l--)
                 wl_list_for_each(ls, &t.comp->wm->layers[l], link) break;
+            struct xw_output *o = wl_container_of(t.comp->outputs.next, o, link);
+            const uint32_t *pix =
+                (const uint32_t *)pixman_image_get_data(o->native);
+            int pw = pixman_image_get_width(o->native);
             fprintf(stderr,
-                    "pump %d: layers=%d mapped=%d kb=%u focus=%p layer=%p\n",
+                    "pump %d: layers=%d mapped=%d kb=%u focus=%p layer=%p "
+                    "ls_xywh=%d,%d %dx%d dmg=%d center=0x%08x\n",
                     i, n, ls ? ls->mapped : 0, ls ? ls->keyboard_interactivity : 0,
-                    (void*)(seat ? seat->kb_focus : NULL), (void*)(ls ? ls->surface : NULL));
+                    (void*)(seat ? seat->kb_focus : NULL), (void*)(ls ? ls->surface : NULL),
+                    ls ? ls->x : -1, ls ? ls->y : -1, ls ? ls->w : -1, ls ? ls->h : -1,
+                    pixman_region_not_empty(&o->damage),
+                    pix[pw * (o->height / 2) + o->width / 2]);
         }
         if (i == 50) {
             fprintf(stderr, "injecting Escape\n");

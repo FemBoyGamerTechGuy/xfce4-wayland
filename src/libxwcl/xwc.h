@@ -100,6 +100,10 @@ void xwc_win_fullscreen(struct xwc_win *w, bool on);
 void xwc_win_minimize(struct xwc_win *w);
 /* xdg toplevel resource (for foreign-toplevel / activation requests) */
 void *xwc_win_toplevel(struct xwc_win *w);
+/* wl_surface resource (xdg-activation target, raw protocol tests) */
+void *xwc_win_surface(struct xwc_win *w);
+/* xdg_surface resource (popup parents, raw protocol tests) */
+void *xwc_win_xdg_surface(struct xwc_win *w);
 /* mapped state (configure + first commit done) */
 bool xwc_win_mapped(struct xwc_win *w);
 
@@ -109,6 +113,8 @@ struct xwc_layer *xwc_layer_create(struct xwc *c, const struct xwc_callbacks *cb
                                   int exclusive_zone, int w, int h);
 /* 0 = none, 1 = exclusive, 2 = on-demand (must precede mapping) */
 void xwc_layer_set_keyboard(struct xwc_layer *l, uint32_t mode);
+/* move the surface to another layer (0=background .. 3=overlay) */
+void xwc_layer_set_layer(struct xwc_layer *l, uint32_t layer);
 void xwc_layer_destroy(struct xwc_layer *l);
 uint32_t *xwc_layer_pixels(struct xwc_layer *l, int *stride);
 void xwc_layer_commit(struct xwc_layer *l);

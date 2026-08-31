@@ -31,8 +31,10 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
 - DONE xdg-shell server (toplevel): configure/ack state machine,
   initial map cycle, maximize/minimize/fullscreen with restores,
   size hints accepted.
-- DONE xdg-shell popups: positioner math (anchor/gravity/offset, flip
-  and slide constraint adjustment), seat grab, dismissal, reposition.
+- DONE xdg-shell popups: positioner math (anchor/gravity incl. corner
+  combinations/offset, flip and slide constraint adjustment), seat grab,
+  dismissal, reposition, outside-click dismissal of the popup chain
+  (xfwm4 menu behavior).
 - DONE window manager: workspaces (count/names via workspaces.conf),
   stacking, click-to-focus + raise, focus fallback on unmap/minimize,
   cascade placement, MRU cycle (Alt+Tab), show-desktop toggle,
@@ -61,8 +63,9 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
 - TODO xkb per-seat runtime layout switching.
 
 ## M4 — Desktop integration protocols
-- DONE layer-shell (server): anchoring, margins, exclusive zones →
-  wm usable area, keyboard interactivity (exclusive + on-demand).
+- DONE layer-shell (server): set_size/set_anchor/margins/exclusive
+  zones → wm usable area, set_layer restacking, keyboard interactivity
+  (exclusive + on-demand).
 - DONE xdg-activation (tokens, single-use, focus handover).
 - DONE wlr-foreign-toplevel-management (handles, state, requests).
 - DONE ext-workspace (group + workspace handles, activate switching).
@@ -73,18 +76,29 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
 - TODO primary-selection + ext-data-control.
 
 ## M5 — Data transfer
-- DONE wl_data_device manager: selection with cross-client offers,
-  receive forwarding, basic drag & drop (enter/motion/drop/cancel).
+- DONE wl_data_device manager: selection with cross-client offers
+  (NULL-source clears honestly — no fabricated empty offers), receive
+  forwarding, basic drag & drop (enter/motion/drop/cancel).
 - TODO action negotiation (v3 set_actions), clipboard persistence,
   drag icons, primary selection.
 
 ## M6 — Session
-- TODO xw-session: runtime dir, autostart (XDG .desktop parsing),
-  supervision, control socket, clean shutdown ordering.
-- TODO power actions via loginctl CLI (logind/elogind).
-- TODO graphical exit dialog (xw-exit: Log Out/Restart/Shutdown/
-  Reboot/Suspend/Hibernate) + Ctrl+Alt+Delete binding (the action
-  and default binding exist; the dialog client is not written yet).
+- DONE xw-session: runtime dir, autostart (XDG .desktop parsing with
+  OnlyShowIn/NotShowIn/Hidden + user-overrides-system), compositor
+  supervision with bounded restarts, control socket line protocol,
+  clean shutdown ordering (clients → compositor → sockets).
+- DONE xw-session-ctl: status/ping/logout/restart/shutdown/reboot/
+  suspend/hibernate commands.
+- DONE power actions via loginctl CLI; fails honestly when logind/
+  elogind is unavailable (asserted by the process-level test).
+- DONE xw-exit graphical exit dialog (layer-shell modal overlay,
+  exclusive keyboard, arrows/Enter/Escape/per-button hotkeys, mouse
+  hit-testing, ctl wiring for all six actions).
+- PART Ctrl+Alt+Delete fires the exit-dialog action; the dialog
+  appears only if `cmd_exit` resolves to the xw-exit binary in the
+  compositor's actions.conf search path (default shipped config does).
+- PART session restart path (re-exec) implemented but not covered by
+  an automated test.
 - TODO session save/restore, screen lock, idle actions.
 
 ## M7 — Panel / desktop
@@ -98,14 +112,18 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
   foundation; the core desktop does not use it).
 
 ## M9 — Hardening/quality
-- DONE zero-warning builds (-Wall -Wextra -Werror), ASAN-clean
-  integration suite (no leaks, no UB) for core flows.
+- DONE zero-warning builds (-Wall -Wextra -Werror, also under -O1),
+  ASAN/UBSAN/LSAN-clean suite + process tests (`make asan`),
+  scoped child reaping (compositor only reaps what it spawned),
+  regression tests for every fixed bug (see TESTING.md).
 - TODO fuzz protocol parsing, sanitizer CI job, performance
   benchmarks, security review (see SECURITY.md).
 
 ## Client library (libxwcl)
 - DONE connection + global binding (pumped sync for in-process
-  tests), shm double-buffered toplevel windows, layer-shell surfaces,
-  client-side xkb, input callbacks, bitmap-font drawing helpers.
+  tests), shm double-buffered toplevel windows, layer-shell surfaces
+  (incl. set_layer), client-side xkb, input callbacks, bitmap-font
+  drawing helpers, surface/xdg_surface/toplevel accessors for
+  activation and popup parents.
 - TODO popup windows helper, activation token helper, data-device
   (clipboard) helper for clients.

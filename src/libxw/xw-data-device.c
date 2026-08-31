@@ -286,11 +286,16 @@ static void device_set_selection(struct wl_client *client,
     if (source)
         xw_log(XW_LOG_DEBUG, "data-device: selection set");
 
-    /* notify everyone else */
+    /* notify everyone else; a NULL source clears their selection without
+     * creating an offer (spec: selection offer may be null) */
     struct xw_data_device_res *d;
     wl_list_for_each(d, &seat->data_devices, link) {
-        if (source && wl_resource_get_client(d->res) == client)
+        if (wl_resource_get_client(d->res) == client)
             continue;
+        if (!source) {
+            wl_data_device_send_selection(d->res, NULL);
+            continue;
+        }
         struct xw_data_offer *off = offer_create(d, source);
         if (off)
             wl_data_device_send_selection(d->res, off->res);

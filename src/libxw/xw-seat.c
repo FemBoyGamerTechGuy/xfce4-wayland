@@ -252,12 +252,6 @@ void xw_seat_set_kb_focus(struct xw_seat *s, struct xw_surface *surface) {
     s->kb_focus = surface;
     if (newc) {
         struct wl_resource *k;
-        int nkb = 0;
-        wl_list_for_each(k, &s->keyboards, link)
-            if (wl_resource_get_client(k) == newc)
-                nkb++;
-        fprintf(stderr, "[kdbg] enter: focus client %p has %d keyboards\n",
-                (void*)newc, nkb);
         wl_list_for_each(k, &s->keyboards, link) {
             if (wl_resource_get_client(k) == newc) {
                 struct wl_array empty;
@@ -455,13 +449,33 @@ void xw_seat_pointer_button(struct xw_seat *s, uint32_t linux_button,
         return;
     }
 
+    /* a press outside the topmost popup dismisses the popup chain
+     * (menu/tooltip behavior: xfwm4 closes menus on outside clicks) */
+    if (down && !s->ptr_grab) {
+        struct xw_popup *p;
+        wl_list_for_each_reverse(p, &c->popups, link) {
+            if (!p->mapped)
+                continue;
+            if (s->ptr_focus && p->surface == s->ptr_focus)
+                break; /* the press is on this popup: keep it (and its
+                          * parents, below us in the list) open */
+            xw_popup_dismiss(p);
+        }
+    }
+
     /* click-to-focus + raise on window press (xfwm4 default) */
     if (down && s->ptr_focus && !s->ptr_grab) {
-        struct xw_window *w = NULL;
-        wl_list_for_each(w, &c->wm->stack, stack_link)
-            if (w->surface == s->ptr_focus)
+        /* find the window under the pointer; wl_list_for_each yields the
+         * head sentinel (not a valid window) when nothing matches */
+        struct xw_window *w;
+        bool hit = false;
+        wl_list_for_each(w, &c->wm->stack, stack_link) {
+            if (w->surface == s->ptr_focus) {
+                hit = true;
                 break;
-        if (w && w->surface == s->ptr_focus) {
+            }
+        }
+        if (hit) {
             if (w->ws != -1 && w->ws != c->wm->ws_current) {
                 /* clicking a window of another workspace can't happen
                  * (invisible), defensive only */

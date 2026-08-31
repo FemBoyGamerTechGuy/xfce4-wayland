@@ -5,50 +5,88 @@ against the **headless backend** with the pixman software renderer.
 
 ## Layout
 
-- `tests/harness/xwtest.h` — assert framework, test registration, child
-  process orchestration, leak counters.
+- `tests/harness/xwtest.h` — assert framework (`XWT_CHECK`,
+  `XWT_ASSERT`, `XWT_WAIT`), test registration.
 - `tests/harness/harness.c` — embeds the compositor in-process, drives
-  the event loop between injections, collects results.
-- `tests/harness/client.c` — scripted Wayland client (real
-  libwayland-client) used from forked children, reporting protocol
-  events back over a pipe.
-- `tests/suite/*.c` — the suites (core, wm, input/shortcuts, clipboard,
-  layer-shell/panel-integration, session).
+  both sides deterministically (server dispatch + client read) between
+  input injections.
+- `tests/harness/client.c` — shared helpers for the in-process test
+  client (solid-color windows).
+- `tests/suite/test_core.c` — core, WM, input/shortcut suite.
+- `tests/suite/test_protocols.c` — desktop-integration protocol suite
+  (layer-shell, popups, clipboard, foreign-toplevel, activation); raw
+  Wayland objects are driven directly next to white-box assertions.
+- `tests/suite/test_session.c` — the graphical exit dialog as a real
+  child process against the in-process compositor.
+- `scripts/test-session.sh` — process-level session integration test
+  (real `xw-session` + `xw-compositor` children, ctl socket, autostart
+  filtering, clean logout).
+- `scripts/run-asan.sh` — full sanitizer regression pass (ASan + UBSan
+  + LeakSanitizer) including the process-level test; restores the
+  release build afterwards.
+- `tests/debug-layer.c` — scratch reproducer for layer-shell child
+  processes (not part of the suite; built ad hoc when debugging).
 
 ## Running
 
-    make tests        # builds and runs build/tests/run-tests
-    build/tests/run-tests [suite-name ...]   # subset
-    build/tests/run-tests -v                 # verbose per-check output
+    make tests        # builds and runs the in-process suite
+    make check        # in-process suite + process-level session test
+    make asan         # full sanitizer pass (rebuilds, tests, restores)
 
-## What is covered today
+Filtering tests (triage):
+
+    XWT_FILTER=popup build/tests/run-tests    # name substring
+    XWT_PREINSTANCES=0 ...                    # debug-layer only
+
+## What is covered today (16 in-process tests + 18 process checks)
 
 - compositor bootstrap + clean shutdown; socket lifecycle
 - output creation, geometry, scale; multi-output
-- wl_shm buffer attach/damage/commit; frame callbacks
-- xdg toplevel lifecycle: map/unmap, title/app_id, configure/ack flow
-- maximize/minimize/fullscreen state machine incl. restore geometry
-- interactive move/resize (pointer-injected and keyboard-injected)
-- edge snapping + keyboard half-tiling
-- workspaces: switching, window assignment, sticky windows, wrap-around
-- focus: click-to-focus, focus-on-activation, Alt+Tab MRU order,
-  wl_keyboard enter/leave observable by clients
-- shortcut engine: exact-modifier matching, consume-vs-forward to the
-  focused client, conflicts reported, config reload, every default
-  binding's action fires
-- window rules: match on app_id/title, applied at map
-- clipboard: selection set/get across two clients; drag-drop basic flow
-- layer-shell: panel surface mapping, exclusive zone affects usable area
-- foreign-toplevel + ext-workspace export observable by a client
-- session end-to-end: xw-session launches compositor + stub components,
-  autostart filtering, LOGOUT/RESTART ctl protocol, clean child reaping,
-  power actions against a fake loginctl (command-line verification)
-- screenshots-as-pixels: window presence and stacking order verified by
-  reading the rendered output buffer
+- wl_shm buffer attach/damage/commit; pixel-exact rendering assertions
+- xdg toplevel lifecycle: map, title/app_id, configure/ack flow
+- workspaces: switching, wrap-around, visibility
+- shortcut engine: default table dispatch, consume-vs-forward
+  suppression, show-desktop
+- focus: click-to-focus + activation, pointer hit-testing
+- layer-shell: panel geometry, exclusive zone shrinking the usable
+  area, set_size/set_layer requests, exclusive keyboard interactivity
+  and focus release on teardown, overlay rendering
+- xdg popups: positioner math (anchor rect + anchor + corner gravity),
+  parent-relative configure, mapping, outside-click dismissal with
+  popup_done delivery
+- clipboard: wl_data_device selection set/clear, owner tracking,
+  NULL-source offers not fabricated
+- wlr-foreign-toplevel: existing-window announcement on bind, title
+  change events, new-window announcement, handle activation focusing
+  the window
+- xdg-activation: token issuance, focus handover, single-use policy
+  (replayed tokens rejected)
+- session exit: the exit dialog maps a modal overlay (pixel-verified),
+  takes keyboard, Escape cancels with exit code 0
+- process-level: session manager supervises the compositor child, ctl
+  protocol (ping/status/logout), honest power failure without logind,
+  XDG autostart filtering (OnlyShowIn/NotShowIn/Hidden), clean logout
+  (exit code 0, sockets removed, no leftover processes)
+
+Not yet covered (honest gaps): drag-and-drop flows, popup grabs,
+key repeat, multi-seat, D-Bus-free restart path, power actions against
+a real logind (no logind exists in the build container).
 
 ## Regression policy
 
-Every bug fixed during development gets a regression test named for it
-(`test_regression_<id>_*`). A fix without a regression test is not
-considered done. Bugs found so far are tracked in WORKLOG.md with their
-tests.
+Every bug fixed during development gets a test that fails without the
+fix. Bugs found so far are tracked in WORKLOG.md with their tests.
+Highlights (each verifiable by reverting the fix):
+
+- SIGCHLD reaping stole the exit dialog child's status from the test
+  (`exit-dialog-cancel`)
+- layer-shell `set_size` request unimplemented — server abort on
+  opcode 0 (`layer-shell-panel`)
+- corner gravities computed as "centered" on one axis
+  (`popup-positioning`)
+- `wl_list_for_each` head-sentinel dereference when pressing on a
+  layer surface (found by ASAN; `layer-shell-focus`)
+- activation token double-free / premature server-side destroy
+  (`foreign-toplevel-activation`)
+- NULL-source selection fabricated an empty offer to clients
+  (`clipboard-selection`)

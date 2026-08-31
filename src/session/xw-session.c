@@ -195,7 +195,13 @@ static pid_t start_compositor(void) {
     /* derive the wayland display name (basename) */
     const char *base = strrchr(line, '/');
     base = base ? base + 1 : line;
-    snprintf(S.socket_name, sizeof(S.socket_name), "%s", base);
+    if (snprintf(S.socket_name, sizeof(S.socket_name), "%s", base) >=
+        (int)sizeof(S.socket_name)) {
+        log_msg("error", "socket name too long");
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        return -1;
+    }
     S.comp_pid = pid;
     S.comp_ready = true;
     log_msg("info", "compositor ready: display %s (pid %d)", S.socket_name,
@@ -456,12 +462,12 @@ static int ctl_listen(void) {
         return -1;
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
-    if (strlen(S.ctl_path) >= sizeof(addr.sun_path)) {
+    int n = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", S.ctl_path);
+    if (n < 0 || (size_t)n >= sizeof(addr.sun_path)) {
         log_msg("error", "control socket path too long");
         close(fd);
         return -1;
     }
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", S.ctl_path);
     unlink(S.ctl_path);
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         log_msg("error", "ctl bind %s: %s", S.ctl_path, strerror(errno));

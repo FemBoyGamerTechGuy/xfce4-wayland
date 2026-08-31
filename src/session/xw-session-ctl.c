@@ -53,12 +53,12 @@ int main(int argc, char **argv) {
     }
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
-    if (strlen(path) >= sizeof(addr.sun_path)) {
+    int n = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+    if (n < 0 || (size_t)n >= sizeof(addr.sun_path)) {
         fprintf(stderr, "socket path too long\n");
         close(fd);
         return 1;
     }
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         fprintf(stderr, "cannot connect to %s: %s\n", path,
                 strerror(errno));
@@ -69,9 +69,9 @@ int main(int argc, char **argv) {
     dprintf(fd, "%s\n", cmd);
     /* read the reply line(s) */
     char buf[512];
-    ssize_t n;
-    while ((n = read(fd, buf, sizeof(buf) - 1)) > 0) {
-        buf[n] = 0;
+    ssize_t rn;
+    while ((rn = read(fd, buf, sizeof(buf) - 1)) > 0) {
+        buf[rn] = 0;
         fputs(buf, stdout);
     }
     close(fd);

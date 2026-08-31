@@ -161,13 +161,12 @@ static void act_activate(struct wl_client *client, struct wl_resource *res,
     wl_list_for_each_safe(t, t2, &c->activation_tokens, link) {
         if (t->token && strcmp(t->token, token) == 0) {
             valid = t->surface == NULL || t->surface == s;
-            /* tokens are single-use */
-            wl_list_remove(&t->link);
-            struct wl_resource *tr = t->res;
-            t->res = NULL;
+            /* single-use: invalidate the token string in place. The
+             * resource stays alive until the client destroys it — a
+             * server-side destroy would turn the client's own (spec-
+             * sanctioned) token destroy request into a protocol error. */
             free(t->token);
             t->token = NULL;
-            wl_resource_destroy(tr);
             break;
         }
     }

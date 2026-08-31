@@ -176,6 +176,15 @@ int xwc_sync(struct xwc *c) {
     return 0;
 }
 
+static void wm_base_ping(void *data, struct xdg_wm_base *b, uint32_t serial) {
+    (void)data;
+    xdg_wm_base_pong(b, serial);
+}
+
+static const struct xdg_wm_base_listener wm_base_listener = {
+    .ping = wm_base_ping,
+};
+
 int xwc_connect_pumped(struct xwc *c, const char *socket_name,
                        void (*pump)(void *ud), void *pump_ud) {
     memset(c, 0, sizeof(*c));
@@ -194,6 +203,7 @@ int xwc_connect_pumped(struct xwc *c, const char *socket_name,
         xwc_disconnect(c);
         return -1;
     }
+    xdg_wm_base_add_listener(c->wm_base, &wm_base_listener, c);
     if (!c->compositor || !c->shm || !c->seat || !c->wm_base) {
         fprintf(stderr, "xwc: missing globals (compositor=%p shm=%p seat=%p "
                         "wm_base=%p)\n",
@@ -378,19 +388,9 @@ static const struct xdg_surface_listener xdg_surface_listener = {
     .configure = xdg_surface_configure,
 };
 
-static void wm_base_ping(void *data, struct xdg_wm_base *b, uint32_t serial) {
-    (void)data;
-    xdg_wm_base_pong(b, serial);
-}
-
-static const struct xdg_wm_base_listener wm_base_listener = {
-    .ping = wm_base_ping,
-};
-
 struct xwc_win *xwc_win_create(struct xwc *c, const struct xwc_callbacks *cb,
                               const char *title, const char *app_id, int w,
                               int h) {
-    xdg_wm_base_add_listener(c->wm_base, &wm_base_listener, c);
     struct xwc_win *win = calloc(1, sizeof(*win));
     if (!win)
         return NULL;
@@ -488,6 +488,10 @@ void xwc_win_minimize(struct xwc_win *w) {
 }
 
 void *xwc_win_toplevel(struct xwc_win *w) { return w->toplevel; }
+/* wl_surface and xdg_surface proxies (for xdg-activation targets and
+ * xdg_popup parents) */
+void *xwc_win_surface(struct xwc_win *w) { return w->surface; }
+void *xwc_win_xdg_surface(struct xwc_win *w) { return w->xdg_surface; }
 
 bool xwc_win_mapped(struct xwc_win *w) { return w->mapped; }
 
@@ -592,6 +596,11 @@ void xwc_layer_resize(struct xwc_layer *l, int w, int h) {
 void xwc_layer_set_keyboard(struct xwc_layer *l, uint32_t mode) {
     if (l->ls)
         zwlr_layer_surface_v1_set_keyboard_interactivity(l->ls, mode);
+}
+
+void xwc_layer_set_layer(struct xwc_layer *l, uint32_t layer) {
+    if (l->ls)
+        zwlr_layer_surface_v1_set_layer(l->ls, layer);
 }
 
 /* ------------------------------------------------------ input routing */

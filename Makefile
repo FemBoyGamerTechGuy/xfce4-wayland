@@ -23,6 +23,7 @@ PYTHON   ?= python3
 
 CSTD     := -std=c11
 CFLAGS   ?= -O2 -g
+LDFLAGS  ?=
 WARN      = -Wall -Wextra -Werror -Wshadow -Wpointer-arith
 DEFS      = -D_GNU_SOURCE
 INCLUDES  = -Isrc -Isrc/libxw -Isrc/libxwcl -Itests/harness -Ibuild/gen
@@ -119,16 +120,16 @@ $(OBJ)/libxwcl/%.o: src/libxwcl/%.c src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/libx
 
 # ---------------------------------------------------------------- server bins
 build/bin/xw-compositor: $(OBJ)/compositor/xw-compositor.o build/lib/libxw.a | build/bin
-	$(CC) -o $@ $(OBJ)/compositor/xw-compositor.o build/lib/libxw.a $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/compositor/xw-compositor.o build/lib/libxw.a $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
 
 $(OBJ)/compositor/%.o: src/compositor/%.c $(LIBXW_DEPS) $(GEN_HEADERS) | $(OBJ)/compositor
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_XKB) $(CFLAGS_PIX) -c $< -o $@
 
 build/bin/xw-session: $(OBJ)/session/xw-session.o | build/bin
-	$(CC) -o $@ $(OBJ)/session/xw-session.o $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/session/xw-session.o $(LDLIBS_M)
 
 build/bin/xw-session-ctl: $(OBJ)/session/xw-session-ctl.o | build/bin
-	$(CC) -o $@ $(OBJ)/session/xw-session-ctl.o $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/session/xw-session-ctl.o $(LDLIBS_M)
 
 $(OBJ)/session/%.o: src/session/%.c | $(OBJ)/session
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) -c $< -o $@
@@ -136,13 +137,13 @@ $(OBJ)/session/%.o: src/session/%.c | $(OBJ)/session
 # ---------------------------------------------------------------- clients
 
 build/bin/xw-panel: $(OBJ)/clients/xw-panel.o build/lib/libxwcl.a | build/bin
-	$(CC) -o $@ $(OBJ)/clients/xw-panel.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-panel.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
 
 build/bin/xw-exit: $(OBJ)/clients/xw-exit.o build/lib/libxwcl.a | build/bin
-	$(CC) -o $@ $(OBJ)/clients/xw-exit.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-exit.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
 
 build/bin/xw-demo: $(OBJ)/clients/xw-demo.o build/lib/libxwcl.a | build/bin
-	$(CC) -o $@ $(OBJ)/clients/xw-demo.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-demo.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
 
 $(OBJ)/clients/%.o: src/clients/%.c src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/clients
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLC) $(CFLAGS_PIX) -c $< -o $@
@@ -150,9 +151,9 @@ $(OBJ)/clients/%.o: src/clients/%.c src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/clie
 # ---------------------------------------------------------------- tests
 TEST_SRC := $(wildcard tests/suite/*.c)
 build/tests/run-tests: $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a | build/tests
-	$(CC) -o $@ $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_WLC) $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_WLC) $(LDLIBS_M)
 
-$(OBJ)/tests/%.o: tests/suite/%.c tests/harness/xwtest.h | $(OBJ)/tests
+$(OBJ)/tests/%.o: tests/suite/%.c tests/harness/xwtest.h $(LIBXW_DEPS) $(GEN_HEADERS) | $(OBJ)/tests
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_WLC) $(CFLAGS_PIX) $(CFLAGS_XKB) -c $< -o $@
 
 $(OBJ)/tests/harness.o: tests/harness/harness.c tests/harness/xwtest.h $(LIBXW_DEPS) $(GEN_HEADERS) | $(OBJ)/tests
@@ -162,7 +163,7 @@ $(OBJ)/tests/client.o: tests/harness/client.c tests/harness/xwtest.h $(GEN_HEADE
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLC) $(CFLAGS_PIX) -c $< -o $@
 
 # ---------------------------------------------------------------- targets
-.PHONY: all tests clean dist
+.PHONY: all tests check asan clean dist
 
 all: build/bin/xw-compositor build/tests/run-tests
 # session manager, exit dialog, panel, demo client: added in later
@@ -175,6 +176,12 @@ all: build/bin/xw-compositor $(SESSION_BINS) $(CLIENT_BINS) build/tests/run-test
 
 tests: all
 	build/tests/run-tests
+
+check: tests
+	sh scripts/test-session.sh
+
+asan:
+	sh scripts/run-asan.sh
 
 clean:
 	rm -rf build dist

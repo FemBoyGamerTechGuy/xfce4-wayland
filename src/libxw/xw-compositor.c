@@ -162,11 +162,32 @@ static int on_signal(int sig, void *data) {
 }
 
 static int reap_children(int sig, void *data) {
+    /* Reap only children the compositor itself spawned. Embedder children
+     * (harness, session manager) must stay reapable by their owner: a
+     * blanket waitpid(-1) here silently steals their exit statuses. */
     (void)sig;
-    (void)data;
-    while (waitpid(-1, NULL, WNOHANG) > 0)
-        ;
+    struct xw_compositor *c = data;
+    for (int i = 0; i < c->n_children;) {
+        pid_t r = waitpid(c->children[i], NULL, WNOHANG);
+        if (r == c->children[i] || (r < 0 && errno == ECHILD)) {
+            xw_log(XW_LOG_DEBUG, "child %d exited", (int)c->children[i]);
+            c->children[i] = c->children[--c->n_children];
+        } else {
+            i++;
+        }
+    }
     return 0;
+}
+
+void xw_compositor_track_child(struct xw_compositor *c, pid_t pid) {
+    if (pid <= 0)
+        return;
+    if (c->n_children >= XW_MAX_CHILDREN) {
+        xw_log(XW_LOG_WARN, "child table full; %d will not be reaped",
+               (int)pid);
+        return;
+    }
+    c->children[c->n_children++] = pid;
 }
 
 static void on_repaint_idle(void *data) {

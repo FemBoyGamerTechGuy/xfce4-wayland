@@ -69,7 +69,7 @@ struct xw_wm *xw_wm_create(struct xw_compositor *c, const char *config_dir) {
                     wm->ws_count = n;
             }
             for (int i = 0; i < XW_MAX_WS; i++) {
-                char key[16];
+                char key[32];
                 snprintf(key, sizeof(key), "name_%d", i + 1);
                 const char *name = xw_ini_get(ini, "workspaces", key);
                 if (name && *name)

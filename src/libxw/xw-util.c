@@ -135,7 +135,6 @@ void xw_argv_free(char **argv) {
 }
 
 pid_t xw_spawn_command(struct xw_compositor *c, const char *cmdline) {
-    (void)c;
     if (!cmdline || !*cmdline) {
         xw_log(XW_LOG_ERROR, "spawn: empty command");
         return -1;
@@ -158,6 +157,7 @@ pid_t xw_spawn_command(struct xw_compositor *c, const char *cmdline) {
         _exit(127);
     }
     xw_log(XW_LOG_INFO, "spawn: pid %d: %s", pid, cmdline);
+    xw_compositor_track_child(c, pid);
     return pid;
 }
 

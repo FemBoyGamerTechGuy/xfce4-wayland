@@ -28,8 +28,12 @@ int64_t xw_now_ms(void);
 char **xw_command_split(const char *cmdline);
 void xw_argv_free(char **argv);
 /* Async-ish child spawn: fork + exec via /bin/sh -c. Returns pid or -1.
- * Children are reaped by the compositor's SIGCHLD source. */
+ * Spawned pids are tracked by the compositor; only tracked children are
+ * reaped by the compositor's SIGCHLD source. */
 pid_t xw_spawn_command(struct xw_compositor *c, const char *cmdline);
+/* Register an externally forked child that the compositor should reap
+ * (used by xw_spawn_command after fork). */
+void xw_compositor_track_child(struct xw_compositor *c, pid_t pid);
 
 /* --------------------------------------------------------------- ini file */
 struct xw_ini_entry {
@@ -482,6 +486,14 @@ void xw_popup_reposition(struct xw_popup *p);
 void xw_popup_dismiss(struct xw_popup *p);
 
 /* ------------------------------------------------------------ compositor */
+
+/* Children spawned by the compositor itself (xw_spawn_command). Only these
+ * are reaped by the compositor's SIGCHLD source: children forked by the
+ * embedding process (session manager, test harness, panel plugins) belong
+ * to their spawner, and stealing their exit status breaks waitpid-based
+ * supervision. */
+#define XW_MAX_CHILDREN 16
+
 struct xw_compositor {
     struct wl_display *display;
     struct wl_event_loop *loop;
@@ -490,6 +502,8 @@ struct xw_compositor {
     int exit_code;
 
     struct wl_event_source *sigint_src, *sigterm_src, *sigchld_src;
+    pid_t children[XW_MAX_CHILDREN];
+    int n_children;
 
     struct xw_backend *backend;
 

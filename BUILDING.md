@@ -38,7 +38,9 @@ interactive shells.
 ## Targets
 
     make            # everything (libs, binaries, tests binary)
-    make tests      # build + run the test suite
+    make tests      # build + run the in-process test suite
+    make check      # tests + process-level session test (test-session.sh)
+    make asan       # sanitizer regression pass (scripts/run-asan.sh)
     make clean      # remove build/
     make dist       # source tarball into dist/
 

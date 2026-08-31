@@ -394,29 +394,39 @@ static void positioner_anchor_point(const struct xw_positioner *p, int *px,
     }
 }
 
-/* gravity: negative direction (left/top) → child edge at anchor point;
- * positive (right/bottom) → child starts at anchor; none → centered */
+/* gravity: the popup edge/corner that touches the anchor point.
+ * LEFT → child's left edge at the anchor (x = px - cw); RIGHT → right
+ * edge (x = px); TOP → top edge (y = py - ch); BOTTOM → bottom edge
+ * (y = py); corners combine both axes; NONE → centered. */
 static void gravity_offset(uint32_t gravity, int cw, int ch, int *ox,
                            int *oy) {
     switch (gravity) {
     case XDG_POSITIONER_GRAVITY_LEFT:
+    case XDG_POSITIONER_GRAVITY_TOP_LEFT:
+    case XDG_POSITIONER_GRAVITY_BOTTOM_LEFT:
         *ox = -cw;
         break;
     case XDG_POSITIONER_GRAVITY_RIGHT:
+    case XDG_POSITIONER_GRAVITY_TOP_RIGHT:
+    case XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT:
         *ox = 0;
         break;
-    default:
+    default: /* NONE: centered */
         *ox = -cw / 2;
         break;
     }
     switch (gravity) {
     case XDG_POSITIONER_GRAVITY_TOP:
+    case XDG_POSITIONER_GRAVITY_TOP_LEFT:
+    case XDG_POSITIONER_GRAVITY_TOP_RIGHT:
         *oy = -ch;
         break;
     case XDG_POSITIONER_GRAVITY_BOTTOM:
+    case XDG_POSITIONER_GRAVITY_BOTTOM_LEFT:
+    case XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT:
         *oy = 0;
         break;
-    default:
+    default: /* NONE: centered */
         *oy = -ch / 2;
         break;
     }
@@ -552,9 +562,9 @@ static void popup_place(struct xw_popup *p) {
     if (p->parent) {
         int px, py;
         xw_surface_get_pos(p->parent, &px, &py, NULL, NULL);
-        px += pos->ax;
-        py += pos->ay;
         int apx, apy;
+        /* anchor point is in parent-surface coordinates (rect origin
+         * included) — do not add the rect origin twice */
         positioner_anchor_point(pos, &apx, &apy);
         compute_popup_position(p->comp, pos, px + apx, py + apy, p->w, p->h,
                                &p->anchor_x, &p->anchor_y);

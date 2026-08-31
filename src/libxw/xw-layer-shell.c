@@ -22,6 +22,8 @@ static struct xw_layer_shell *g_shell;
 /* ---------------------------------------------------- zwlr_layer_surface */
 
 static void ls_destroy_req(struct wl_client *client, struct wl_resource *res);
+static void ls_set_size(struct wl_client *client, struct wl_resource *res,
+                        uint32_t width, uint32_t height);
 static void ls_set_anchor(struct wl_client *client, struct wl_resource *res,
                           uint32_t anchor);
 static void ls_set_exclusive_zone(struct wl_client *client,
@@ -36,15 +38,19 @@ static void ls_get_popup(struct wl_client *client, struct wl_resource *res,
                          struct wl_resource *popup);
 static void ls_ack_configure(struct wl_client *client,
                              struct wl_resource *res, uint32_t serial);
+static void ls_set_layer(struct wl_client *client, struct wl_resource *res,
+                         uint32_t layer);
 
 static const struct zwlr_layer_surface_v1_interface layer_surface_impl = {
     .destroy = ls_destroy_req,
+    .set_size = ls_set_size,
     .set_anchor = ls_set_anchor,
     .set_exclusive_zone = ls_set_exclusive_zone,
     .set_margin = ls_set_margin,
     .set_keyboard_interactivity = ls_set_keyboard_interactivity,
     .get_popup = ls_get_popup,
     .ack_configure = ls_ack_configure,
+    .set_layer = ls_set_layer,
 };
 
 static struct xw_layer_surface *ls_from_res(struct wl_resource *res) {
@@ -120,6 +126,41 @@ static void ls_layout(struct xw_layer_surface *ls) {
 static void ls_destroy_req(struct wl_client *client, struct wl_resource *res) {
     (void)client;
     wl_resource_destroy(res);
+}
+
+static void ls_set_size(struct wl_client *client, struct wl_resource *res,
+                        uint32_t width, uint32_t height) {
+    (void)client;
+    struct xw_layer_surface *ls = ls_from_res(res);
+    ls->configured_w = (int)width;
+    ls->configured_h = (int)height;
+    if (!ls->mapped && ls->configured_sent) {
+        /* the client resized itself before mapping: update the pending
+         * configure so the committed geometry matches */
+        ls_configure(ls);
+    }
+}
+
+static void ls_set_layer(struct wl_client *client, struct wl_resource *res,
+                         uint32_t layer) {
+    (void)client;
+    struct xw_layer_surface *ls = ls_from_res(res);
+    if (layer > ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY) {
+        wl_resource_post_error(res, ZWLR_LAYER_SHELL_V1_ERROR_INVALID_LAYER,
+                               "invalid layer");
+        return;
+    }
+    if (ls->layer == (enum zwlr_layer_shell_v1_layer)layer)
+        return;
+    if (ls->mapped)
+        xw_damage_outputs_rect(ls->comp, ls->x, ls->y, ls->w, ls->h);
+    wl_list_remove(&ls->link);
+    wl_list_insert(ls->comp->wm->layers[layer].prev, &ls->link);
+    ls->layer = layer;
+    if (ls->mapped) {
+        xw_wm_recalculate_usable(ls->comp->wm);
+        xw_damage_outputs_rect(ls->comp, ls->x, ls->y, ls->w, ls->h);
+    }
 }
 
 static void ls_set_anchor(struct wl_client *client, struct wl_resource *res,

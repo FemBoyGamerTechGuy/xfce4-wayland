@@ -97,6 +97,10 @@ static void test_exit_dialog_rendered(struct xwt_ctx *t) {
         pix = xw_compositor_output_pixels(t->comp, 0, &pw, &ph);
         changed = (pix[ph / 2 * pw + pw / 2] != before) ||
                   (pix[10 * pw + 10] != before);
+        /* the dialog is a separate process: exec + connect + layer
+         * handshake need real wall-clock time, so pace the loop */
+        if (!changed)
+            usleep(10000);
     }
     XWT_CHECK(changed, "overlay pixels rendered");
     /* overlay layer surfaces exist */
