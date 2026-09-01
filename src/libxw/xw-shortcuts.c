@@ -70,6 +70,24 @@ static xkb_keysym_t parse_binding(struct xw_shortcuts *sc, const char *str,
     return xkb_keysym_from_name(p, XKB_KEYSYM_CASE_INSENSITIVE);
 }
 
+/* Keysym canonicalization: physical keys produce different keysyms
+ * depending on held modifiers (Shift+Tab -> ISO_Left_Tab, Alt+Print ->
+ * Sys_Req, keypad Enter -> KP_Enter). Keycode-based matchers (xfwm4)
+ * treat those as one key; a keysym matcher must canonicalize both the
+ * stored binding and the live event or the binding can never fire. */
+static xkb_keysym_t canonical_keysym(xkb_keysym_t sym) {
+    switch (sym) {
+    case XKB_KEY_ISO_Left_Tab:
+        return XKB_KEY_Tab;
+    case XKB_KEY_Sys_Req:
+        return XKB_KEY_Print;
+    case XKB_KEY_KP_Enter:
+        return XKB_KEY_Return;
+    default:
+        return sym;
+    }
+}
+
 static struct xw_shortcut *binding_add(struct xw_shortcuts *sc, int action,
                                        const char *arg, const char *binding) {
     xkb_mod_mask_t mods = 0;
@@ -84,7 +102,7 @@ static struct xw_shortcut *binding_add(struct xw_shortcuts *sc, int action,
     b->action = action;
     b->arg = arg ? strdup(arg) : NULL;
     b->binding_str = strdup(binding);
-    b->keysym = sym;
+    b->keysym = canonical_keysym(sym);
     b->mods = mods;
 
     /* conflict detection: exact duplicate (keysym, mods) */
@@ -352,6 +370,7 @@ bool xw_shortcuts_dispatch(struct xw_shortcuts *sc, struct xw_seat *seat,
                                                    XKB_STATE_MODS_DEPRESSED) &
                           ~seat->ignore_mask & sc->tracked_mods;
 
+    sym = canonical_keysym(sym);
     struct xw_shortcut *b;
     wl_list_for_each(b, &sc->bindings, link) {
         if (b->keysym != sym || b->mods != mods)

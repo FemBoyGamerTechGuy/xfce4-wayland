@@ -30,11 +30,14 @@
 #define K_F8 66
 #define K_F9 67
 #define K_F10 68
-#define K_F11 69
+#define K_F11 87
+#define K_F12 88
+#define K_NUMLOCK 69
 #define K_LEFTCTRL 29
 #define K_RIGHTCTRL 97
 #define K_LEFTSHIFT 42
 #define K_LEFTALT 56
+#define K_LEFTMETA 125 /* Super */
 #define K_DELETE 111
 #define K_INSERT 110
 #define K_HOME 102

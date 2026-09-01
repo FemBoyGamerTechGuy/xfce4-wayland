@@ -231,6 +231,104 @@ static void test_pointer_focus(struct xwt_ctx *t) {
     XWT_CHECK(w->activated, "window activated after click");
 }
 
+/* every binding in the default table must dispatch to its action
+ * through the real key pipeline (modifiers pressed as real keys) */
+static uint32_t keycode_for_keysym(struct xw_seat *s, xkb_keysym_t sym) {
+    for (uint32_t kc = 1; kc <= 255; kc++) {
+        int nlevels = xkb_keymap_num_levels_for_key(s->keymap, kc + 8, 0);
+        for (int lvl = 0; lvl < nlevels; lvl++) {
+            const xkb_keysym_t *syms;
+            int n = xkb_keymap_key_get_syms_by_level(s->keymap, kc + 8, 0,
+                                                     lvl, &syms);
+            for (int i = 0; i < n; i++)
+                if (syms[i] == sym)
+                    return kc;
+        }
+    }
+    return 0;
+}
+
+static void test_all_default_shortcuts(struct xwt_ctx *t) {
+    struct xwc_win *win = xwt_window_solid(t, 0xffcc3366, 200, 200, "Defs");
+    XWT_ASSERT(win);
+    XWT_WAIT(t, xw_compositor_window_count(t->comp) == 1);
+
+    struct xw_shortcuts *sc = t->comp->shortcuts;
+    struct xw_seat *s = xw_seat_first(t->comp);
+    XWT_ASSERT(s && sc);
+
+    xw_compositor_set_action_hook(t->comp, action_hook, NULL);
+
+    int total = 0, bad = 0, nosym = 0;
+    struct xw_shortcut *b;
+    wl_list_for_each(b, &sc->bindings, link) {
+        /* keypad bindings fire with NumLock on (their keysyms live at
+         * level 1, like on every real keyboard) */
+        bool kp = strstr(b->binding_str, "KP_") != NULL;
+        if (kp) {
+            xw_compositor_inject_key(t->comp, K_NUMLOCK, true);
+            xw_compositor_inject_key(t->comp, K_NUMLOCK, false);
+            xwt_pump(t);
+        }
+        uint32_t kc = keycode_for_keysym(s, b->keysym);
+        if (!kc) {
+            /* keysym exists in the table but not the evdev keymap */
+            nosym++;
+            XWT_CHECK(false, "no keycode for binding '%s' (keysym 0x%x)",
+                      b->binding_str, (unsigned)b->keysym);
+            continue;
+        }
+        total++;
+
+        /* press the binding's modifiers as real keys */
+        bool shift = b->mods & (1u << sc->mod_shift);
+        bool ctrl = b->mods & (1u << sc->mod_ctrl);
+        bool alt = b->mods & (1u << sc->mod_alt);
+        bool super_ = b->mods & (1u << sc->mod_super);
+        if (shift)
+            xw_compositor_inject_key(t->comp, K_LEFTSHIFT, true);
+        if (ctrl)
+            xw_compositor_inject_key(t->comp, K_LEFTCTRL, true);
+        if (alt)
+            xw_compositor_inject_key(t->comp, K_LEFTALT, true);
+        if (super_)
+            xw_compositor_inject_key(t->comp, K_LEFTMETA, true);
+
+        g_hook_n = 0;
+        xw_compositor_inject_key(t->comp, kc, true);
+        xwt_pump(t);
+        xw_compositor_inject_key(t->comp, kc, false);
+        xwt_pump(t);
+
+        if (super_)
+            xw_compositor_inject_key(t->comp, K_LEFTMETA, false);
+        if (alt)
+            xw_compositor_inject_key(t->comp, K_LEFTALT, false);
+        if (ctrl)
+            xw_compositor_inject_key(t->comp, K_LEFTCTRL, false);
+        if (shift)
+            xw_compositor_inject_key(t->comp, K_LEFTSHIFT, false);
+        xwt_pump(t);
+
+        if (g_hook_n != 1 || g_hook_actions[0] != b->action) {
+            bad++;
+            XWT_CHECK(false, "binding '%s' (action %d) did not dispatch "
+                      "(hook fired %d, first action %d)", b->binding_str,
+                      b->action, g_hook_n,
+                      g_hook_n > 0 ? g_hook_actions[0] : -1);
+        }
+        if (kp) { /* NumLock off again for the non-KP bindings */
+            xw_compositor_inject_key(t->comp, K_NUMLOCK, true);
+            xw_compositor_inject_key(t->comp, K_NUMLOCK, false);
+            xwt_pump(t);
+        }
+    }
+    XWT_CHECK(bad == 0 && total > 25,
+              "default table: %d/%d bindings dispatch (%d unmapped)",
+              total - bad, total, nosym);
+    xw_compositor_set_action_hook(t->comp, NULL, NULL);
+}
+
 /* ------------------------------------------------------------ registration */
 
 static const struct xwt_test tests[] = {
@@ -241,6 +339,7 @@ static const struct xwt_test tests[] = {
     {"workspace-switch", test_workspace_switch},
     {"shortcut-close", test_shortcut_table},
     {"shortcut-suppression", test_shortcut_release_suppression},
+    {"shortcut-all-defaults", test_all_default_shortcuts},
     {"shortcut-show-desktop", test_shortcut_show_desktop},
     {"pointer-focus", test_pointer_focus},
 };
