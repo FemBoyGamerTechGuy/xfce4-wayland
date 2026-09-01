@@ -14,9 +14,18 @@ static void output_send_details(struct wl_resource *res, struct xw_output *o) {
     if (wl_resource_get_version(res) >= WL_OUTPUT_NAME_SINCE_VERSION)
         wl_output_send_name(res, o->name);
     if (wl_resource_get_version(res) >= WL_OUTPUT_DESCRIPTION_SINCE_VERSION)
-        wl_output_send_description(res, "xw headless output");
+        wl_output_send_description(res, "xw output");
     if (wl_resource_get_version(res) < WL_OUTPUT_DONE_SINCE_VERSION)
         wl_output_send_done(res);
+}
+
+static void output_reannounce(struct xw_output *o) {
+    struct wl_resource *res;
+    wl_list_for_each(res, &o->resources, link) {
+        output_send_details(res, o);
+        if (wl_resource_get_version(res) >= WL_OUTPUT_DONE_SINCE_VERSION)
+            wl_output_send_done(res);
+    }
 }
 
 static void output_resource_destroy(struct wl_resource *res) {
@@ -110,4 +119,120 @@ void xw_output_repaint(struct xw_output *o) {
     /* 4. damage accounting + frame callbacks */
     pixman_region_clear(&o->damage);
     deliver_frame_callbacks(o);
+
+    /* 5. backend present (headless has none; nested/x11 hand the frame
+     * to the parent display) */
+    if (c->backend && c->backend->ops && c->backend->ops->present)
+        c->backend->ops->present(c->backend, o);
+}
+
+/* ------------------------------------------------------ shared lifecycle */
+
+struct xw_output *xw_output_create(struct xw_compositor *c, const char *name,
+                                   int x, int y, int w, int h, int scale) {
+    if (w < 16 || h < 16 || scale < 1)
+        return NULL;
+    struct xw_output *o = calloc(1, sizeof(*o));
+    if (!o)
+        return NULL;
+    o->comp = c;
+    o->x = x;
+    o->y = y;
+    o->width = w;
+    o->height = h;
+    o->scale = scale;
+    snprintf(o->name, sizeof(o->name), "%s", name && *name ? name : "OUTPUT");
+    o->usable.x = x;
+    o->usable.y = y;
+    o->usable.w = w;
+    o->usable.h = h;
+    pixman_region_init(&o->damage);
+    wl_list_init(&o->resources);
+
+    size_t stride = (size_t)w * 4;
+    uint32_t *logical_data = calloc(stride / 4 * (size_t)h, 4);
+    uint32_t *native_data = calloc(stride / 4 * (size_t)h * (size_t)scale *
+                                       (size_t)scale, 4);
+    if (!logical_data || !native_data) {
+        free(logical_data);
+        free(native_data);
+        free(o);
+        return NULL;
+    }
+    o->logical = pixman_image_create_bits(PIXMAN_a8r8g8b8, w, h, logical_data,
+                                          (int)stride);
+    o->native = pixman_image_create_bits(PIXMAN_a8r8g8b8, w * scale, h * scale,
+                                         native_data, (int)stride * scale);
+    o->native_data = native_data;
+
+    o->global = wl_global_create(c->display, &wl_output_interface, 4, o,
+                                 xw_output_bind);
+    if (!o->global) {
+        pixman_image_unref(o->logical);
+        pixman_image_unref(o->native);
+        free(o);
+        return NULL;
+    }
+    wl_list_insert(c->outputs.prev, &o->link);
+    xw_log(XW_LOG_INFO, "output %s: %dx%d+%d+%d scale %d", o->name, o->width,
+           o->height, o->x, o->y, o->scale);
+    return o;
+}
+
+void xw_output_destroy(struct xw_output *o) {
+    if (!o)
+        return;
+    wl_list_remove(&o->link);
+    if (o->global)
+        wl_global_destroy(o->global);
+    pixman_region_fini(&o->damage);
+    free(pixman_image_get_data(o->logical));
+    free(o->native_data);
+    pixman_image_unref(o->logical);
+    pixman_image_unref(o->native);
+    free(o);
+}
+
+void xw_output_resize(struct xw_output *o, int w, int h) {
+    if (!o || w < 16 || h < 16 || (w == o->width && h == o->height))
+        return;
+    struct xw_compositor *c = o->comp;
+
+    /* reallocate backbuffers */
+    size_t stride = (size_t)w * 4;
+    uint32_t *logical_data = calloc(stride / 4 * (size_t)h, 4);
+    uint32_t *native_data = calloc(stride / 4 * (size_t)h * (size_t)o->scale *
+                                       (size_t)o->scale, 4);
+    if (!logical_data || !native_data) {
+        free(logical_data);
+        free(native_data);
+        xw_log(XW_LOG_ERROR, "output %s: resize OOM, keeping %dx%d", o->name,
+               o->width, o->height);
+        return;
+    }
+    free(pixman_image_get_data(o->logical));
+    free(o->native_data);
+    pixman_image_unref(o->logical);
+    pixman_image_unref(o->native);
+    o->logical = pixman_image_create_bits(PIXMAN_a8r8g8b8, w, h, logical_data,
+                                          (int)stride);
+    o->native = pixman_image_create_bits(
+        PIXMAN_a8r8g8b8, w * o->scale, h * o->scale, native_data,
+        (int)stride * o->scale);
+    o->native_data = native_data;
+    o->width = w;
+    o->height = h;
+
+    xw_log(XW_LOG_INFO, "output %s: resized to %dx%d", o->name, w, h);
+
+    /* re-announce mode to bound clients */
+    output_reannounce(o);
+
+    /* relayout: usable area, maximized/fullscreen windows, damage */
+    if (c->wm)
+        xw_wm_recalculate_usable(c->wm);
+    else
+        xw_output_set_usable(o, o->x, o->y, w, h);
+    pixman_region_union_rect(&o->damage, &o->damage, 0, 0, w, h);
+    xw_schedule_repaint(c);
 }

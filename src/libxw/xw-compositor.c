@@ -235,6 +235,16 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
         goto fail;
     c->loop = wl_display_get_event_loop(c->display);
 
+    /* arm signals as early as possible: a TERM arriving during the rest
+     * of create (backend handshake, shell setup) must still lead to a
+     * clean exit instead of killing the process with the default
+     * disposition */
+    c->sigint_src = wl_event_loop_add_signal(c->loop, SIGINT, on_signal, c);
+    c->sigterm_src = wl_event_loop_add_signal(c->loop, SIGTERM, on_signal, c);
+    c->sigchld_src = wl_event_loop_add_signal(c->loop, SIGCHLD, reap_children, c);
+    if (!c->sigint_src || !c->sigterm_src || !c->sigchld_src)
+        goto fail;
+
     if (wl_display_init_shm(c->display) < 0) {
         xw_log(XW_LOG_ERROR, "wl_display_init_shm failed");
         goto fail;
@@ -263,7 +273,23 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
     }
 
     /* backend + outputs */
-    c->backend = xw_backend_headless_create(c, cfg);
+    switch (cfg->backend) {
+    case XW_BACKEND_NESTED:
+        c->backend = xw_backend_nested_create(c, cfg);
+        break;
+    case XW_BACKEND_X11:
+#ifdef XW_HAVE_X11_BACKEND
+        c->backend = xw_backend_x11_create(c, cfg);
+#else
+        xw_log(XW_LOG_ERROR, "x11 backend not compiled in (no libX11 at "
+                            "build time)");
+        c->backend = NULL;
+#endif
+        break;
+    default:
+        c->backend = xw_backend_headless_create(c, cfg);
+        break;
+    }
     if (!c->backend)
         goto fail;
 
@@ -291,11 +317,6 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
     c->shortcuts = xw_shortcuts_create(c, c->conf.config_dir);
     if (!c->shortcuts)
         goto fail;
-
-    /* signals */
-    c->sigint_src = wl_event_loop_add_signal(c->loop, SIGINT, on_signal, c);
-    c->sigterm_src = wl_event_loop_add_signal(c->loop, SIGTERM, on_signal, c);
-    c->sigchld_src = wl_event_loop_add_signal(c->loop, SIGCHLD, reap_children, c);
 
     /* socket */
     const char *sock = NULL;
@@ -353,7 +374,7 @@ void xw_compositor_destroy(struct xw_compositor *c) {
     xw_wm_destroy(c->wm);
     c->wm = NULL;
 
-    xw_backend_headless_destroy(c->backend);
+    xw_backend_destroy(c->backend);
     c->backend = NULL;
 
     xw_layer_shell_fin(c);
@@ -363,6 +384,56 @@ void xw_compositor_destroy(struct xw_compositor *c) {
         wl_display_destroy(c->display);
     free(c->conf_dir_owned);
     free(c);
+}
+
+/* ------------------------------------------------------- backend generic */
+
+void xw_backend_destroy(struct xw_backend *b) {
+    if (!b)
+        return;
+    struct xw_compositor *c = b->comp;
+    if (b->ops && b->ops->destroy)
+        b->ops->destroy(b);
+    else
+        free(b);
+    /* contract: outputs are owned by the compositor, not the backend;
+     * freed here while the display is still alive */
+    xw_backend_destroy_outputs(c);
+}
+
+void xw_backend_destroy_outputs(struct xw_compositor *c) {
+    struct xw_output *o, *o2;
+    wl_list_for_each_safe(o, o2, &c->outputs, link)
+        xw_output_destroy(o);
+}
+
+/* ----------------------------------------------------------- input inject */
+
+void xw_compositor_inject_key(struct xw_compositor *c, uint32_t linux_keycode,
+                              bool down) {
+    struct xw_seat *s = xw_seat_first(c);
+    if (s)
+        xw_seat_key(s, linux_keycode, down);
+}
+
+void xw_compositor_inject_pointer_motion(struct xw_compositor *c, int x, int y) {
+    struct xw_seat *s = xw_seat_first(c);
+    if (s)
+        xw_seat_pointer_motion(s, x, y);
+}
+
+void xw_compositor_inject_pointer_button(struct xw_compositor *c,
+                                         uint32_t linux_button, bool down) {
+    struct xw_seat *s = xw_seat_first(c);
+    if (s)
+        xw_seat_pointer_button(s, linux_button, down);
+}
+
+void xw_compositor_inject_pointer_axis(struct xw_compositor *c,
+                                       uint32_t axis, double value) {
+    struct xw_seat *s = xw_seat_first(c);
+    if (s)
+        xw_seat_pointer_axis(s, axis, value);
 }
 
 int xw_compositor_run(struct xw_compositor *c) {

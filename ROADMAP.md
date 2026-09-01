@@ -24,7 +24,11 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
   integration suite (client teardown ordering fixed and verified).
 - TODO linux-dmabuf import (blocked on: no dmabuf in headless test env;
   needs DRM backend first).
-- TODO DRM/KMS backend; nested (windowed) backend; GL renderer path.
+- DONE nested backends (Phase 2): Wayland (a client of the parent via
+  libxwcl) and X11 (libX11 + XPutImage present path, XTEST-verified
+  input). `xw-compositor -B nested|x11`, `xw-session --nested`.
+- TODO DRM/KMS backend (Phase 4) for physical displays; libinput seat
+  backend for real devices; GL renderer path.
 - TODO presentation-time feedback.
 
 ## M2 — Shell + window management

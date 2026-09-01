@@ -19,9 +19,21 @@ against the **headless backend** with the pixman software renderer.
 - `tests/suite/test_session.c` — the graphical exit dialog as a real
   child process against the in-process compositor.
 - `tests/suite/test_panel.c` — panel coverage (see above).
+- `tests/suite/test_backends.c` — nested backend coverage: a real
+  compositor (B, nested) running inside another real compositor (A,
+  headless) in one process. Asserts topology, the present pipeline
+  (B's framebuffer content visible in A's pixels), clients of B
+  rendering through B into A, and input routing (keys injected into A
+  reach B's shortcut engine when B's window is focused — and parent
+  shortcuts must not shadow the child desktop).
+- `tests/x11probe.c` + `build/tests/x11probe` — X11-backend process
+  probe: finds the compositor window in a live X server, reads back
+  its pixels (XGetImage) and injects XTEST keyboard input.
 - `scripts/test-session.sh` — process-level session integration test
   (real `xw-session` + `xw-compositor` children, ctl socket, autostart
-  filtering, runtime spawns, panel autostart, clean logout).
+  filtering, runtime spawns, panel autostart, clean logout, the X11
+  backend under Xvfb with synthesized input, `xw-session --nested`,
+  and the nested Wayland backend across two real processes).
 - `scripts/run-asan.sh` — full sanitizer regression pass (ASan + UBSan
   + LeakSanitizer) including the process-level test; restores the
   release build afterwards.
@@ -37,7 +49,7 @@ Filtering tests (triage):
     XWT_FILTER=popup build/tests/run-tests    # name substring
     XWT_PREINSTANCES=0 ...                    # debug-layer only
 
-## What is covered today (21 in-process tests + 28 process checks)
+## What is covered today (22 in-process tests + 47 process checks)
 
 - compositor bootstrap + clean shutdown; socket lifecycle
 - output creation, geometry, scale; multi-output

@@ -85,6 +85,15 @@ struct xw_output_spec {
     int scale;          /* integer scale, >= 1 */
 };
 
+/* Backend selection. headless renders into memory (tests/CI/DRM-less
+ * development); nested runs as a window inside a parent Wayland
+ * compositor; x11 runs as a window inside an X11/XLibre server. */
+enum xw_backend_type {
+    XW_BACKEND_HEADLESS = 0,
+    XW_BACKEND_NESTED,
+    XW_BACKEND_X11,
+};
+
 struct xw_compositor_config {
     const char *config_dir;    /* directory with INI config; NULL = defaults */
     const char *socket_name;   /* NULL = automatic */
@@ -93,6 +102,16 @@ struct xw_compositor_config {
     struct xw_output_spec *outputs;
     int n_outputs;             /* 0 = one 1280x720 headless output */
     int log_level;
+    int backend;               /* enum xw_backend_type; 0 = headless */
+    /* parent display for nested backends: a WAYLAND_DISPLAY name for
+     * XW_BACKEND_NESTED (NULL = inherit $WAYLAND_DISPLAY) or an X
+     * display string for XW_BACKEND_X11 (NULL = inherit $DISPLAY) */
+    const char *parent_display;
+    /* test hook: while the nested backend performs its blocking initial
+     * handshake with the parent, call this to keep the parent (e.g. an
+     * in-process compositor) making progress. NULL = none */
+    void (*nested_pump)(void *ud);
+    void *nested_pump_ud;
 };
 
 struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cfg);

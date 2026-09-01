@@ -56,4 +56,11 @@ compatibility surface is small and tracked in the ROADMAP.
   Shutdown/Reboot/Suspend/Hibernate and session seat handling. Absent
   systems degrade gracefully (buttons report the limitation).
 - **XWayland** — future optional component for legacy X11 clients
+
+### Runtime/build, optional
+
+| Dependency | License | Needed for |
+|------------|---------|------------|
+| libX11 | X11 (MIT-style) | the nested X11 backend (runs the desktop inside an X11/XLibre session). Absent at build time: the backend is compiled out and `-B x11` reports a clear error; everything else still builds. |
+| libXtst + libXext | X11 (MIT-style) | test-only: the Xvfb x11-backend check injects XTEST keyboard input. Fetched rootless into `.toolchain/sysroot` when the system package is missing. |
   (ROADMAP). Never a foundation of the desktop.

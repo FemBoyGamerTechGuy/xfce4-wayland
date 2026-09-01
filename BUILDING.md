@@ -11,8 +11,13 @@
   - pixman-1 >= 0.42
 - wayland-protocols >= 1.36 (we use xdg-activation, ext-workspace,
   single-pixel-buffer; 1.44 or newer recommended)
+- libX11 dev files for the nested X11 backend (**optional**: without
+  it the build still succeeds, `-B x11` then reports "not compiled in";
+  the nested Wayland backend needs nothing extra)
 - python3 + Pillow **at build time** (font rasterization only)
 - `xkeyboard-config` keymaps at runtime (usually already installed)
+- Xvfb (plus libXtst, fetched into the sysroot by the test) to run the
+  x11-backend process checks in `make check`
 
 ## Normal build (system-wide dev packages)
 

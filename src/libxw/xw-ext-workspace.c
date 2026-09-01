@@ -16,9 +16,8 @@ struct xw_ws_manager {
     struct wl_list link;      /* comp.ws_managers */
     struct wl_resource *group; /* one shared group per manager */
     struct wl_list workspaces; /* struct xw_ws_ws.manager_link */
+    struct xw_compositor *comp;
 };
-
-static struct xw_compositor *g_ws_comp; /* set in init */
 
 
 struct xw_ws_ws {
@@ -26,6 +25,7 @@ struct xw_ws_ws {
     int index;                /* wm workspace index */
     struct wl_list manager_link; /* manager.workspaces */
     struct wl_list link;      /* comp-agnostic: node of manager list */
+    struct xw_ws_manager *manager; /* owning manager (for comp) */
 };
 
 /* -------------------------------------------------------- workspace handle */
@@ -65,10 +65,11 @@ static void ws_destroy_req(struct wl_client *client, struct wl_resource *res) {
 static void ws_activate(struct wl_client *client, struct wl_resource *res) {
     (void)client;
     struct xw_ws_ws *ws = ws_from_res(res);
-    if (!ws || !g_ws_comp || !g_ws_comp->wm)
+    if (!ws || !ws->manager || !ws->manager->comp || !ws->manager->comp->wm)
         return;
-    if (ws->index >= 0 && ws->index < g_ws_comp->wm->ws_count)
-        xw_wm_switch_workspace(g_ws_comp->wm, ws->index);
+    struct xw_compositor *c = ws->manager->comp;
+    if (ws->index >= 0 && ws->index < c->wm->ws_count)
+        xw_wm_switch_workspace(c->wm, ws->index);
 }
 
 static void ws_deactivate(struct wl_client *client, struct wl_resource *res) {
@@ -118,9 +119,9 @@ static void group_resource_destroy(struct wl_resource *res) {
 
 static void manager_commit(struct wl_client *client, struct wl_resource *res) {
     (void)client;
-    (void)res;
-    if (g_ws_comp)
-        xw_ext_workspace_changed(g_ws_comp);
+    struct xw_ws_manager *m = wl_resource_get_user_data(res);
+    if (m && m->comp)
+        xw_ext_workspace_changed(m->comp);
 }
 
 static void manager_stop(struct wl_client *client, struct wl_resource *res) {
@@ -204,6 +205,7 @@ static void manager_ensure_workspaces(struct xw_ws_manager *m,
             continue;
         }
         nws->index = i;
+        nws->manager = m;
         wl_resource_set_implementation(nws->res, &ws_impl, nws,
                                        ws_resource_destroy);
         wl_list_insert(m->workspaces.prev, &nws->manager_link);
@@ -232,6 +234,7 @@ static void bind_manager(struct wl_client *client, void *data, uint32_t version,
         return;
     }
     m->res = res;
+    m->comp = c;
     wl_list_init(&m->workspaces);
     wl_resource_set_implementation(res, &manager_impl, m,
                                    manager_resource_destroy);
@@ -243,7 +246,8 @@ static void bind_manager(struct wl_client *client, void *data, uint32_t version,
 /* --------------------------------------------------- compositor hooks */
 
 void xw_ext_workspace_init(struct xw_compositor *c) {
-    g_ws_comp = c;
+    c->ws_state = c; /* marker: this module holds no extra heap state,
+                        the globals list lives in comp.ws_managers */
     struct wl_global *g = wl_global_create(
         c->display, &ext_workspace_manager_v1_interface, 1, c, bind_manager);
     if (!g)
@@ -251,9 +255,7 @@ void xw_ext_workspace_init(struct xw_compositor *c) {
 }
 
 void xw_ext_workspace_fin(struct xw_compositor *c) {
-    (void)c;
-    if (g_ws_comp == c)
-        g_ws_comp = NULL;
+    c->ws_state = NULL;
 }
 
 void xw_ext_workspace_changed(struct xw_compositor *c) {

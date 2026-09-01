@@ -46,8 +46,6 @@ struct xw_data_offer {
     struct wl_list device_link;
 };
 
-static struct wl_global *g_ddm;
-static struct xw_compositor *g_ddm_comp;
 
 /* ---------------------------------------------------------- data source */
 
@@ -323,7 +321,6 @@ static void device_resource_destroy(struct wl_resource *res) {
 
 /* ------------------------------------------------ data_device_manager */
 
-static struct wl_list g_sources; /* xw_data_source.link */
 
 static void ddm_create_source(struct wl_client *client,
                               struct wl_resource *res, uint32_t id) {
@@ -342,7 +339,8 @@ static void ddm_create_source(struct wl_client *client,
     }
     src->res = sres;
     src->dnd_actions = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
-    wl_list_insert(g_sources.prev, &src->link);
+    struct xw_compositor *c = wl_resource_get_user_data(res);
+    wl_list_insert(c->ddm_sources.prev, &src->link);
     wl_resource_set_implementation(sres, &source_impl, src,
                                    source_resource_destroy);
 }
@@ -403,19 +401,19 @@ static void bind_ddm(struct wl_client *client, void *data, uint32_t version,
 /* --------------------------------------------------- compositor hooks */
 
 void xw_data_device_init(struct xw_compositor *c) {
-    g_ddm_comp = c;
-    wl_list_init(&g_sources);
-    g_ddm = wl_global_create(c->display, &wl_data_device_manager_interface,
-                             DATA_DEVICE_VERSION, c, bind_ddm);
-    if (!g_ddm)
+    wl_list_init(&c->ddm_sources);
+    c->ddm_global = wl_global_create(c->display, &wl_data_device_manager_interface,
+                                     DATA_DEVICE_VERSION, c, bind_ddm);
+    if (!c->ddm_global)
         xw_log(XW_LOG_ERROR, "data device manager global creation failed");
 }
 
 void xw_data_device_fin(struct xw_compositor *c) {
-    (void)c;
     /* sources and devices die with their clients */
-    g_ddm = NULL;
-    g_ddm_comp = NULL;
+    if (c->ddm_global) {
+        wl_global_destroy(c->ddm_global);
+        c->ddm_global = NULL;
+    }
 }
 
 void xw_data_device_notify_focus(struct xw_compositor *c, struct xw_seat *seat) {

@@ -82,6 +82,9 @@ int xwc_connect_pumped(struct xwc *c, const char *socket_name,
                         void (*pump)(void *ud), void *pump_ud);
 /* sync request + wait, yielding through the pump if set */
 int xwc_sync(struct xwc *c);
+/* Non-blocking drain of our side of the connection (used with an
+ * embedded in-process server; also usable standalone). */
+int xwc_drain(struct xwc *c);
 void xwc_disconnect(struct xwc *c);
 /* Dispatch pending events (timeout_ms < 0 = default). Returns 0, or -1
  * on connection error. */

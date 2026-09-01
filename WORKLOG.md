@@ -259,3 +259,79 @@ layer client; then the settings GUI once more client surface is
 proven. Session restart (re-exec) still needs an automated test.
 Consider upstreaming the paced-wait helper into the harness (tests
 currently re-implement it in test_panel.c).
+
+## Session 4 — Phase 2: nested backends (real desktop inside a session)
+
+**Goal**: move beyond headless — run the whole desktop as a window
+inside the user's existing Wayland or X11/XLibre session (the safe
+development workflow before DRM/KMS).
+
+### Work
+- **Backend refactor**: `struct xw_backend` gained an ops vtable
+  (`present`, `destroy`); `xw_output_repaint` calls `present` after
+  compositing. Output lifecycle factored out of headless into shared
+  `xw_output_create/destroy` + new **`xw_output_resize`** (realloc
+  backbuffers, re-announce geometry/mode/done, relayout). Injection
+  API moved to xw-compositor.c (backend-independent).
+- **nested Wayland backend** (`xw-backend-nested.c`): the compositor is
+  a *client of the parent* via libxwcl (dogfooded); one output mirrors
+  the parent window; present = memcpy into the SHM back buffer +
+  commit; parent input forwarded verbatim (evdev keycodes, Wayland
+  button codes); the parent socket is multiplexed on our own event
+  loop. Test hook: `nested_pump` lets an in-process parent run during
+  the blocking handshake.
+- **nested X11 backend** (`xw-backend-x11.c`): top-level X window,
+  XPutImage straight from the native pixman buffer (identical byte
+  layout, zero conversion), X keycodes = evdev+8, buttons 1-3 →
+  0x110/111/112, wheel 4/5 → axes, detectable auto-repeat via XKB,
+  invisible X cursor (our software cursor is the visible one),
+  ConfigureNotify → output resize, WM_DELETE_WINDOW → stop.
+- **CLI**: `xw-compositor -B headless|nested|x11` + `-D parent`;
+  `xw-session --nested` auto-selects (WAYLAND_DISPLAY → nested, else
+  DISPLAY → x11, $XW_BACKEND overrides); nested sessions keep DISPLAY
+  (XWayland future). `xw-session-ctl` gained `-S` (parity with
+  xw-session; needed by tests and multi-session setups).
+- **Multi-compositor correctness**: removed ALL file-static module
+  state (layer-shell, ext-workspace, activation, data-device) into
+  per-compositor fields — two compositors in one process previously
+  leaked one and could free the other's state (UAF). Signals now armed
+  at the top of `xw_compositor_create` (early TERM during backend
+  handshakes killed the process with the default disposition before).
+
+### Bugs found & fixed (the interesting ones)
+- `wl_display_read_events` **decrements `reader_count`
+  unconditionally** — calling it without a `prepare_read` intent
+  corrupts the count to -1 and the next call blocks forever on the
+  reader futex (decoded from the libwayland disassembly after a
+  traced hang). The nested fd callback now uses the canonical
+  prepare→read→dispatch→flush loop.
+- libxwcl `xwc_sync` with a pump never drained its own side of the
+  connection (pumps only drive the embedded server) — added
+  `xwc_drain`; sync now completes against an in-process parent.
+- Static callback table without `.ud` → NULL user data → crash in the
+  first configure (found by ASan immediately).
+- Output buffers leaked for every compositor after the backend
+  refactor (the old headless destroy freed them; the new contract had
+  no owner) — `xw_backend_destroy` now always destroys outputs.
+- Makefile's *first* target was an eval-generated protocol rule: bare
+  `make` silently did nothing since the first build (only
+  `make tests/check` built). Fixed with `.DEFAULT_GOAL := all`.
+- The 4-signals-armed-late race: compositors killed during creation
+  exited 143 instead of 0 (reproduced 3/3 with immediate kill).
+
+### Tests
+- `tests/suite/test_backends.c` — compositor-inside-compositor
+  (in-process): topology, present pipeline verified through PIXELS,
+  clients of the nested desktop render through to the host, input
+  routing with parent/child shortcut shadowing check.
+- `scripts/test-session.sh` sessions 4-6: x11 backend under Xvfb
+  (pixel round-trip via XGetImage + XTEST-injected Ctrl+Alt+D consumed
+  by the shortcut engine), `xw-session --nested` end to end, and the
+  nested Wayland backend across two real processes with a live panel.
+- Verified: 22/22 in-process, 47/47 process checks, full
+  ASan+UBSan+LSan pass. Docs updated across the board.
+
+### Next
+Phase 3: real input (libinput seat backend for DRM sessions);
+meanwhile keyboard move/resize + shortcut gaps from the XFCE table,
+notification daemon, XWayland detection for nested-X11 sessions.

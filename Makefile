@@ -22,6 +22,10 @@ CC       ?= cc
 AR       ?= ar
 PYTHON   ?= python3
 
+# The protocol rules below are generated via eval and would otherwise
+# become the default goal; the default goal must be `all`.
+.DEFAULT_GOAL := all
+
 CSTD     := -std=c11
 CFLAGS   ?= -O2 -g
 LDFLAGS  ?=
@@ -43,6 +47,19 @@ CFLAGS_XKB   := $(shell pkg-config --cflags xkbcommon)
 LDLIBS_XKB   := $(shell pkg-config --libs xkbcommon)
 CFLAGS_PIX   := $(shell pkg-config --cflags pixman-1)
 LDLIBS_PIX   := $(shell pkg-config --libs pixman-1)
+
+# X11 nested backend: optional at build time (degrades gracefully
+# to a runtime error when libX11 is absent)
+X11_OK := $(shell pkg-config --exists x11 && echo yes)
+ifeq ($(X11_OK),yes)
+CFLAGS_X11 := $(shell pkg-config --cflags x11)
+LDLIBS_X11 := $(shell pkg-config --libs x11)
+HAVE_X11   := -DXW_HAVE_X11_BACKEND
+else
+CFLAGS_X11 :=
+LDLIBS_X11 :=
+HAVE_X11   :=
+endif
 
 # ---------------------------------------------------------------- protocols
 # (XML path, generated basename). wlr-* are vendored in-repo; the rest come
@@ -87,7 +104,11 @@ $(DIRECTORIES):
 
 
 # ----------------------------------------------------------------- libxw
+ifeq ($(X11_OK),yes)
 LIBXW_SRC := $(wildcard src/libxw/*.c)
+else
+LIBXW_SRC := $(filter-out src/libxw/xw-backend-x11.c,$(wildcard src/libxw/*.c))
+endif
 LIBXW_OBJ := $(patsubst src/libxw/%.c,$(OBJ)/libxw/%.o,$(LIBXW_SRC))
 LIBXW_DEPS := src/libxw/*.h src/*.h
 
@@ -96,7 +117,15 @@ build/lib/libxw.a: $(LIBXW_OBJ) $(GEN_PROTO_OBJ) | build/lib
 	$(AR) rcs $@ $(LIBXW_OBJ) $(GEN_PROTO_OBJ)
 
 $(OBJ)/libxw/%.o: src/libxw/%.c $(LIBXW_DEPS) $(GEN_HEADERS) | $(OBJ)/libxw
-	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_XKB) $(CFLAGS_PIX) -c $< -o $@
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_XKB) $(CFLAGS_PIX) $(HAVE_X11) -c $< -o $@
+
+# backend files with mixed includes: nested needs wayland-client
+# (loop integration via client-core); x11 needs X11 headers
+$(OBJ)/libxw/xw-backend-nested.o: src/libxw/xw-backend-nested.c $(LIBXW_DEPS) src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/libxw
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_WLC) $(CFLAGS_XKB) $(CFLAGS_PIX) -c $< -o $@
+
+$(OBJ)/libxw/xw-backend-x11.o: src/libxw/xw-backend-x11.c $(LIBXW_DEPS) $(GEN_HEADERS) | $(OBJ)/libxw
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_X11) $(CFLAGS_XKB) $(CFLAGS_PIX) $(HAVE_X11) -c $< -o $@
 
 $(OBJ)/gen/%-protocol.o: $(GEN)/%-protocol.c | $(OBJ)/gen
 	$(CC) $(CSTD) $(CFLAGS) -w $(INCLUDES) $(CFLAGS_WLS) -c $< -o $@
@@ -120,8 +149,8 @@ $(OBJ)/libxwcl/%.o: src/libxwcl/%.c src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/libx
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLC) $(CFLAGS_PIX) -c $< -o $@
 
 # ---------------------------------------------------------------- server bins
-build/bin/xw-compositor: $(OBJ)/compositor/xw-compositor.o build/lib/libxw.a | build/bin
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/compositor/xw-compositor.o build/lib/libxw.a $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
+build/bin/xw-compositor: $(OBJ)/compositor/xw-compositor.o build/lib/libxw.a build/lib/libxwcl.a | build/bin
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/compositor/xw-compositor.o build/lib/libxw.a build/lib/libxwcl.a $(LDLIBS_WLS) $(LDLIBS_WLC) $(LDLIBS_X11) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
 
 $(OBJ)/compositor/%.o: src/compositor/%.c $(LIBXW_DEPS) $(GEN_HEADERS) | $(OBJ)/compositor
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_XKB) $(CFLAGS_PIX) -c $< -o $@
@@ -152,7 +181,7 @@ $(OBJ)/clients/%.o: src/clients/%.c src/clients/*.h src/libxwcl/*.h $(GEN_HEADER
 # ---------------------------------------------------------------- tests
 TEST_SRC := $(wildcard tests/suite/*.c)
 build/tests/run-tests: $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a | build/tests
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_WLC) $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_WLC) $(LDLIBS_X11) $(LDLIBS_M)
 
 $(OBJ)/tests/%.o: tests/suite/%.c tests/harness/xwtest.h $(LIBXW_DEPS) src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/tests
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_WLC) $(CFLAGS_PIX) $(CFLAGS_XKB) -c $< -o $@
@@ -162,6 +191,23 @@ $(OBJ)/tests/harness.o: tests/harness/harness.c tests/harness/xwtest.h $(LIBXW_D
 
 $(OBJ)/tests/client.o: tests/harness/client.c tests/harness/xwtest.h src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/tests
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLC) $(CFLAGS_PIX) -c $< -o $@
+
+# XTEST probe helper (process-level x11-backend test; needs Xvfb)
+build/tests/x11probe: $(OBJ)/tests/x11probe.o | build/tests
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/x11probe.o $(LDLIBS_X11) $(LDLIBS_XTST) -lm
+
+# XTEST probe: xtst dev files live in the optional sysroot (the
+# runtime lib may be there too), so use explicit paths with rpath
+ifeq ($(X11_OK)$(XW_SYSROOT),yes$(XW_SYSROOT))
+CFLAGS_XTST := -I$(XW_SYSROOT)/usr/include
+LDLIBS_XTST  := -lXtst -L$(XW_SYSROOT)/usr/lib/x86_64-linux-gnu -Wl,-rpath,$(XW_SYSROOT)/usr/lib/x86_64-linux-gnu
+else
+CFLAGS_XTST :=
+LDLIBS_XTST  := -lXtst
+endif
+
+$(OBJ)/tests/x11probe.o: tests/x11probe.c | $(OBJ)/tests
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(CFLAGS_X11) $(CFLAGS_XTST) -c $< -o $@
 
 # ---------------------------------------------------------------- targets
 .PHONY: all tests check asan clean dist
@@ -174,6 +220,9 @@ CLIENT_BINS := $(if $(wildcard src/clients/xw-demo.c),build/bin/xw-demo,) \
 	$(if $(wildcard src/clients/xw-exit.c),build/bin/xw-exit,) \
 	$(if $(wildcard src/clients/xw-panel.c),build/bin/xw-panel,)
 all: build/bin/xw-compositor $(SESSION_BINS) $(CLIENT_BINS) build/tests/run-tests
+ifeq ($(X11_OK),yes)
+all: build/tests/x11probe
+endif
 
 tests: all
 	build/tests/run-tests

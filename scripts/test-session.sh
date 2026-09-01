@@ -223,6 +223,124 @@ else
 fi
 
 echo
+echo "== session 4: X11 nested backend (Xvfb) =="
+
+if command -v Xvfb >/dev/null 2>&1 && [ -x "$ROOT/build/tests/x11probe" ]; then
+    rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+    Xvfb :99 -screen 0 800x600x24 >/dev/null 2>&1 &
+    XVFB_PID=$!
+    sleep 1
+
+    LOG4="$RTD/session4-x11.log"
+    DISPLAY=:99 "$BIN/xw-compositor" --backend x11 -s xw-test-x11 \
+        >"$LOG4" 2>&1 &
+    COMP_X11_PID=$!
+
+    check "x11: compositor starts under Xvfb" \
+        'wait_for "kill -0 $COMP_X11_PID 2>/dev/null && [ -S \"$RTD/xw-test-x11\" ]"'
+
+    PROBE="$ROOT/build/tests/x11probe"
+    out="$("$PROBE" :99 2>&1)"
+    check "x11: rendered pixels visible in the X window" \
+        '[ "$out" = "probe: background pixels OK" ]'
+
+    out="$("$PROBE" :99 inject 2>&1)"
+    check "x11: XTEST input injection accepted" \
+        'case "$out" in *"injected Ctrl+Alt+D"*) true ;; *) false ;; esac'
+    check "x11: shortcut engine consumed the injected key" \
+        'wait_for "rg -q \"shortcut: action\" \"$LOG4\" 2>/dev/null"'
+
+    kill -TERM "$COMP_X11_PID" 2>/dev/null
+    check "x11: compositor exits cleanly" 'wait_pid_exit "$COMP_X11_PID"'
+    wait "$COMP_X11_PID" 2>/dev/null
+    check "x11: exit code 0" '[ "$?" -eq 0 ]'
+    kill "$XVFB_PID" 2>/dev/null
+    rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+else
+    echo "SKIP session 4 (Xvfb or x11probe not available)"
+fi
+
+echo
+echo "== session 5: xw-session --nested (auto x11 under Xvfb) =="
+
+if command -v Xvfb >/dev/null 2>&1 && [ -x "$ROOT/build/tests/x11probe" ]; then
+    rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+    Xvfb :99 -screen 0 800x600x24 >/dev/null 2>&1 &
+    XVFB_PID=$!
+    sleep 1
+
+    LOG5="$RTD/session5-nested.log"
+    # no WAYLAND_DISPLAY, DISPLAY=:99 -> auto-selects the x11 backend
+    env -u WAYLAND_DISPLAY DISPLAY=:99 XDG_RUNTIME_DIR="$RTD" \
+        HOME="$FAKE_HOME" "$BIN/xw-session" --nested -n -S xw-nest \
+        >"$LOG5" 2>&1 &
+    SESS_PID=$!
+
+    check "nested: session starts" \
+        'wait_for "[ -S \"$RTD/xw-nest.sock\" ]"'
+    check "nested: compositor runs with the x11 backend" \
+        'wait_for "rg -q \"nested session: backend x11\" \"$LOG5\" 2>/dev/null"'
+
+    PROBE="$ROOT/build/tests/x11probe"
+    check "nested: desktop window visible in Xvfb" \
+        'wait_for "\"$PROBE\" :99 2>/dev/null | rg -q \"background pixels OK\""'
+
+    XDG_RUNTIME_DIR="$RTD" "$BIN/xw-session-ctl" -S xw-nest logout \
+        >/dev/null 2>&1
+    check "nested: logout exits cleanly" 'wait_pid_exit "$SESS_PID"'
+    wait "$SESS_PID"
+    check "nested: exit code 0" '[ "$?" -eq 0 ]'
+    kill "$XVFB_PID" 2>/dev/null
+    rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+else
+    echo "SKIP session 5 (Xvfb not available)"
+fi
+
+echo
+echo "== session 6: nested Wayland backend (two real compositor processes) =="
+
+if [ -x "$BIN/xw-panel" ]; then
+    LOG6A="$RTD/session6-parent.log"
+    LOG6B="$RTD/session6-child.log"
+
+    "$BIN/xw-compositor" -s xw-nest-parent -o 480x360 >"$LOG6A" 2>&1 &
+    PARENT_PID=$!
+    check "wnested: parent compositor starts" \
+        'wait_for "[ -S \"$RTD/xw-nest-parent\" ]"'
+
+    WAYLAND_DISPLAY=xw-nest-parent "$BIN/xw-compositor" \
+        --backend nested --parent-display xw-nest-parent -s xw-nest-child \
+        -o 240x180 >"$LOG6B" 2>&1 &
+    CHILD_PID=$!
+    check "wnested: nested compositor starts" \
+        'wait_for "rg -q \"nested backend: window 240x180\" \"$LOG6B\" 2>/dev/null && [ -S \"$RTD/xw-nest-child\" ]"'
+    # "window 240x180" only logs after the parent answered the xdg
+    # configure: it proves the full parent handshake happened
+
+    # a real panel client inside the NESTED compositor
+    XDG_RUNTIME_DIR="$RTD" WAYLAND_DISPLAY=xw-nest-child \
+        "$BIN/xw-panel" >/dev/null 2>&1 &
+    PANEL6_PID=$!
+    check "wnested: panel runs inside the nested compositor" \
+        'wait_for "pgrep -x xw-panel >/dev/null 2>/dev/null"'
+
+    kill -TERM "$PANEL6_PID" "$CHILD_PID" "$PARENT_PID" 2>/dev/null
+    check "wnested: nested compositor exits cleanly" \
+        'wait_pid_exit "$CHILD_PID"'
+    check "wnested: parent compositor exits cleanly" \
+        'wait_pid_exit "$PARENT_PID"'
+    wait "$CHILD_PID" 2>/dev/null
+    CHILD_RC=$?
+    check "wnested: child exit code 0 (got $CHILD_RC)" '[ "$CHILD_RC" -eq 0 ]'
+    wait "$PARENT_PID" 2>/dev/null
+    check "wnested: parent exit code 0" '[ "$?" -eq 0 ]'
+    check "wnested: panel process gone" \
+        'wait_for "[ -z \"$(pgrep -x xw-panel 2>/dev/null)\" ]"'
+else
+    echo "SKIP session 6 (xw-panel not built)"
+fi
+
+echo
 echo "test-session: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1
 exit 0

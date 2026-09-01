@@ -356,6 +356,8 @@ bool xw_shortcuts_dispatch(struct xw_shortcuts *sc, struct xw_seat *seat,
     wl_list_for_each(b, &sc->bindings, link) {
         if (b->keysym != sym || b->mods != mods)
             continue;
+        xw_log(XW_LOG_INFO, "shortcut: action %d dispatched via %s",
+               b->action, b->binding_str);
         xw_actions_dispatch(sc->comp, b->action, b->arg);
         return true;
     }

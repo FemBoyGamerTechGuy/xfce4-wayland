@@ -17,7 +17,6 @@ struct xw_layer_shell {
     struct xw_compositor *comp;
 };
 
-static struct xw_layer_shell *g_shell;
 
 /* ---------------------------------------------------- zwlr_layer_surface */
 
@@ -289,7 +288,8 @@ static void shell_get_layer_surface(struct wl_client *client,
                                     struct wl_resource *output,
                                     uint32_t layer, const char *namespace) {
     (void)res;
-    struct xw_compositor *c = g_shell->comp;
+    struct xw_layer_shell *sh = wl_resource_get_user_data(res);
+    struct xw_compositor *c = sh->comp;
     struct xw_surface *s = wl_resource_get_user_data(surface);
 
     if (s->role != XW_SURFACE_ROLE_NONE) {
@@ -434,23 +434,27 @@ void xw_layer_role_destroy(struct xw_surface *s) {
 /* ---------------------------------------------------------------- init */
 
 void xw_layer_shell_init(struct xw_compositor *c) {
-    g_shell = calloc(1, sizeof(*g_shell));
-    if (!g_shell)
+    struct xw_layer_shell *sh = calloc(1, sizeof(*sh));
+    if (!sh)
         return;
-    g_shell->comp = c;
-    g_shell->global = wl_global_create(
+    sh->comp = c;
+    sh->global = wl_global_create(
         c->display, &zwlr_layer_shell_v1_interface, LAYER_SHELL_VERSION,
-        g_shell, bind_layer_shell);
-    if (!g_shell->global)
+        sh, bind_layer_shell);
+    if (!sh->global) {
         xw_log(XW_LOG_ERROR, "layer shell global creation failed");
+        free(sh);
+        return;
+    }
+    c->layer_shell_state = sh;
 }
 
 void xw_layer_shell_fin(struct xw_compositor *c) {
-    (void)c;
-    if (g_shell) {
-        if (g_shell->global)
-            wl_global_destroy(g_shell->global);
-        free(g_shell);
-        g_shell = NULL;
+    struct xw_layer_shell *sh = c->layer_shell_state;
+    if (sh) {
+        if (sh->global)
+            wl_global_destroy(sh->global);
+        free(sh);
+        c->layer_shell_state = NULL;
     }
 }

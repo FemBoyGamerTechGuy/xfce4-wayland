@@ -142,16 +142,46 @@ struct xw_output {
 void xw_output_set_usable(struct xw_output *o, int x, int y, int w, int h);
 void xw_output_damage_rect(struct xw_output *o, int x, int y, int w, int h);
 void xw_output_repaint(struct xw_output *o);
+/* Shared output lifecycle (used by every backend). Creates the pixman
+ * backbuffers, the wl_output global and links it into the layout at
+ * (x, y). Fails only on allocation. */
+struct xw_output *xw_output_create(struct xw_compositor *c, const char *name,
+                                   int x, int y, int w, int h, int scale);
+void xw_output_destroy(struct xw_output *o);
+/* Resize in place: reallocates the backbuffers, re-announces geometry +
+ * mode + done to bound clients, relatches maximized/fullscreen windows
+ * and damages everything. No-op when the size is unchanged. */
+void xw_output_resize(struct xw_output *o, int w, int h);
 
 /* --------------------------------------------------------------- backend */
+/* Backend vtable. `present` is called from the repaint path (after the
+ * frame is composited into the output's native buffer) and is where
+ * backends hand the pixels to real display hardware or a parent
+ * compositor. All ops are optional (NULL = not applicable). */
+struct xw_backend;
+struct xw_output;
+
+struct xw_backend_ops {
+    void (*present)(struct xw_backend *b, struct xw_output *o);
+    void (*destroy)(struct xw_backend *b);
+};
+
 struct xw_backend {
     struct xw_compositor *comp;
     const char *name;
+    const struct xw_backend_ops *ops;
 };
 
 struct xw_backend *xw_backend_headless_create(struct xw_compositor *c,
                                               const struct xw_compositor_config *cfg);
-void xw_backend_headless_destroy(struct xw_backend *b);
+struct xw_backend *xw_backend_nested_create(struct xw_compositor *c,
+                                             const struct xw_compositor_config *cfg);
+struct xw_backend *xw_backend_x11_create(struct xw_compositor *c,
+                                          const struct xw_compositor_config *cfg);
+/* generic teardown (ops->destroy) */
+void xw_backend_destroy(struct xw_backend *b);
+/* destroys all outputs of the compositor (shared by backend destroys) */
+void xw_backend_destroy_outputs(struct xw_compositor *c);
 
 /* ------------------------------------------------------------------- seat */
 struct xw_window;
@@ -531,7 +561,16 @@ struct xw_compositor {
 
     uint32_t bg_color; /* wallpaper fill (a8r8g8b8) */
 
-    /* module state (structs defined in the respective modules) */
+    /* module state (structs defined in the respective modules; kept as
+     * void* here so the structs stay private). Per-compositor: several
+     * compositors can live in one process (nested backend tests, the
+     * session manager embedding), so no file-static module state. */
+    void *layer_shell_state;   /* struct xw_layer_shell */
+    void *ws_state;            /* ext-workspace manager state */
+    void *activation_state;    /* struct xw_activation */
+    struct wl_global *ddm_global; /* wl_data_device_manager global */
+    struct wl_list ddm_sources;   /* xw_data_source.link */
+
     struct wl_list ft_managers;      /* foreign toplevel managers */
     struct wl_list ws_managers;      /* ext workspace managers */
     struct wl_list activation_tokens; /* xw_activation_token.link */

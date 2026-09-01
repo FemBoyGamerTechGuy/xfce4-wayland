@@ -52,17 +52,24 @@ therefore own the following responsibilities directly:
 
 - **Display/event integration**: `wl_display` + `wl_event_loop` from
   libwayland-server; our backend interface drives frame scheduling.
-- **Backend abstraction** (`struct xw_backend`): owns outputs and the
-  input event source. The headless backend is complete and is what the
-  test suite and CI use; DRM/KMS and nested backends are roadmap items.
-  This is the same seam where GPU rendering would be introduced.
+- **Backend abstraction** (`struct xw_backend` + ops vtable): backends
+  hand composited frames to a display via the `present` op and pump
+  input events into the seat. Three exist today: headless (tests, CI),
+  **nested Wayland** (the whole desktop as a window in a parent
+  compositor, implemented as a libxwcl client with its socket
+  multiplexed on our own event loop) and **nested X11** (a top-level
+  X window; XPutImage from the native pixman buffer, X keycodes are
+  evdev+8). DRM/KMS is the roadmap item; this is the same seam where
+  GPU rendering would be introduced.
 - **Buffer management**: wl_shm (and single-pixel-buffer) today; linux-dmabuf
   is a roadmap item.
 - **Rendering**: pixman-based compositor with damage tracking, integer
   output scale, software cursor. Simple, correct, GPU-independent.
-- **Input**: injected through the backend interface (headless backend
-  exposes a test API; a libinput backend is a roadmap item), then
-  processed by a real xkbcommon state machine before dispatch.
+- **Input**: injected through the backend interface (headless exposes a
+  test API; nested backends forward real parent events: evdev keycodes
+  and Wayland button codes verbatim; a libinput backend is a roadmap
+  item), then processed by a real xkbcommon state machine before
+  dispatch.
 
 Owning these is more work, but it is the point of the exercise: an XFCE
 experience on an architecture we fully understand and control.

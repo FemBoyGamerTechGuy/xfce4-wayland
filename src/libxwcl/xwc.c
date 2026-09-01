@@ -182,11 +182,34 @@ int xwc_sync(struct xwc *c) {
     wl_display_flush(c->display);
     while (!done) {
         if (c->pump) {
+            /* embedded (in-process) server: the pump only drives the
+             * server; draining OUR side of the connection is ours to
+             * do, otherwise the sync answer never gets processed */
             c->pump(c->pump_ud);
+            if (xwc_drain(c) < 0)
+                return -1;
         } else if (wl_display_dispatch(c->display) < 0) {
             return -1;
         }
     }
+    return 0;
+}
+
+/* Non-blocking drain: read whatever arrived and dispatch it. Returns 0,
+ * or -1 on connection error. */
+int xwc_drain(struct xwc *c) {
+    while (wl_display_prepare_read(c->display) != 0) {
+        if (wl_display_dispatch_pending(c->display) < 0)
+            return -1;
+    }
+    struct pollfd pfd = {.fd = wl_display_get_fd(c->display), .events = POLLIN};
+    poll(&pfd, 1, 0);
+    if (pfd.revents & POLLIN)
+        wl_display_read_events(c->display);
+    else
+        wl_display_cancel_read(c->display);
+    if (wl_display_dispatch_pending(c->display) < 0)
+        return -1;
     return 0;
 }
 

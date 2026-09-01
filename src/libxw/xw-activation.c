@@ -25,7 +25,6 @@ struct xw_activation_token {
     struct wl_list link;     /* comp.activation_tokens */
 };
 
-static struct xw_activation *g_act;
 
 /* ------------------------------------------------------------ token */
 
@@ -144,7 +143,6 @@ static void act_get_token(struct wl_client *client, struct wl_resource *res,
     wl_resource_set_implementation(tres, &token_impl, t,
                                    token_resource_destroy);
     wl_list_insert(c->activation_tokens.prev, &t->link);
-    (void)g_act;
 }
 
 static void act_activate(struct wl_client *client, struct wl_resource *res,
@@ -214,21 +212,25 @@ static void bind_activation(struct wl_client *client, void *data,
 /* --------------------------------------------------- compositor hooks */
 
 void xw_activation_init(struct xw_compositor *c) {
-    g_act = calloc(1, sizeof(*g_act));
-    if (!g_act)
+    struct xw_activation *act = calloc(1, sizeof(*act));
+    if (!act)
         return;
-    g_act->global = wl_global_create(c->display, &xdg_activation_v1_interface, 1,
-                                     c, bind_activation);
-    if (!g_act->global)
+    act->global = wl_global_create(c->display, &xdg_activation_v1_interface, 1,
+                                   c, bind_activation);
+    if (!act->global) {
         xw_log(XW_LOG_ERROR, "xdg-activation global creation failed");
+        free(act);
+        return;
+    }
+    c->activation_state = act;
 }
 
 void xw_activation_fin(struct xw_compositor *c) {
-    (void)c;
-    if (g_act) {
-        if (g_act->global)
-            wl_global_destroy(g_act->global);
-        free(g_act);
-        g_act = NULL;
+    struct xw_activation *act = c->activation_state;
+    if (act) {
+        if (act->global)
+            wl_global_destroy(act->global);
+        free(act);
+        c->activation_state = NULL;
     }
 }

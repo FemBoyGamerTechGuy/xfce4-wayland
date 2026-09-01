@@ -49,6 +49,7 @@ struct session {
     bool comp_ready;
     bool shutting_down;
     bool restarting;          /* re-exec instead of plain exit */
+    bool nested;              /* desktop runs inside the parent session */
     struct {
         pid_t pid;
         char name[300];
@@ -65,6 +66,23 @@ struct session {
 };
 
 static struct session S;
+
+/* nested mode: run the desktop as a window inside the user's current
+ * session (the primary development workflow before DRM/KMS). Backend
+ * choice: explicit $XW_BACKEND, else a Wayland parent if
+ * $WAYLAND_DISPLAY is set, else an X11 parent if $DISPLAY is set. */
+static const char *nested_backend_arg(void) {
+    const char *forced = getenv("XW_BACKEND");
+    if (forced && *forced)
+        return forced;
+    const char *wl = getenv("WAYLAND_DISPLAY");
+    if (wl && *wl)
+        return "nested";
+    const char *x = getenv("DISPLAY");
+    if (x && *x)
+        return "x11";
+    return NULL;
+}
 
 /* -------------------------------------------------------------- utils */
 
@@ -166,10 +184,24 @@ static pid_t start_compositor(void) {
     int outpipe[2];
     if (pipe(outpipe) < 0)
         return -1;
+
+    /* build the argument list: -q plus the backend when nesting */
+    const char *args[8] = {find_compositor(), "-q", NULL, NULL, NULL, NULL, NULL, NULL};
+    int nargs = 2;
+    if (S.nested) {
+        const char *be = nested_backend_arg();
+        if (!be) {
+            log_msg("error", "nested mode requires $WAYLAND_DISPLAY or "
+                            "$DISPLAY (or set $XW_BACKEND)");
+            return -1;
+        }
+        args[nargs++] = "--backend";
+        args[nargs++] = be;
+        log_msg("info", "nested session: backend %s", be);
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
-        close(outpipe[0]);
-        close(outpipe[1]);
         return -1;
     }
     if (pid == 0) {
@@ -178,7 +210,6 @@ static pid_t start_compositor(void) {
         dup2(outpipe[1], STDOUT_FILENO);
         close(outpipe[0]);
         close(outpipe[1]);
-        const char *args[] = {find_compositor(), "-q", NULL};
         execvp(args[0], (char *const *)args);
         log_msg("error", "execvp(compositor) failed: %s", strerror(errno));
         _exit(127);
@@ -274,7 +305,9 @@ static pid_t spawn_autostart_exec(const char *exec, const char *name) {
     if (pid == 0) {
         setenv("XDG_RUNTIME_DIR", S.runtime_dir, 1);
         setenv("WAYLAND_DISPLAY", S.socket_name, 1);
-        unsetenv("DISPLAY"); /* wayland-native session: no X by default */
+        if (!S.nested)
+            unsetenv("DISPLAY"); /* wayland-native session: no X by default;
+                                     nested mode keeps it (XWayland future) */
         const char *sh = getenv("XW_SHELL") ? getenv("XW_SHELL") : "/bin/sh";
         const char *args[] = {sh, "-c", exec, NULL};
         execvp(args[0], (char *const *)args);
@@ -583,6 +616,9 @@ static void usage(const char *prog) {
            "Options:\n"
            "  -S, --ctl-name NAME    control socket name (default: xw-session)\n"
            "  -n, --no-autostart     skip XDG autostart entries\n"
+           "  -N, --nested           run the desktop inside the current session\n"
+           "                          (window under Wayland or X11; $XW_BACKEND\n"
+           "                          overrides the auto-choice)\n"
            "  -h, --help             this help\n",
            prog);
 }
@@ -590,21 +626,26 @@ static void usage(const char *prog) {
 int main(int argc, char **argv) {
     const char *ctl_name = "xw-session";
     bool autostart = true;
+    S.nested = false;
 
     static const struct option longopts[] = {
         {"ctl-name", required_argument, NULL, 'S'},
         {"no-autostart", no_argument, NULL, 'n'},
+        {"nested", no_argument, NULL, 'N'},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0},
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "S:nh", longopts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "S:nNh", longopts, NULL)) != -1) {
         switch (opt) {
         case 'S':
             ctl_name = optarg;
             break;
         case 'n':
             autostart = false;
+            break;
+        case 'N':
+            S.nested = true;
             break;
         case 'h':
             usage(argv[0]);
@@ -720,11 +761,14 @@ out:
     log_msg("info", "session manager exiting");
 
     if (S.restarting) {
-        /* re-exec ourselves for a fresh session */
+        /* re-exec ourselves for a fresh session (flags preserved) */
         char flag[] = "-S";
         char name[128];
         snprintf(name, sizeof(name), "%s", ctl_name);
-        char *args[] = {argv[0], flag, name, NULL};
+        char nested_flag[] = "-N";
+        char *args[5] = {argv[0], flag, name, NULL, NULL};
+        if (S.nested)
+            args[3] = nested_flag;
         execvp(argv[0], args);
         /* if exec fails we fall through with an error */
         log_msg("error", "re-exec failed: %s", strerror(errno));

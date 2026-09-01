@@ -755,6 +755,15 @@ void xw_wm_recalculate_usable(struct xw_wm *wm) {
             w->w = w->output->usable.w;
             w->h = w->output->usable.h;
             xw_wm_damage_window(wm, w);
+            xw_xdg_send_configure(w);
+        } else if (w->fullscreen) {
+            xw_wm_damage_window(wm, w);
+            w->x = w->output->x;
+            w->y = w->output->y;
+            w->w = w->output->width;
+            w->h = w->output->height;
+            xw_wm_damage_window(wm, w);
+            xw_xdg_send_configure(w);
         }
     }
     xw_wm_damage_all(wm);
