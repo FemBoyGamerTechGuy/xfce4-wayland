@@ -103,7 +103,7 @@ coverage), real-input backend (libinput: udev seat + explicit device
 modes), session manager with honest logind/elogind power reporting,
 graphical exit dialog (unavailable actions show their reason), and
 the desktop panel exist and pass an automated suite (33 in-process
-tests + 71 process-level checks + 38 build-system regression checks,
+tests + 75 process-level checks + 58 build-system regression checks,
 ASAN/UBSAN/LSAN-clean, incl. the forked panel and dialog children;
 the build is verified on font-less systems and under zsh). Nested
 Wayland and nested X11 backends run the desktop inside an existing

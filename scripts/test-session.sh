@@ -371,6 +371,43 @@ else
 fi
 
 echo
+echo "== session 4b: libinput real-input source startup =="
+
+# The udev-seat code path (udev_new -> libinput_udev_create_context ->
+# libinput_udev_assign_seat) is exactly the one whose direct libudev
+# symbols broke the final link on Arch/Artix; this exercises it for
+# real. A machine without a udev seat may refuse the source — that is
+# an honest, logged refusal and passes; what must never happen is a
+# crash or silence. Skipped honestly when the build has no libinput
+# backend (XW_LIBINPUT=0 or dev files absent).
+if ldd "$BIN/xw-compositor" 2>/dev/null | grep -q libinput; then
+    LOG4B="$RTD/session4b-libinput.log"
+    "$BIN/xw-compositor" --backend headless -I libinput -s xw-test-li \
+        >"$LOG4B" 2>&1 &
+    COMP_LI_PID=$!
+
+    check "libinput: source startup logs its mode or a diagnostic" \
+        'wait_for "rg -q \"input:\" \"$LOG4B\" 2>/dev/null"'
+    check "libinput: the udev-seat (or path) code path executed" \
+        'rg -q "libinput udev mode|libinput path mode|udev unavailable|udev context failed|cannot assign seat|path context failed" "$LOG4B" 2>/dev/null'
+
+    kill -TERM "$COMP_LI_PID" 2>/dev/null
+    wait "$COMP_LI_PID" 2>/dev/null
+    LI_RC=$?
+    if [ "$LI_RC" -eq 0 ]; then
+        check "libinput: compositor exits cleanly on SIGTERM (rc=0)" \
+            '[ "$LI_RC" -eq 0 ]'
+    else
+        check "libinput: early exit is an honest input failure (rc=$LI_RC)" \
+            'rg -q "input:.*(unavailable|failed|cannot assign|no device)" "$LOG4B" 2>/dev/null'
+    fi
+    check "libinput: no leaked compositor process" \
+        '! kill -0 $COMP_LI_PID 2>/dev/null'
+else
+    echo "SKIP session 4b (compositor built without the libinput backend)"
+fi
+
+echo
 echo "== session 5: xw-session --nested (auto x11 under Xvfb) =="
 
 if command -v Xvfb >/dev/null 2>&1 && [ -x "$ROOT/build/tests/x11probe" ]; then

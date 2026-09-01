@@ -16,6 +16,12 @@
 #       launch, clear diagnostic, non-zero exit, no stray processes
 #   R5  zsh execution: syntax, sourcing and full runs of the shell
 #       entry points under zsh (plus dash/bash syntax checks)
+#   R6  linker dependency propagation: upstream-shaped libinput.pc
+#       (no -ludev handed out) must still link; XW_LIBINPUT=1 fails
+#       clearly without libudev dev files; auto degrades with a
+#       notice; =0 builds without the backend; feature switching
+#       refuses stale trees; symbol-coverage audit of every final
+#       link command
 #
 # Skips are explicit and honest (with the reason); a skip never passes
 # a check silently. Run via `make check` or directly.
@@ -269,7 +275,8 @@ for sh in sh bash; do
         for s in scripts/env.sh scripts/dev-session.sh \
                  scripts/test-session.sh scripts/run-asan.sh \
                  scripts/bootstrap-sysroot.sh \
-                 scripts/test-build-regressions.sh; do
+                 scripts/test-build-regressions.sh \
+                 scripts/test-link-deps.sh; do
             "$sh" -n "$ROOT/$s" >/dev/null 2>&1 || bad=$((bad + 1))
         done
         check "R5: $sh -n syntax of all entry scripts ($bad failures)" \
@@ -282,7 +289,8 @@ if [ -n "$ZSH" ]; then
     for s in scripts/env.sh scripts/dev-session.sh \
              scripts/test-session.sh scripts/run-asan.sh \
              scripts/bootstrap-sysroot.sh \
-             scripts/test-build-regressions.sh; do
+             scripts/test-build-regressions.sh \
+             scripts/test-link-deps.sh; do
         "$ZSH" -n "$ROOT/$s" >/dev/null 2>&1 || bad=$((bad + 1))
     done
     check "R5: zsh -n syntax of all entry scripts ($bad failures)" \
@@ -328,7 +336,219 @@ if [ -n "$ZSH" ]; then
     fi
 fi
 
+# ========================================= R6: linker dependency propagation
+echo
+echo "== R6: linker dependency propagation (libudev / -l audit) =="
+
+# The reported Artix failure: xw-input-libinput.o references udev_new
+# directly; upstream libinput.pc does not hand out -ludev (only the
+# Debian-family sysroot pc used here does, via Requires:). These checks
+# exercise the upstream shape explicitly so the sandbox cannot mask it.
+if [ -f "$ROOT/build/lib/libxw.a" ] && [ -e "$ROOT/build/bin/xw-compositor" ]; then
+    HSYS="$TMP/hsys"
+    PC="$HSYS/usr/lib/x86_64-linux-gnu/pkgconfig"
+    mkdir -p "$PC"
+
+    # scanner/protocols locations are reused through symlinks when a
+    # local sysroot is the provider (on normal distros the system
+    # locations serve the fallbacks in the Makefile)
+    if [ -n "${XW_SYSROOT:-}" ] && [ -d "$XW_SYSROOT/usr/bin" ]; then
+        ln -s "$XW_SYSROOT/usr/bin" "$HSYS/usr/bin"
+    fi
+    if [ -n "${XW_SYSROOT:-}" ] && [ -d "$XW_SYSROOT/usr/share" ]; then
+        ln -s "$XW_SYSROOT/usr/share" "$HSYS/usr/share"
+    fi
+
+    # full .pc closure: every directory participating in the current
+    # search (local sysroot, PKG_CONFIG_PATH, built-in defaults)
+    # contributes ALL of its .pc files except libinput.pc/libudev.pc —
+    # the hostile upstream-shaped versions are written below. The
+    # closure keeps transitive Requires resolvable (wayland-server ->
+    # libffi, x11 -> xcb, ...) while PKG_CONFIG_LIBDIR makes the
+    # hostile directory the only search root, so the test cannot be
+    # unmasked by system .pc files on real distributions.
+    PC_DIRS="$(printf '%s' "${PKG_CONFIG_PATH:-}" | tr ':' ' ') \
+/usr/lib/x86_64-linux-gnu/pkgconfig /usr/lib64/pkgconfig \
+/usr/share/pkgconfig /usr/lib/pkgconfig"
+    if [ -n "${XW_SYSROOT:-}" ] && [ -d "$XW_SYSROOT/usr/lib/x86_64-linux-gnu/pkgconfig" ]; then
+        PC_DIRS="$XW_SYSROOT/usr/lib/x86_64-linux-gnu/pkgconfig $PC_DIRS"
+    fi
+    for pd in $PC_DIRS; do
+        [ -d "$pd" ] || continue
+        for pcf in "$pd"/*.pc; do
+            [ -f "$pcf" ] || continue
+            case "${pcf##*/}" in
+            libinput.pc | libudev.pc) continue ;;
+            esac
+            cp "$pcf" "$PC/"
+        done
+    done
+
+    # upstream-shaped libinput.pc (Requires.private, no -ludev out)
+    LI_LIBDIR=$(pkg-config --variable=libdir libinput 2>/dev/null || echo /usr/lib)
+    LI_INC=$(pkg-config --variable=includedir libinput 2>/dev/null || echo /usr/include)
+    LI_VER=$(pkg-config --modversion libinput 2>/dev/null || echo 0)
+    LU_LIBDIR=$(pkg-config --variable=libdir libudev 2>/dev/null || echo /usr/lib)
+    LU_INC=$(pkg-config --variable=includedir libudev 2>/dev/null || echo /usr/include)
+    LU_VER=$(pkg-config --modversion libudev 2>/dev/null || echo 0)
+    cat > "$PC/libinput.pc" <<EOF
+libdir=$LI_LIBDIR
+includedir=$LI_INC
+
+Name: libinput
+Description: Input abstraction library (upstream .pc shape)
+Version: $LI_VER
+Libs: -L\${libdir} -linput
+Cflags: -I\${includedir}
+Requires.private: libudev
+EOF
+    cat > "$PC/libudev.pc" <<EOF
+libdir=$LU_LIBDIR
+includedir=$LU_INC
+
+Name: libudev
+Description: udev library (upstream .pc shape)
+Version: $LU_VER
+Libs: -L\${libdir} -ludev
+Cflags: -I\${includedir}
+EOF
+
+    # PKG_CONFIG_LIBDIR replaces the built-in default search path, so
+    # the hostile directory is the ONLY source on every machine (the
+    # system libudev.pc of a real distro must not leak in).
+    hlibs=$(env -u PKG_CONFIG_PATH PKG_CONFIG_LIBDIR="$PC" \
+        pkg-config --libs libinput 2>/dev/null || true)
+    check "R6: hostile libinput.pc hands out no -ludev (test self-check)" \
+        'case "$hlibs" in *ludev*) false ;; *) true ;; esac'
+
+    # --- R6a: the Artix repro — final link with upstream-shaped pcs
+    # (the exe is removed FIRST so `make -n` actually prints the link
+    # command instead of reporting the target up to date)
+    rm -f "$ROOT/build/bin/xw-compositor"
+    line=$( (cd "$ROOT" && env -u PKG_CONFIG_PATH PKG_CONFIG_LIBDIR="$PC" \
+        make -n XW_LIBINPUT=1 XW_SYSROOT="$HSYS" \
+        build/bin/xw-compositor 2>/dev/null) | \
+        grep -F -- " -o build/bin/xw-compositor " | head -1)
+    pos_arc=$(printf '%s\n' "$line" | tr ' ' '\n' | grep -n 'libxw\.a$' | head -1 | cut -d: -f1)
+    pos_in=$(printf '%s\n' "$line" | tr ' ' '\n' | grep -n '^-linput$' | head -1 | cut -d: -f1)
+    pos_ud=$(printf '%s\n' "$line" | tr ' ' '\n' | grep -n '^-ludev$' | head -1 | cut -d: -f1)
+    pos_arc=${pos_arc:-0}; pos_in=${pos_in:-0}; pos_ud=${pos_ud:-0}
+    check "R6: -ludev explicitly on the final link command" '[ "$pos_ud" -gt 0 ]'
+    check "R6: -ludev ordered after libxw.a and -linput (static-safe)" \
+        '[ "$pos_arc" -gt 0 ] && [ "$pos_in" -gt 0 ] && [ "$pos_ud" -gt "$pos_in" ]'
+
+    rm -f "$ROOT/build/bin/xw-compositor"
+    ( cd "$ROOT" && env -u PKG_CONFIG_PATH PKG_CONFIG_LIBDIR="$PC" \
+        make -s XW_LIBINPUT=1 XW_SYSROOT="$HSYS" \
+        build/bin/xw-compositor ) >"$TMP/r6a.log" 2>&1
+    rc=$?
+    check "R6: upstream-pc final link succeeds (the Artix failure, rc=$rc)" \
+        '[ "$rc" -eq 0 ]'
+    check "R6: compositor binary produced under hostile pcs" \
+        '[ -e "$ROOT/build/bin/xw-compositor" ]'
+
+    # restore the canonical build of the binary
+    rm -f "$ROOT/build/bin/xw-compositor"
+    ( cd "$ROOT" && make -s build/bin/xw-compositor ) >/dev/null 2>&1
+
+    # --- R6b: XW_LIBINPUT=1 with libudev dev files absent -> clear error
+    HSYS_NOUDEV="$TMP/hsys-noudev"
+    PC_NOUDEV="$HSYS_NOUDEV/usr/lib/x86_64-linux-gnu/pkgconfig"
+    mkdir -p "$PC_NOUDEV"
+    cp "$PC"/*.pc "$PC_NOUDEV/"
+    rm -f "$PC_NOUDEV/libudev.pc"
+    for sub in bin share; do
+        if [ -L "$HSYS/usr/$sub" ]; then
+            ln -s "$(readlink "$HSYS/usr/$sub")" "$HSYS_NOUDEV/usr/$sub"
+        fi
+    done
+    ( cd "$ROOT" && env -u PKG_CONFIG_PATH PKG_CONFIG_LIBDIR="$PC_NOUDEV" \
+        make -s XW_LIBINPUT=1 XW_SYSROOT="$HSYS_NOUDEV" \
+        build/bin/xw-compositor ) >"$TMP/r6b.log" 2>&1
+    rc=$?
+    check "R6: XW_LIBINPUT=1 without libudev fails (rc=$rc)" '[ "$rc" -ne 0 ]'
+    grep -q "libudev" "$TMP/r6b.log"
+    rc=$?
+    check "R6: XW_LIBINPUT=1 failure names libudev" '[ "$rc" -eq 0 ]'
+
+    # --- R6c: auto without libudev -> degrade with notice, config "no"
+    ( cd "$ROOT" && env -u PKG_CONFIG_PATH PKG_CONFIG_LIBDIR="$PC_NOUDEV" \
+        make -s XW_SYSROOT="$HSYS_NOUDEV" config ) >"$TMP/r6c.log" 2>&1
+    rc=$?
+    check "R6: auto without libudev: make config succeeds (rc=$rc)" \
+        '[ "$rc" -eq 0 ]'
+    grep -qE '^  libinput +no$' "$TMP/r6c.log"
+    rc=$?
+    check "R6: auto without libudev: config reports the backend off" \
+        '[ "$rc" -eq 0 ]'
+    grep -q "libudev" "$TMP/r6c.log"
+    rc=$?
+    check "R6: auto without libudev: the notice names libudev" \
+        '[ "$rc" -eq 0 ]'
+
+    # --- R6c2: auto with both -> enabled, versions reported
+    ( cd "$ROOT" && env -u PKG_CONFIG_PATH PKG_CONFIG_LIBDIR="$PC" \
+        make -s XW_SYSROOT="$HSYS" config ) >"$TMP/r6c2.log" 2>&1
+    grep -qE '^  libinput +yes \(libinput .+ \+ libudev .+\)$' "$TMP/r6c2.log"
+    rc=$?
+    check "R6: auto with both dev sets: config reports libinput + libudev" \
+        '[ "$rc" -eq 0 ]'
+
+    # --- R6d: XW_LIBINPUT=0 -> off
+    ( cd "$ROOT" && make -s XW_LIBINPUT=0 config ) >"$TMP/r6d.log" 2>&1
+    grep -qE '^  libinput +no$' "$TMP/r6d.log"
+    rc=$?
+    check "R6: XW_LIBINPUT=0: config reports the backend off" '[ "$rc" -eq 0 ]'
+
+    # --- R6e: feature switching over a populated tree refuses (stale
+    # archive members would otherwise reproduce the DSO failure class)
+    ( cd "$ROOT" && make -s XW_LIBINPUT=0 \
+        build/bin/xw-compositor ) >"$TMP/r6e.log" 2>&1
+    rc=$?
+    check "R6: switching libinput off on a built tree fails loudly (rc=$rc)" \
+        '[ "$rc" -ne 0 ]'
+    grep -q "make clean" "$TMP/r6e.log"
+    rc=$?
+    check "R6: the refusal points at make clean" '[ "$rc" -eq 0 ]'
+else
+    skip=$((skip + 1))
+    note "SKIP R6: no build tree (run make first; make check builds it)"
+fi
+
+# --- R6f: XW_LIBINPUT=0 builds fully from a clean checkout even when
+# the development files are present (=0 means never build the backend)
+NOINPUT="$TMP/nolibinput"
+copy_repo "$NOINPUT"
+( cd "$NOINPUT" && make -s XW_LIBINPUT=0 all ) >"$TMP/r6f.log" 2>&1
+rc=$?
+check "R6: XW_LIBINPUT=0 clean build succeeds (rc=$rc)" '[ "$rc" -eq 0 ]'
+check "R6: XW_LIBINPUT=0 compositor produced" \
+    '[ -x "$NOINPUT/build/bin/xw-compositor" ]'
+check "R6: XW_LIBINPUT=0 libxw.a excludes the backend member" \
+    '! ar t "$NOINPUT/build/lib/libxw.a" 2>/dev/null | grep -q xw-input-libinput'
+nm "$NOINPUT/build/bin/xw-compositor" >"$TMP/r6f.nm" 2>&1 || true
+check "R6: XW_LIBINPUT=0 binary references no udev/libinput symbols" \
+    '! grep -qE "U (udev_|libinput_)" "$TMP/r6f.nm"'
+
+# --- R6g: symbol-coverage audit of every final link command
+if [ -f "$ROOT/build/lib/libxw.a" ]; then
+    sh "$ROOT/scripts/test-link-deps.sh" >"$TMP/r6g.log" 2>&1
+    rc=$?
+    check "R6: link-line symbol audit passes for all executables (rc=$rc)" \
+        '[ "$rc" -eq 0 ]'
+    grep -q "test-link-deps: .* 0 failed" "$TMP/r6g.log"
+    rc=$?
+    check "R6: audit summary reports zero failures" '[ "$rc" -eq 0 ]'
+else
+    skip=$((skip + 1))
+    note "SKIP R6g: no build tree for the link audit"
+fi
+
 echo
 echo "test-build-regressions: $pass passed, $fail failed, $skip skipped"
+if [ "${XW_REGR_KEEP:-}" = "1" ]; then
+    trap - EXIT INT TERM
+    echo "test-build-regressions: TMP kept for inspection: $TMP"
+fi
 [ "$fail" -eq 0 ] || exit 1
 exit 0

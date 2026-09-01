@@ -560,3 +560,134 @@ Stage Summary:
   wire-sysroot-ldlib-mk.py}, .toolchain/zsh-root (gitignored, local).
 - Suite totals: 33 in-process, 71 process-level, 38 build regressions,
   sanitizer-clean.
+
+---
+Task ID: artix-link-fix
+Agent: chief-autonomous-developer
+Task: Fix the post-font-fix build failure on Artix/XLibre:
+`ld: build/lib/libxw.a(xw-input-libinput.o): undefined reference to
+'udev_new@@LIBUDEV_183'` / `libudev.so.1: DSO missing from command
+line` — as a dependency-graph/propagation problem, not a one-off
+flag, per the user's 13 requirements.
+
+Work Log:
+- Root cause audit: src/libxw/xw-input-libinput.c calls udev_new()/
+  udev_unref() DIRECTLY (it creates the udev seat context handed to
+  libinput_udev_create_context). Only this file references libudev
+  symbols; it lands inside libxw.a. The final link carried only
+  `pkg-config --libs libinput` = -linput: upstream libinput.pc does
+  not hand out -ludev (Requires.private), and modern ld defaults to
+  --no-copy-dt-needed-entries, refusing symbols from indirect
+  DT_NEEDED DSOs. The sandbox never caught it because the local
+  sysroot's libinput.pc (Debian-family, patched by
+  bootstrap-sysroot.sh) declares a PUBLIC `Requires: libudev`, which
+  makes pkg-config emit -ludev transitively. Verified: nm shows
+  udev_new/udev_unref undefined in xw-input-libinput.o; libinput.so
+  exports only libinput_udev_* (its own API), not udev_*.
+- Makefile fix (byte-precise scripts/wire-udev-link-mk.py, 9
+  idempotent patches; NEVER the text editor — the Edit tool was
+  caught converting all 77 recipe TABs to spaces mid-session, the
+  exact hazard the worklog warned about; recovered via
+  git checkout + re-running the wire script):
+  1. The libinput feature now detects, validates and links BOTH
+     pkg-config modules (libinput, libudev): XW_LIBINPUT=1 gives a
+     precise error per missing module; auto enables only when BOTH
+     resolve and the degrade notice names the missing one; 0 stays
+     off.
+  2. CFLAGS_LIBUDEV/LDLIBS_LIBUDEV defined; the
+     xw-input-libinput.o compile rule adds the udev cflags
+     (<libudev.h> is included directly) and its stale comment
+     ("udev context comes through libinput itself") was corrected.
+  3. Both links that consume libxw.a (xw-compositor, run-tests) put
+     $(LDLIBS_LIBUDEV) directly after $(LDLIBS_LIBINPUT): after the
+     archive that references the symbols, after -linput (static-safe
+     order), before xkbcommon/pixman. Client binaries (libxwcl only)
+     stay clean — no global flag anywhere.
+  4. LIBINPUT_FOUND now probes with `--libs`, not `--exists`:
+     pkgconf's --exists resolves Requires.private, so with only the
+     libudev dev files missing, upstream libinput.pc makes --exists
+     report LIBINPUT itself as missing — misdirecting the
+     diagnostic. --libs parses exactly what the link consumes.
+  5. New resolved-feature stamp guard (build/.features, mirrors the
+     PROFILE guard): switching XW_X11/XW_LIBINPUT across a
+     resolved-state change over a populated tree now fails loudly
+     with "make clean" — without it, libxw.a silently kept a
+     udev-using member while linking without -ludev (the same DSO
+     failure class). auto<->1 with the same outcome never forces a
+     clean.
+- Regression coverage (test-build-regressions.sh R6, 20 new checks —
+  suite 38 -> 58, all via `make check`):
+  R6a builds a hostile pkg-config dir with UPSTREAM-shaped
+  libinput.pc/libudev.pc (no -ludev handed out; PKG_CONFIG_LIBDIR
+  makes it the only search root so system .pc files cannot mask it on
+  real distros) with the full .pc closure (transitive Requires like
+  wayland-server->libffi stay resolvable) and re-links the final
+  executable — the literal Artix failure; asserts rc=0 AND -ludev
+  present AND ordered after libxw.a/-linput on the link command.
+  R6b: XW_LIBINPUT=1 without libudev.pc -> hard error naming libudev.
+  R6c: auto without libudev.pc -> config reports the backend off with
+  a libudev notice. R6d: =0 -> off. R6e: feature switching on a
+  populated tree refuses with make-clean guidance. R6f: full
+  XW_LIBINPUT=0 build from a clean copy — archive excludes
+  xw-input-libinput.o, binary references no udev/libinput symbols.
+  R6g: scripts/test-link-deps.sh — symbol-coverage audit: for every
+  final executable it takes the exact link command from `make -n`,
+  parses objects/archives/-l/-L, and fails if any undefined symbol of
+  the inputs is not provided by a library/object on that same line
+  (C runtime + sanitizer runtimes accounted). Catches the whole class
+  for any future dependency, not just udev. Two audit subtleties
+  fixed by testing: `nm -D` succeeds with EMPTY output on relocatable
+  .o (the || fallback never fired), and glibc ifunc symbols print as
+  lowercase 'i' (strcmp/memcpy) — both handled.
+  Session 4b in test-session.sh (4 checks, suite 71 -> 75): starts
+  the compositor with -I libinput — the udev-seat code path whose
+  symbols broke the link — asserting it logs its mode or an honest
+  refusal and exits with discipline (portable: udev-less machines
+  pass via the honest-failure branch).
+- scripts/quickstart-clean.sh: the literal documented quick-start
+  (clone + env.sh + make + dev-session --logout) on a pristine git
+  clone — the req-13 gate; verified rc=0 here.
+- Docs: DEPENDENCIES.md libudev is now a first-class direct
+  build/link dependency (row + prose + the addition-bar note); the
+  full "why" (upstream pc shape, --no-copy-dt-needed) is recorded.
+  BUILDING.md: libudev dev requirement row, XW_LIBINPUT knob
+  semantics (both dev sets + make-clean rule), sysroot bootstrap
+  note, libudev dev packages added to ALL distribution examples
+  (systemd-libs on Arch/Artix family, libudev-dev on Debian/Ubuntu,
+  systemd-devel on Fedora/openSUSE, libudev-devel on Void, udev-dev
+  on Alpine), and troubleshooting entries for the new diagnostics
+  plus "undefined reference/DSO missing from command line" (what it
+  means, why the released build does not produce it, what to check
+  after local hacks). TESTING.md/README.md counts updated.
+- Verification on the final tree, stripped environment: clean
+  rebuild from scratch rc=0 (link line inspected: libxw.a libxwcl.a
+  ... -linput -ludev ... -lxkbcommon); make check = 33/33 + 75/75 +
+  58/58, 0 skipped; make asan = PASS (ASan+UBSan+LSan incl. the new
+  libinput-startup checks; release restored). Runtime: dev-session
+  --logout round trip rc=0 (headless, panel autostarted); nested X11
+  under Xvfb: backend x11, x11probe reads back rendered pixels, XTEST
+  injects Ctrl+Alt+D, shortcut engine dispatches action 24, clean
+  exit 0; `xw-compositor -I libinput` runs the REAL udev-seat path —
+  "input: libinput udev mode, seat 'seat0'" (udev_new -> context ->
+  assign_seat all executed), clean SIGTERM exit 0. No-root install
+  smoke test to a $HOME-style prefix passes.
+
+Stage Summary:
+- The Artix link failure class is closed: libudev is an explicit,
+  validated, correctly-ordered direct dependency of the libinput
+  feature; the hostile-pc regression reproduces the user's exact
+  environment shape (upstream libinput.pc) inside `make check`, so
+  the sandbox can no longer mask this family of bugs.
+- The systematic audit (test-link-deps.sh) + feature-stamp guard +
+  LIBINPUT three-state semantics give the build system fail-fast
+  coverage for the entire "missing/misordered linker dependency"
+  class, not just this instance.
+- Honest backend status (unchanged, verified by running): plain
+  build + dev-session = HEADLESS backend (real compositor+WM+panel
+  over a real Wayland socket, pixman software rendering); with
+  $DISPLAY = nested X11 window (verified under Xvfb incl. XTEST
+  input); the libinput real-input source starts in udev seat mode
+  when asked; direct DRM/KMS scanout remains Phase 4 (not built).
+- New artifacts: scripts/{wire-udev-link-mk.py,test-link-deps.sh,
+  quickstart-clean.sh}; suite totals now 33 in-process + 75
+  process-level + 58 build regressions, sanitizer-clean.

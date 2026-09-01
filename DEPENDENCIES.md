@@ -25,7 +25,7 @@ rules apply and are documented.
 | **libxkbcommon** | keymap compilation, modifier state, keysym resolution for the shortcut engine | 1.0 | MIT | both | ✔ | ✔ | – | no | none |
 | **pixman-1** | software renderer: compositing, damage regions, image ops (output-pixel introspection used by tests) | 0.42 | MIT | both | ✔ | ✔ | ✔ | no | none |
 | **libinput** | real input backend: keyboard/pointer events, device discovery, hotplug, pointer acceleration, v120 wheel protocol | 1.19 | MIT | both (backend optional) | – (parent feeds input) | ✔ (device ownership) | – | **yes** (`XW_LIBINPUT`) | none |
-| **libudev** (via libinput) | udev-seat device discovery + hotplug for libinput | 183 | LGPL-2.1+ | runtime (libinput dep) | – | ✔ | – | with libinput | LGPL: relinking rights + license notice on redistribution |
+| **libudev** | udev-seat context the input backend creates itself: `udev_new()` hands the seat context to `libinput_udev_create_context` — device discovery + hotplug | 183 | LGPL-2.1+ | both (with the libinput backend) | – (parent feeds input) | ✔ (device enumeration) | – | with `XW_LIBINPUT` | LGPL: relinking rights + license notice on redistribution |
 | **libX11** | nested X11 backend: window, XPutImage present path, XKB detectable-autorepeat handling | any (1.6+) | MIT | both (backend optional) | ✔ (X11 parents, XLibre) | – | ✔ | **yes** (`XW_X11`) | none |
 | **libXtst / libXi** | XTEST synthetic input for the process-level X11 backend tests | 1.2 / 1.5 | MIT | dev/test only | ✔ (tests) | – | – | yes (`make check` only) | none |
 | **python3 + Pillow** | build-time bitmap font rasterization (`tools/genfont.py`) of the bundled `assets/fonts/DejaVuSans-ascii.ttf`; no runtime font stack, **no system font package** | py3.8+ / Pillow 9+ | PSF / HPND-MIT (font asset: DejaVu license, see THIRD-PARTY-LICENSES.md) | build only | ✔ | ✔ | ✔ | no (build) | none |
@@ -53,6 +53,17 @@ rules apply and are documented.
   and every X server uses; it solves acceleration curves, wheel
   protocols, device quirks and hotplug correctly. Our input module is
   deliberately thin over it.
+- **libudev**: a *direct* dependency of our input backend, not an
+  incidental libinput runtime dep. The backend calls `udev_new()`
+  itself (udev seat mode), so the udev symbols are referenced by
+  `xw-input-libinput.o` inside `libxw.a` and must be linked
+  explicitly onto the final executables — upstream `libinput.pc`
+  does not hand out `-ludev` (`Requires.private` only), and relying
+  on libinput's indirect DT_NEEDED fails with modern ld
+  (`--no-copy-dt-needed-entries`: the "DSO missing from command
+  line" class). The Makefile therefore detects, validates and links
+  `libudev` as its own pkg-config module whenever `XW_LIBINPUT` is
+  on.
 - **libX11**: only for the *nested X11* backend — the development
   workflow for users living in X11/XLibre sessions. The core never
   links it when built with `XW_X11=0`.
@@ -79,7 +90,8 @@ rules apply and are documented.
    ourselves (see "rejected" for the counter-examples).
 2. Permissive license preferred; copyleft accepted only when no
    equally capable permissive alternative exists (libudev is the only
-   current case, inherited via libinput) — obligations documented
+   current case — a direct build/link dependency of the libinput
+   backend, accepted with eyes open) — obligations documented
    above and in THIRD-PARTY-LICENSES.md.
 3. Runtime dependency must degrade honestly (probe + actionable
    message), like loginctl does.

@@ -89,8 +89,10 @@ absent rather than half-working.
   integration (real `xw-session` + `xw-compositor` children, ctl
   socket, autostart filtering, runtime spawns, panel autostart, clean
   logout, the power backend with a fake loginctl, the X11 backend
-  under Xvfb with synthesized input, `xw-session --nested`, and the
-  nested Wayland backend across two real processes).
+  under Xvfb with synthesized input, the libinput real-input source
+  startup (udev-seat path or its honest logged refusal),
+  `xw-session --nested`, and the nested Wayland backend across two
+  real processes).
 - `scripts/test-build-regressions.sh` — **Level 2 (build system)**:
   regression suite for the distro-agnostic build: font generation from
   the bundled asset (determinism, stripped environment, precise
@@ -98,8 +100,20 @@ absent rather than half-working.
   the quick-start flow after a partial/failed build (dev-session must
   refuse), a **clean build with every system font hidden** inside an
   unprivileged mount namespace (the exact "clean distro, documented
-  deps, still fails" class), and shell compatibility: syntax +
-  sourcing + full session runs under zsh, bash and dash.
+  deps, still fails" class), shell compatibility (syntax + sourcing +
+  full session runs under zsh, bash and dash), and **linker
+  dependency propagation (R6)**: the final link is re-executed under
+  an upstream-shaped `libinput.pc` (which hands out no `-ludev`, the
+  Arch/Artix condition), `-ludev` ordering is asserted on the link
+  command, `XW_LIBINPUT=1/auto/0` semantics are exercised against
+  missing libudev dev files, feature switching over a populated tree
+  must refuse, and a `XW_LIBINPUT=0` build is verified to exclude the
+  backend from the archive and binary. Complemented by
+  `scripts/test-link-deps.sh` — a symbol-coverage audit that parses
+  every final executable's actual link command and fails if any
+  undefined symbol of its objects/archives is not provided by a
+  library on that command line (the general "DSO missing from command
+  line" catcher).
 - `scripts/run-asan.sh` — full sanitizer regression pass (ASan + UBSan
   + LeakSanitizer) including the process-level test; restores the
   release build afterwards.
@@ -136,7 +150,7 @@ requires a running udev instance; run
 what was verified (device, kernel, distro) in WORKLOG.md — that is
 what keeps "verified at Level 3" honest.
 
-## What is covered today (33 Level-1 tests + 71 Level-2 checks + 38 build-regression checks)
+## What is covered today (33 Level-1 tests + 75 Level-2 checks + 58 build-regression checks)
 
 - compositor bootstrap + clean shutdown; socket lifecycle
 - output creation, geometry, scale; multi-output

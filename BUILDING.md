@@ -52,6 +52,7 @@ invokes a package manager and never requires root: see
 | Requirement | Notes |
 |---|---|
 | libinput dev | >= 1.19 — the real-input backend (udev seat mode + path mode, v120 wheel handling). Without it the compositor still builds and runs (headless + nested input unaffected); see [feature toggles](#build-system-knobs) |
+| libudev dev | >= 183 — required **together with** libinput dev: the input backend creates the udev seat context itself (it calls `udev_new()` and passes the context to `libinput_udev_create_context`), which makes libudev a direct compile + link dependency — pkg-config module `libudev` — not something libinput hands out transitively at link time |
 | libX11 dev | the nested X11 backend (run the whole desktop inside an X11/XLibre session). Degrades gracefully when absent |
 | Xvfb + libXtst + libXi dev | required to run the X11 process-level checks in `make check`; the suite skips nothing silently — the checks fail loudly without Xvfb |
 | xkeyboard-config | **runtime only** — xkb keymaps (`evdev/pc105/us` defaults); virtually always installed already |
@@ -127,7 +128,7 @@ the configurable install prefix.
 | Knob | Values | Effect |
 |---|---|---|
 | `XW_X11` | `auto` (default) / `1` / `0` | nested X11 backend. `auto` builds it when libX11 dev files are found and prints an actionable note otherwise; `1` requires it (hard error with instructions); `0` never builds it |
-| `XW_LIBINPUT` | `auto` (default) / `1` / `0` | real-input (libinput) backend, same semantics |
+| `XW_LIBINPUT` | `auto` (default) / `1` / `0` | real-input backend (needs the libinput **and** libudev dev sets — see the requirement row above). `auto` builds it when both are found, printing an actionable note naming the missing one otherwise; `1` requires both (hard error naming whichever is missing); `0` never builds it. Switching the backend on/off over a populated build tree requires `make clean` (the build refuses to mix feature sets, exactly like PROFILE switching) |
 | `PROFILE` | `release` (default) / `debug` / `asan` | compiler/linker preset, see [profiles](#build-profiles) |
 | `prefix` | path (default `/usr/local`) | installation prefix |
 | `DESTDIR` | path | staged install root (packagers) |
@@ -396,7 +397,9 @@ The script:
 
 - downloads wayland/xkbcommon/libinput/udev/Xtst/Xi dev packages plus
   the runtimes not present system-wide (libinput's dependencies:
-  libevdev, libwacom, mtdev, libgudev),
+  libevdev, libwacom, mtdev, libgudev). libudev is not just a libinput
+  runtime dep here: the input backend links it directly, so its dev
+  files (headers + `libudev.pc`) are required with the libinput feature,
 - extracts them with `dpkg -x` into `.toolchain/sysroot` (gitignored,
   never committed),
 - rewrites the `.pc` prefix paths, links dev SONAMEs to matching system
@@ -423,24 +426,28 @@ packages from the [requirements table](#requirements) as needed.
 
 ```sh
 sudo pacman -S base-devel wayland wayland-protocols libxkbcommon \
-                 pixman libx11 libinput python-pillow
+                 pixman libx11 libinput systemd-libs python-pillow
 # for `make check`:
 sudo pacman -S xorg-server-xvfb libxtst libxi
 ```
+
+(`systemd-libs` ships `libudev.pc` on Arch and the Artix family; it
+provides the udev library only — no systemd service. Verify with
+`pkg-config --modversion libudev`.)
 
 ### Debian
 
 ```sh
 sudo apt install build-essential pkg-config libwayland-dev \
                    wayland-protocols libxkbcommon-dev libpixman-1-dev \
-                   libx11-dev libinput-dev python3-pil
+                   libx11-dev libinput-dev libudev-dev python3-pil
 # for `make check`:
 sudo apt install xvfb libxtst-dev libxi-dev
 ```
 
-(The exact `libpixman-1-dev`/`libwayland-dev` names are verified
-against Debian 13 "trixie"; the sysroot bootstrap in this repo was
-built from them.)
+(The exact `libpixman-1-dev`/`libwayland-dev`/`libudev-dev` names are
+verified against Debian 13 "trixie"; the sysroot bootstrap in this
+repo was built from them.)
 
 ### Ubuntu
 
@@ -449,7 +456,7 @@ Same package names as Debian (Ubuntu inherits them):
 ```sh
 sudo apt install build-essential pkg-config libwayland-dev \
                    wayland-protocols libxkbcommon-dev libpixman-1-dev \
-                   libx11-dev libinput-dev python3-pil
+                   libx11-dev libinput-dev libudev-dev python3-pil
 sudo apt install xvfb libxtst-dev libxi-dev   # for make check
 ```
 
@@ -458,17 +465,20 @@ sudo apt install xvfb libxtst-dev libxi-dev   # for make check
 ```sh
 sudo dnf install gcc make pkgconf wayland-devel wayland-protocols-devel \
                    libxkbcommon-devel pixman-devel libX11-devel \
-                   libinput-devel python3-pillow
+                   libinput-devel systemd-devel python3-pillow
 # for `make check`:
 sudo dnf install xorg-x11-server-Xvfb libXtst-devel libXi-devel
 ```
+
+(`systemd-devel` carries `libudev.pc`; on openSUSE the same package
+name applies.)
 
 ### openSUSE
 
 ```sh
 sudo zypper install gcc make pkg-config wayland-devel wayland-protocols \
                      libxkbcommon-devel pixman-devel libX11-devel \
-                     libinput-devel python3-Pillow
+                     libinput-devel systemd-devel python3-Pillow
 # for `make check` (Xvfb lives in the xorg-x11-server package):
 sudo zypper install xorg-x11-server libXtst-devel libXi-devel
 ```
@@ -478,7 +488,7 @@ sudo zypper install xorg-x11-server libXtst-devel libXi-devel
 ```sh
 sudo xbps-install base-devel wayland-devel wayland-protocols \
                     libxkbcommon-devel pixman-devel libX11-devel \
-                    libinput-devel python3-Pillow
+                    libinput-devel libudev-devel python3-Pillow
 # for `make check`:
 sudo xbps-install xorgserver-xvfb libXtst-devel libXi-devel
 ```
@@ -488,7 +498,7 @@ sudo xbps-install xorgserver-xvfb libXtst-devel libXi-devel
 ```sh
 sudo apk add build-base pkgconf wayland-dev wayland-protocols \
                 libxkbcommon-dev pixman-dev libx11-dev libinput-dev \
-                py3-pillow
+                udev-dev py3-pillow
 # for `make check`:
 sudo apk add xvfb libxtst-dev libxi-dev
 ```
@@ -557,6 +567,39 @@ development package everywhere; with a sysroot make sure
 not be built`**
 Informational (AUTO mode). Install libinput development files to enable
 real input, or `make XW_LIBINPUT=0` to silence the note.
+
+**`libinput: the libudev development files (pkg-config module 'libudev')
+were not found — ...`**
+Informational (AUTO mode). The input backend creates its own udev
+seat context, so libudev is a direct link dependency; libinput alone
+is not enough. Install the package shipping `libudev.pc` (see the
+distribution examples above) or `make XW_LIBINPUT=0` to silence the
+note.
+
+**`libinput backend requested (XW_LIBINPUT=1) but the libudev
+development files were not found ...`**
+`XW_LIBINPUT=1` was set but the module named in the message is
+missing. Install it (the message names the pkg-config module and the
+reason), or drop back to `auto`/`0`.
+
+**`undefined reference to 'udev_new'` / `DSO missing from command
+line` during linking**
+An object references a symbol that lives in a library which is not
+*explicitly* on the link command (modern ld refuses to resolve
+symbols from indirect DT_NEEDED libraries). The released build does
+not produce this: libudev is an explicit direct dependency of the
+libinput feature, and `make check` (R6) re-links under an
+upstream-shaped `libinput.pc` plus audits every final link command's
+symbol coverage ([scripts/test-link-deps.sh]). If you see it after
+local changes, add the missing library via `pkg-config --libs
+<module>` to the affected link rule in the Makefile — never as a
+global flag.
+
+**`build tree holds objects for features '...'` (or no stamp)**
+You switched `XW_X11`/`XW_LIBINPUT` across a resolved-state change
+over a populated tree (or the tree predates feature tracking). `make
+clean` once; the guard exists because archives would otherwise keep
+stale members — the same DSO failure class as above.
 
 **`build tree holds objects from PROFILE 'release'`**
 You switched `PROFILE` over a populated tree. `make clean` first —

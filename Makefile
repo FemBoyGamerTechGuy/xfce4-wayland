@@ -196,30 +196,90 @@ HAVE_X11   :=
 endif
 
 # libinput real-input backend — XW_LIBINPUT = auto|1|0.
-LIBINPUT_FOUND := $(shell pkg-config --exists libinput 2>/dev/null && echo y)
+# The backend calls libudev DIRECTLY (udev_new creates the seat
+# context handed to libinput_udev_create_context), so the feature
+# needs TWO development sets: libinput and libudev. The udev_*
+# symbols are referenced by xw-input-libinput.o inside libxw.a and
+# must appear on the final link line explicitly: upstream
+# libinput.pc does not hand out -ludev (pkg-config --libs libinput
+# is just -linput; libudev only rides along as libinput's
+# DT_NEEDED), and ld's default --no-copy-dt-needed-entries refuses
+# to resolve symbols from indirect DSOs — the exact
+# "DSO missing from command line" failure seen on Arch/Artix.
+# probed with --libs, not --exists: pkgconf's --exists resolves
+# Requires.private, and upstream libinput.pc declares Requires.private:
+# libudev -- with only the libudev dev files missing, --exists would
+# report LIBINPUT itself as missing and misdirect the diagnostic.
+# --libs parses the file and its public Requires exactly like the
+# link rule will consume it.
+LIBINPUT_FOUND := $(shell pkg-config --libs libinput >/dev/null 2>&1 && echo y)
+LIBUDEV_FOUND  := $(shell pkg-config --exists libudev 2>/dev/null && echo y)
+LIBINPUT_VER   := $(shell pkg-config --modversion libinput 2>/dev/null)
+LIBUDEV_VER    := $(shell pkg-config --modversion libudev 2>/dev/null)
 ifeq ($(XW_LIBINPUT),1)
   ifneq ($(LIBINPUT_FOUND),y)
     $(error libinput backend requested (XW_LIBINPUT=1) but the libinput development files were not found. libinput drives real keyboards/mice for the native session; the core compositor, nested backends and all tests build and run without it. Install your distribution's libinput development package (BUILDING.md), or build with XW_LIBINPUT=auto/0.)
+  endif
+  ifneq ($(LIBUDEV_FOUND),y)
+    $(error libinput backend requested (XW_LIBINPUT=1) but the libudev development files were not found (pkg-config module 'libudev'). The backend creates the udev context itself for device discovery (udev seat mode), which makes libudev a direct link dependency of libxw.a — not something libinput provides transitively at link time. Install your distribution's libudev development package (BUILDING.md), or build with XW_LIBINPUT=auto/0.)
   endif
   LIBINPUT_ON := y
 else ifeq ($(XW_LIBINPUT),0)
   LIBINPUT_ON :=
 else
-  LIBINPUT_ON := $(LIBINPUT_FOUND)
-  ifneq ($(LIBINPUT_FOUND),y)
-    $(info libinput: development files not found — the real-input backend will not be built (headless and nested input are unaffected).)
-    $(info libinput: install the libinput development package (BUILDING.md) to enable it, or set XW_LIBINPUT=0 to silence this note.)
+  # auto: enabled only when BOTH direct dependencies resolve
+  ifeq ($(LIBINPUT_FOUND)$(LIBUDEV_FOUND),yy)
+    LIBINPUT_ON := y
+  else
+    LIBINPUT_ON :=
+    ifneq ($(LIBINPUT_FOUND),y)
+      $(info libinput: development files not found — the real-input backend will not be built (headless and nested input are unaffected).)
+    else
+      $(info libinput: the libudev development files (pkg-config module 'libudev') were not found — the real-input backend will not be built: it creates its own udev context for device discovery, which makes libudev a direct link dependency rather than something libinput provides transitively.)
+    endif
+    $(info libinput: install the missing development package(s) (BUILDING.md) to enable the backend, or set XW_LIBINPUT=0 to silence this note.)
   endif
 endif
 
 ifeq ($(LIBINPUT_ON),y)
 CFLAGS_LIBINPUT := $(shell pkg-config --cflags libinput 2>/dev/null)
 LDLIBS_LIBINPUT := $(shell pkg-config --libs libinput 2>/dev/null)
+CFLAGS_LIBUDEV  := $(shell pkg-config --cflags libudev 2>/dev/null)
+LDLIBS_LIBUDEV  := $(shell pkg-config --libs libudev 2>/dev/null)
 HAVE_LIBINPUT   := -DXW_HAVE_LIBINPUT
 else
 CFLAGS_LIBINPUT :=
 LDLIBS_LIBINPUT :=
+CFLAGS_LIBUDEV  :=
+LDLIBS_LIBUDEV  :=
 HAVE_LIBINPUT   :=
+endif
+
+
+# Resolved-feature stamp guard: like the PROFILE guard, this
+# refuses to mix objects built with a different set of optional
+# backends in the same tree. The stamp records the RESOLVED state
+# (x11/libinput on/off), so switching between auto and 1 with the
+# same outcome never forces a clean; switching a feature on/off
+# does. Without the guard the archive would silently keep stale
+# members (e.g. a udev-using xw-input-libinput.o left in libxw.a
+# while linking without -ludev — the same "DSO missing from
+# command line" failure class).
+ifeq ($(XW_PROFILE_GUARD),skip)
+XW_FEATURE_GUARD := skip
+endif
+XW_TREE_FEATURES := $(shell cat build/.features 2>/dev/null)
+XW_FEATURES_NOW  := x11=$(if $(X11_ON),y,n) libinput=$(if $(LIBINPUT_ON),y,n)
+ifneq ($(XW_FEATURE_GUARD),skip)
+ifneq ($(XW_TREE_FEATURES),$(XW_FEATURES_NOW))
+ifneq ($(wildcard build/obj),)
+ifeq ($(XW_TREE_FEATURES),)
+$(error build tree holds objects but no build/.features stamp (built before feature tracking existed, or by a file-target-only build). Run `make clean` once so the tree records its feature set.)
+else
+$(error build tree holds objects for features '$(XW_TREE_FEATURES)' but the current configuration resolves to '$(XW_FEATURES_NOW)'. Switching XW_X11/XW_LIBINPUT across a resolved-state change needs a clean tree: run `make clean` first.)
+endif
+endif
+endif
 endif
 
 # ---------------------------------------------------------------- protocols
@@ -297,10 +357,13 @@ $(OBJ)/libxw/xw-backend-nested.o: src/libxw/xw-backend-nested.c $(LIBXW_DEPS) sr
 $(OBJ)/libxw/xw-backend-x11.o: src/libxw/xw-backend-x11.c $(LIBXW_DEPS) $(GEN_HEADERS) | $(OBJ)/libxw
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_X11) $(CFLAGS_XKB) $(CFLAGS_PIX) $(HAVE_X11) $(HAVE_LIBINPUT) -c $< -o $@
 
-# libinput backend: needs libinput headers (udev context comes
-# through libinput itself)
+# libinput backend: needs libinput AND libudev headers — the
+# backend creates the udev context itself (udev seat mode), so
+# <libudev.h> is included directly and the udev_* symbols it
+# pulls in must be linked explicitly (see the feature block
+# above for why libinput.pc does not provide them).
 $(OBJ)/libxw/xw-input-libinput.o: src/libxw/xw-input-libinput.c $(LIBXW_DEPS) $(GEN_HEADERS) | $(OBJ)/libxw
-	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_LIBINPUT) $(CFLAGS_XKB) $(CFLAGS_PIX) $(HAVE_LIBINPUT) -c $< -o $@
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_LIBINPUT) $(CFLAGS_LIBUDEV) $(CFLAGS_XKB) $(CFLAGS_PIX) $(HAVE_LIBINPUT) -c $< -o $@
 
 $(OBJ)/gen/%-protocol.o: $(GEN)/%-protocol.c | $(OBJ)/gen
 	$(CC) $(CSTD) $(CFLAGS) -w $(INCLUDES) $(CFLAGS_WLS) -c $< -o $@
@@ -325,7 +388,7 @@ $(OBJ)/libxwcl/%.o: src/libxwcl/%.c src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/libx
 
 # ---------------------------------------------------------------- server bins
 build/bin/xw-compositor: $(OBJ)/compositor/xw-compositor.o build/lib/libxw.a build/lib/libxwcl.a | build/bin
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/compositor/xw-compositor.o build/lib/libxw.a build/lib/libxwcl.a $(LDLIBS_WLS) $(LDLIBS_WLC) $(LDLIBS_X11) $(LDLIBS_LIBINPUT) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/compositor/xw-compositor.o build/lib/libxw.a build/lib/libxwcl.a $(LDLIBS_WLS) $(LDLIBS_WLC) $(LDLIBS_X11) $(LDLIBS_LIBINPUT) $(LDLIBS_LIBUDEV) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
 
 $(OBJ)/compositor/%.o: src/compositor/%.c $(LIBXW_DEPS) $(GEN_HEADERS) | $(OBJ)/compositor
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_XKB) $(CFLAGS_PIX) -c $< -o $@
@@ -356,7 +419,7 @@ $(OBJ)/clients/%.o: src/clients/%.c src/clients/*.h src/libxwcl/*.h $(GEN_HEADER
 # ---------------------------------------------------------------- tests
 TEST_SRC := $(wildcard tests/suite/*.c)
 build/tests/run-tests: $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a | build/tests
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_WLC) $(LDLIBS_X11) $(LDLIBS_LIBINPUT) $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_WLC) $(LDLIBS_X11) $(LDLIBS_LIBINPUT) $(LDLIBS_LIBUDEV) $(LDLIBS_M)
 
 $(OBJ)/tests/%.o: tests/suite/%.c tests/harness/xwtest.h $(LIBXW_DEPS) src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/tests
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_WLC) $(CFLAGS_PIX) $(CFLAGS_XKB) $(HAVE_X11) $(HAVE_LIBINPUT) -c $< -o $@
@@ -392,7 +455,7 @@ SESSION_BINS := $(if $(wildcard src/session/xw-session.c),build/bin/xw-session b
 CLIENT_BINS := $(if $(wildcard src/clients/xw-demo.c),build/bin/xw-demo,) \
 	$(if $(wildcard src/clients/xw-exit.c),build/bin/xw-exit,) \
 	$(if $(wildcard src/clients/xw-panel.c),build/bin/xw-panel,)
-all: build/.profile build/bin/xw-compositor $(SESSION_BINS) $(CLIENT_BINS) \
+all: build/.profile build/.features build/bin/xw-compositor $(SESSION_BINS) $(CLIENT_BINS) \
 	build/tests/run-tests
 ifeq ($(X11_ON),y)
 all: build/tests/x11probe
@@ -402,6 +465,11 @@ endif
 build/.profile:
 	@mkdir -p $(@D)
 	@printf '%s\n' '$(PROFILE)' > $@
+
+# resolved-feature stamp consulted by the feature guard above
+build/.features:
+	@mkdir -p $(@D)
+	@printf 'x11=%s libinput=%s\n' '$(if $(X11_ON),y,n)' '$(if $(LIBINPUT_ON),y,n)' > $@
 
 tests: all
 	build/tests/run-tests
@@ -468,6 +536,6 @@ config:
 	@echo "  xkbcommon      $(shell pkg-config --modversion xkbcommon 2>/dev/null || echo missing)"
 	@echo "  pixman         $(shell pkg-config --modversion pixman-1 2>/dev/null || echo missing)"
 	@echo "  X11 backend    $(if $(X11_ON),yes (libX11 $(shell pkg-config --modversion x11 2>/dev/null)),no)"
-	@echo "  libinput       $(if $(LIBINPUT_ON),yes ($(shell pkg-config --modversion libinput 2>/dev/null)),no)"
+	@echo "  libinput       $(if $(LIBINPUT_ON),yes (libinput $(LIBINPUT_VER) + libudev $(LIBUDEV_VER)),no)"
 	@echo "  font source    $(if $(XW_FONT),$(XW_FONT) (XW_FONT override),bundled asset assets/fonts/DejaVuSans-ascii.ttf)"
 	@echo "  install prefix $(prefix)"
