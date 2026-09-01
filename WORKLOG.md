@@ -426,3 +426,20 @@ after; logind session takeover for DRM master without root; multi-
 monitor + hotplug on top. Also queued: session restart (re-exec)
 automated test, notification daemon skeleton, xdg geometry offsets
 (CSD shadows).
+
+### Session 5 addendum
+
+- **CSD geometry offsets (M2 PART gap closed)**: set_window_geometry
+  x/y now apply. render: blit_surface takes a source sub-rect origin
+  (content composited 1:1 from (geo_x, geo_y); oversized buffers —
+  shadow margins — composite only the declared rect, which keeps
+  damage exact; the 1:1 path covers any buffer containing the source
+  rect). input: surface-local coords account for the buffer-origin
+  offset and the default interactive rect is the geometry rect, so
+  clicks on CSD shadows fall through. Test: csd-geometry.
+- **Session restart (re-exec) covered + fixed**: the re-exec rebuilt
+  a minimal argv and silently dropped user flags (-n kept autostart
+  off in the original session but not in the restarted one); it now
+  re-execs with the original argv. New session 1c process checks:
+  socket teardown + reappearance, same pid, fresh compositor,
+  restarts=0, flags preserved, clean logout.

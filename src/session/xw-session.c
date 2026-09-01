@@ -802,15 +802,10 @@ out:
     log_msg("info", "session manager exiting");
 
     if (S.restarting) {
-        /* re-exec ourselves for a fresh session (flags preserved) */
-        char flag[] = "-S";
-        char name[128];
-        snprintf(name, sizeof(name), "%s", ctl_name);
-        char nested_flag[] = "-N";
-        char *args[5] = {argv[0], flag, name, NULL, NULL};
-        if (S.nested)
-            args[3] = nested_flag;
-        execvp(argv[0], args);
+        /* re-exec with the ORIGINAL argv: a restarted session keeps
+         * every flag the user chose (ctl name, no-autostart, nested).
+         * Rebuilding a minimal argv here silently dropped flags. */
+        execvp(argv[0], argv);
         /* if exec fails we fall through with an error */
         log_msg("error", "re-exec failed: %s", strerror(errno));
         return 1;

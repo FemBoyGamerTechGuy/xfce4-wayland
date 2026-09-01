@@ -190,6 +190,43 @@ unset FAKE_LOG
 export XW_POWER_STATE_PATH="$RTD/nonexistent-power-state"
 
 echo
+echo "== session 1c: session restart (re-exec) =="
+
+# a dedicated ctl name keeps this independent from the defaults
+export XW_SESSION_SOCK=xw-restart-test
+"$BIN/xw-session" -n -S "$XW_SESSION_SOCK" >"$LOG" 2>&1 &
+SESS_PID=$!
+check "1c: control socket appears" \
+    'wait_for "[ -S \"$RTD/$XW_SESSION_SOCK.sock\" ]"'
+
+reply="$("$BIN/xw-session-ctl" -S "$XW_SESSION_SOCK" restart 2>/dev/null)"
+check "1c: restart -> ok restarting session" \
+    '[ "$reply" = "ok restarting session" ]'
+
+# re-exec keeps the same pid: the socket is removed, then reappears
+check "1c: socket torn down" 'wait_for "[ ! -S \"$RTD/$XW_SESSION_SOCK.sock\" ]"'
+check "1c: socket back after re-exec" \
+    'wait_for "[ -S \"$RTD/$XW_SESSION_SOCK.sock\" ]"'
+check "1c: session process still alive (same pid)" 'kill -0 "$SESS_PID" 2>/dev/null'
+
+reply="$("$BIN/xw-session-ctl" -S "$XW_SESSION_SOCK" status 2>/dev/null)"
+check "1c: fresh session runs the compositor again" \
+    'case "$reply" in *compositor=running*) true ;; *) false ;; esac'
+check "1c: restart counter reset (fresh session state)" \
+    'case "$reply" in *restarts=0*) true ;; *) false ;; esac'
+
+# flags survive the re-exec: -n must still hold autostart back
+reply="$("$BIN/xw-session-ctl" -S "$XW_SESSION_SOCK" status 2>/dev/null)"
+check "1c: no autostart children (flag preserved)" \
+    'case "$reply" in *autostart=0*) true ;; *) false ;; esac'
+
+"$BIN/xw-session-ctl" -S "$XW_SESSION_SOCK" logout >/dev/null 2>&1
+check "1c: logout after restart exits cleanly" 'wait_pid_exit "$SESS_PID"'
+wait "$SESS_PID"
+check "1c: exit code 0" '[ "$?" -eq 0 ]'
+unset XW_SESSION_SOCK
+
+echo
 echo "== session 2: XDG autostart filtering =="
 
 mkdir -p "$FAKE_HOME/.config/autostart"
