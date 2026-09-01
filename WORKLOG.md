@@ -691,3 +691,120 @@ Stage Summary:
 - New artifacts: scripts/{wire-udev-link-mk.py,test-link-deps.sh,
   quickstart-clean.sh}; suite totals now 33 in-process + 75
   process-level + 58 build regressions, sanitizer-clean.
+
+---
+Task ID: nested-panel-invisible
+Agent: chief-autonomous-developer
+Task: Fix the nested-session panel invisibility: "the compositor window
+appears and the mouse cursor works, but the xw-panel is completely
+invisible" while the session reports the panel autostarted. Trace the
+complete path, fix compositor or panel, add regression tests, verify
+the full nested session end-to-end.
+
+Work Log:
+- Reproduction ladder (fresh Xvfb; no WM -> panel VISIBLE, so the
+  report needed a real WM): wrote tests/miniwm.c (minimal reparenting
+  WM that resizes clients like openbox/xfwm4) and tests/panelprobe.c
+  (pixel probe for panel colors, background extent, right-edge
+  coverage, and the software cursor at an XTEST warp point). Under the
+  WM the panel appeared at STALE width and later crashed — leading to
+  three independent root causes plus two more crashers found on the
+  way:
+  1. X event starvation (the resize never reached the compositor):
+     minimal reproducer tests/fdtest2.c — with an XPutImage present
+     (any large request) the X server defers flushing subsequent
+     event batches of that connection server-side (verified: kernel
+     socket queues 0/0 for seconds while Reparent/Configure/Map/Expose
+     are pending), and Xlib's _XReply read-ahead drains the socket
+     into its own queue on round trips, so a pure epoll on
+     ConnectionNumber never fires. A delayed XSync round trip
+     materialized all events (XPending=5). Fix: xb_watchdog in
+     xw-backend-x11.c — 50ms timer doing one XSync (the reply forces
+     the server to flush) + a shared XPending drain; the fd callback
+     keeps instant delivery (same reasoning as GTK's X11 backend
+     polling XPending instead of trusting select()).
+  2. Layer surfaces were never reconfigured on output resize:
+     xw_layer_reconfigure_output() (xw-layer-shell.c) relayouts +
+     re-sends configure for anchored surfaces when the output
+     geometry changes; xw_output_resize() calls it. The panel now
+     learns the new width and recommits (spans the WM geometry).
+  3. Client crash #1 (the panel SEGV, exit 139): libxwcl freed the
+     wl_output listener state in out_done while the listener stayed
+     attached — the second output announcement (the resize
+     reannounce, newly reachable) called into freed memory. The state
+     now lives for the connection's lifetime and w/h update on every
+     done.
+  4. Client crash #2 (buffer use-after-free window): pool_destroy
+     destroyed wl_buffers that were still the surface's committed
+     content (the server-side wl_shm_buffer dies with the resource;
+     the renderer keeps reading it until the next commit). Fixed by
+     pool retirement: the old pool is destroyed only after the
+     replacement buffer is committed (guarded for allocation
+     failure), and window/layer destroy now destroys surfaces before
+     pools.
+  5. xw-exit segfaulted (exit 139, caught by the new exit logging)
+     on any output != 720px tall: draw() used a hardcoded 720 height
+     bound against an output-sized layer buffer -> write past the shm
+     mapping. Geometry now derives from the configure (dialog_rect);
+     it only ever worked on the headless 1280x720 default.
+  6. Session observability: xw-session reaped children with statuses
+     discarded — a crashed panel was indistinguishable from a running
+     one (the exact report). Autostart/spawned exits are now logged
+     with name, pid, wait status, runtime, and a 127-specific
+     Exec=-line hint. dev-session.sh's blind "panel autostarted" echo
+     replaced by a real pgrep check after a settle delay.
+- Tests: in-process layer-shell-resize-reconfigure (protocol suite,
+  33 -> 34); session 5 rebuilt as the full nested regression (Xvfb +
+  miniwm + real panel autostart + panelprobe: alive, no child exits,
+  panel visible + spans resized width + software-cursor path + no
+  crash lines + clean logout, 75 -> 84 process checks); new session 7
+  (autostart exit logging incl. the 127 hint); panelprobe/miniwm/
+  fdtest2 wired into the Makefile behind X11_ON via byte-precise
+  scripts/wire-nested-tests-mk.py; new xw-demo client (the Makefile
+  already expected it) as the canonical non-modal "normal app".
+- Sandbox bootstrap fix: the sysroot needs libinput's recursive
+  runtime deps (libmtdev1t64, libgudev-1.0-0) or the final link fails
+  (DSO missing g_udev_*/mtdev_*); added to bootstrap-sysroot.sh's
+  download list.
+- Docs: ARCHITECTURE.md (X11 event-delivery watchdog rationale,
+  wl_buffer lifetime contract, layer reconfigure-on-resize, output
+  announcement not one-shot), BUILDING.md troubleshooting ("window
+  appears but panel does not" -> read the exit log, 127 = Exec path),
+  TESTING.md (new coverage + regression-policy entries), README
+  counts (34 + 84 + 49-58).
+- Final verification of the whole checklist on the rebuilt tree,
+  Xvfb + reparenting WM, `build/bin/xw-session --nested` with panel
+  autostart: panel + clock + workspace buttons + tasklist + exit
+  button all present in pixels; panel spans the WM-resized 700x450
+  window; XTEST warp shows the COMPOSITOR's software cursor (the X
+  cursor of our window is invisible by construction -> the visible
+  cursor provably went through the compositor input path); XTEST
+  click on the exit button spawns xw-exit end-to-end; with xw-demo
+  open the panel stays visible and the tasklist gains a task button
+  (btn pixel count 2432 -> 6483); clean logout rc=0, no leftover
+  processes.
+- Full suites on the final tree: 34/34 in-process, 84/84
+  process-level, 49/49 build regressions (+1 environmental skip: zsh
+  absent in this sandbox; 58 with zsh installed), make asan = PASS
+  (ASan+UBSan+LSan, release restored).
+
+Stage Summary:
+- The nested-session panel invisibility is closed end-to-end. It was
+  not one bug: event starvation (server deferral + Xlib read-ahead),
+  missing layer reconfiguration on resize, a client-side use-after-
+  free on output reannouncement, a buffer-lifetime violation, a
+  hardcoded dialog height, and silent child-exit supervision — any
+  one of which could make the panel invisible or dead while the
+  session claimed success.
+- "Panel autostarted" is no longer a claim the system makes without
+  evidence: the session logs child exits with status/runtime/hints,
+  dev-session verifies the process, and the nested regression
+  verifies actual pixels through a real reparenting WM.
+- Honest backend status (unchanged, now pixel-verified under a WM):
+  plain build + dev-session = HEADLESS; with $DISPLAY = nested X11
+  window (panel, tasklist, dialog, cursor, interaction verified);
+  nested Wayland works; direct DRM/KMS remains Phase 4.
+- New artifacts: tests/{panelprobe,miniwm,fdtest2}.c,
+  scripts/wire-nested-tests-mk.py, src/clients/xw-demo.c; suites:
+  34 in-process + 84 process-level + 49-58 build regressions,
+  sanitizer-clean.

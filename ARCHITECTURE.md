@@ -61,6 +61,20 @@ therefore own the following responsibilities directly:
   X window; XPutImage from the native pixman buffer, X keycodes are
   evdev+8). DRM/KMS is the roadmap item; this is the same seam where
   GPU rendering would be introduced.
+- **X11 event delivery (nested backend)**: polling only the X
+  connection fd is NOT sufficient, for two independently reproducible
+  reasons (see `xb_watchdog` in `src/libxw/xw-backend-x11.c` and
+  `tests/fdtest2.c`): the X server defers flushing event batches of a
+  connection that recently carried large requests (our XPutImage
+  presents — the map-time structure events then sit server-side while
+  the fd stays silent), and Xlib's `_XReply` read-ahead drains the
+  socket into its own internal queue after any round trip. The
+  backend therefore also runs a 50ms watchdog that performs one XSync
+  round trip (the reply forces the server to flush the connection)
+  and drains Xlib's queue; the fd callback keeps instant delivery
+  when the server flushed on its own. This is the same reasoning
+  behind GTK's X11 backend polling XPending from its event-loop check
+  phase instead of trusting select().
 - **Buffer management**: wl_shm (and single-pixel-buffer) today; linux-dmabuf
   is a roadmap item.
 - **Rendering**: pixman-based compositor with damage tracking, integer
@@ -199,6 +213,22 @@ synthetic input — that is what makes the test coverage meaningful).
   shortcuts section above).
 
 ## The panel (xw-panel)
+
+Protocol contract notes learned the hard way (all regression-tested):
+
+- wl_buffer lifetime: the compositor keeps rendering from the attached
+  wl_buffer until the next commit swaps it, and the server-side
+  wl_shm_buffer dies with the wl_buffer resource. Clients must not
+  destroy a buffer that is still the surface's committed content —
+  libxwcl "retires" the previous pool on resize and destroys it only
+  after the replacement buffer has been committed.
+- layer surfaces anchored to opposite edges derive their size from
+  the output; when the output geometry changes the compositor sends a
+  fresh configure so anchored clients recommit at the new size (the
+  panel always spans the actual output).
+- the wl_output announcement is not one-shot: the compositor
+  re-announces on mode changes (nested resize), and client listener
+  state must live as long as the proxy.
 
 One process, one layer-shell surface: a top bar anchored LEFT|RIGHT
 (compositor dictates the width) with a fixed height and an exclusive

@@ -37,7 +37,7 @@ echo "bootstrap: downloading packages (no root, no system changes)"
 (cd "$DL" && apt-get download \
     libwayland-dev libwayland-bin wayland-protocols libxkbcommon-dev \
     libinput-dev libinput10 libudev-dev libxtst-dev libxtst6 \
-    libxi-dev libxi6 libevdev2 libwacom9)
+    libxi-dev libxi6 libevdev2 libwacom9 libmtdev1t64 libgudev-1.0-0)
 
 echo "bootstrap: extracting into $SYS"
 for deb in "$DL"/*.deb; do
@@ -72,6 +72,10 @@ done
 # libinput runtime is NOT installed system-wide here: keep the sysroot
 # copy, link the dev name to it, and record the rpath in libinput.pc
 # (upstream's Requires: libudev is preserved so -ludev resolves too).
+# libmtdev + libgudev are libinput's/libwacom's own runtime deps: they
+# must be extracted too, or the final link fails with "DSO missing"/
+# undefined references (g_udev_*, mtdev_*) — apt-get download does not
+# resolve dependency closures, so they are listed explicitly above.
 if [ -e "$LIB/libinput.so.10" ]; then
     ln -sf libinput.so.10 "$LIB/libinput.so"
     sed -i "s|^Libs:.*|Libs: -L\${libdir} -Wl,-rpath,\${libdir} -linput|" "$PC/libinput.pc"

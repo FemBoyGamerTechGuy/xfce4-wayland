@@ -94,6 +94,14 @@ struct xwc_win {
     int cur;              /* current back buffer index */
     uint32_t *data;       /* pool mapping */
     size_t pool_size;
+    /* previous pool awaiting safe destruction (see win_pool_swap): the
+     * compositor keeps rendering from the attached wl_buffer until the
+     * next commit, so the old buffers must not be destroyed before the
+     * new one is committed */
+    struct wl_shm_pool *old_pool;
+    struct wl_buffer *old_bufs[2];
+    uint32_t *old_data;
+    size_t old_pool_size;
     int w, h;
     bool mapped;
     bool closed;
@@ -112,6 +120,11 @@ struct xwc_layer {
     int cur;
     uint32_t *data;
     size_t pool_size;
+    /* previous pool awaiting safe destruction (see layer_configure) */
+    struct wl_shm_pool *old_pool;
+    struct wl_buffer *old_bufs[2];
+    uint32_t *old_data;
+    size_t old_pool_size;
     int w, h;
     bool mapped;
     bool conf_pending;
@@ -410,6 +423,43 @@ static const struct wl_buffer_listener buf_listener = {
 
 /* ------------------------------------------------------------- window */
 
+/* Destroy a retired pool. Called only after the replacement buffer has
+ * been committed (or the surface is gone): the server's wl_shm_buffer
+ * dies with the wl_buffer resource, and the surface keeps using it
+ * until a commit swaps it — destroying earlier leaves the compositor
+ * reading freed memory on its next repaint. */
+static void pool_retired_destroy(struct wl_shm_pool *pool,
+                                 struct wl_buffer **bufs, uint32_t *data,
+                                 size_t size) {
+    if (bufs[0])
+        wl_buffer_destroy(bufs[0]);
+    if (bufs[1])
+        wl_buffer_destroy(bufs[1]);
+    bufs[0] = bufs[1] = NULL;
+    if (pool)
+        wl_shm_pool_destroy(pool);
+    if (data && size)
+        munmap(data, size);
+}
+
+/* move the current pool into the retirement slot (new buffers are not
+ * created yet) */
+static void pool_retire(struct wl_shm_pool **pool, struct wl_buffer **bufs,
+                        uint32_t **data, size_t *size,
+                        struct wl_shm_pool **old_pool,
+                        struct wl_buffer **old_bufs, uint32_t **old_data,
+                        size_t *old_size) {
+    pool_retired_destroy(*old_pool, old_bufs, *old_data, *old_size);
+    *old_pool = *pool;
+    old_bufs[0] = bufs[0];
+    old_bufs[1] = bufs[1];
+    *old_data = *data;
+    *old_size = *size;
+    *pool = NULL;
+    *data = NULL;
+    bufs[0] = bufs[1] = NULL;
+}
+
 static void win_configure_apply(struct xwc_win *w) {
     int nw = w->conf_w, nh = w->conf_h;
     if (nw < 1)
@@ -418,9 +468,8 @@ static void win_configure_apply(struct xwc_win *w) {
         nh = w->h;
     if (nw == w->w && nh == w->h && w->data)
         return;
-    pool_destroy(w->pool, w->bufs, w->data, w->pool_size);
-    w->pool = NULL;
-    w->data = NULL;
+    pool_retire(&w->pool, w->bufs, &w->data, &w->pool_size, &w->old_pool,
+                w->old_bufs, &w->old_data, &w->old_pool_size);
     w->w = nw;
     w->h = nh;
     if (!pool_create(w->c, w, nw, nh, &w->pool, w->bufs, &w->data,
@@ -430,6 +479,17 @@ static void win_configure_apply(struct xwc_win *w) {
     }
     wl_buffer_add_listener(w->bufs[0], &buf_listener, w);
     wl_buffer_add_listener(w->bufs[1], &buf_listener, w);
+}
+
+/* destroy the retired pool after the replacement buffer was committed
+ * (called right after the configure callback, which draws + commits) */
+static void win_retired_release(struct xwc_win *w) {
+    pool_retired_destroy(w->old_pool, w->old_bufs, w->old_data,
+                         w->old_pool_size);
+    w->old_pool = NULL;
+    w->old_bufs[0] = w->old_bufs[1] = NULL;
+    w->old_data = NULL;
+    w->old_pool_size = 0;
 }
 
 static void toplevel_configure(void *data, struct xdg_toplevel *t, int32_t w,
@@ -465,6 +525,12 @@ static void xdg_surface_configure(void *data, struct xdg_surface *xs,
      * toplevel.configure handler only records the size */
     if (win->cb.configure)
         win->cb.configure(win, win->conf_w, win->conf_h, win->cb.ud);
+    /* the callback drew into the NEW buffer and committed it — the
+     * retired pool can go now (see pool_retire). Only when the new
+     * pool exists: on allocation failure nothing was committed and
+     * the old buffer must stay alive. */
+    if (win->data)
+        win_retired_release(win);
 }
 
 static const struct xdg_surface_listener xdg_surface_listener = {
@@ -502,13 +568,19 @@ void xwc_win_destroy(struct xwc_win *w) {
     if (!w)
         return;
     xwc_unregister_surface(w->c, w->surface);
-    pool_destroy(w->pool, w->bufs, w->data, w->pool_size);
+    /* role objects and surface first, pools after: requests are
+     * processed in order, so the server stops rendering from the
+     * attached buffer before the wl_buffer (and its server-side
+     * wl_shm_buffer) is destroyed */
     if (w->toplevel)
         xdg_toplevel_destroy(w->toplevel);
     if (w->xdg_surface)
         xdg_surface_destroy(w->xdg_surface);
     if (w->surface)
         wl_surface_destroy(w->surface);
+    pool_destroy(w->pool, w->bufs, w->data, w->pool_size);
+    pool_retired_destroy(w->old_pool, w->old_bufs, w->old_data,
+                         w->old_pool_size);
     if (w->c->focused_owner == w)
         w->c->focused_owner = NULL;
     free(w);
@@ -589,9 +661,14 @@ static void layer_configure(void *data, struct zwlr_layer_surface_v1 *ls,
     l->conf_pending = false;
     if ((int)w != l->w || (int)h != l->h || !l->data) {
         if ((int)w > 0 && (int)h > 0) {
-            pool_destroy(l->pool, l->bufs, l->data, l->pool_size);
-            l->pool = NULL;
-            l->data = NULL;
+            /* retire the old pool (destroyed only after the new buffer
+             * is committed below — the compositor renders from the
+             * attached wl_buffer until then; destroying it earlier
+             * would free the server-side wl_shm_buffer under the
+             * renderer) */
+            pool_retire(&l->pool, l->bufs, &l->data, &l->pool_size,
+                        &l->old_pool, l->old_bufs, &l->old_data,
+                        &l->old_pool_size);
             l->w = w;
             l->h = h;
             if (pool_create(l->c, l, l->w, l->h, &l->pool, l->bufs, &l->data,
@@ -603,6 +680,19 @@ static void layer_configure(void *data, struct zwlr_layer_surface_v1 *ls,
     }
     if (l->cb.configure)
         l->cb.configure((struct xwc_win *)l, l->w, l->h, l->cb.ud);
+    /* the configure callback drew + committed the new buffer: release
+     * the retired pool. Only when the new pool exists — if allocation
+     * failed nothing was committed and the surface still renders from
+     * the old buffer, which must stay alive (released at destroy time
+     * instead, after the surface itself is gone). */
+    if (l->data && (l->old_pool || l->old_data)) {
+        pool_retired_destroy(l->old_pool, l->old_bufs, l->old_data,
+                             l->old_pool_size);
+        l->old_pool = NULL;
+        l->old_bufs[0] = l->old_bufs[1] = NULL;
+        l->old_data = NULL;
+        l->old_pool_size = 0;
+    }
 }
 
 static void layer_closed(void *data, struct zwlr_layer_surface_v1 *ls) {
@@ -650,11 +740,14 @@ void xwc_layer_destroy(struct xwc_layer *l) {
     if (!l)
         return;
     xwc_unregister_surface(l->c, l->surface);
-    pool_destroy(l->pool, l->bufs, l->data, l->pool_size);
+    /* surface before pools (see xwc_win_destroy) */
     if (l->ls)
         zwlr_layer_surface_v1_destroy(l->ls);
     if (l->surface)
         wl_surface_destroy(l->surface);
+    pool_destroy(l->pool, l->bufs, l->data, l->pool_size);
+    pool_retired_destroy(l->old_pool, l->old_bufs, l->old_data,
+                         l->old_pool_size);
     free(l);
 }
 

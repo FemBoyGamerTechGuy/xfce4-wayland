@@ -46,6 +46,7 @@ struct x11_backend {
 
     struct xw_output *output; /* single output, 1:1 with the window */
     struct wl_event_source *xsrc; /* X fd on our loop */
+    struct wl_event_source *wdog; /* event watchdog timer (see below) */
 
     int win_w, win_h;
 
@@ -214,6 +215,18 @@ static void xb_handle_event(struct x11_backend *xb, XEvent *ev) {
     }
 }
 
+/* --------------------------------------------------------- X event pump */
+
+/* Drain Xlib's event queue. Used from both the fd callback and the
+ * watchdog timer. */
+static void xb_pump_events(struct x11_backend *xb) {
+    while (XPending(xb->dpy)) {
+        XEvent ev;
+        XNextEvent(xb->dpy, &ev);
+        xb_handle_event(xb, &ev);
+    }
+}
+
 static int xb_on_readable(int fd, uint32_t mask, void *data) {
     (void)fd;
     struct x11_backend *xb = data;
@@ -223,14 +236,46 @@ static int xb_on_readable(int fd, uint32_t mask, void *data) {
     }
     /* Xlib buffers internally; XPending flushes requests and reads the
      * socket, so a poll wakeup is drained with this loop */
-    while (XPending(xb->dpy)) {
-        XEvent ev;
-        XNextEvent(xb->dpy, &ev);
-        xb_handle_event(xb, &ev);
-    }
+    xb_pump_events(xb);
     XFlush(xb->dpy);
     return 0;
 }
+
+/* Event-delivery watchdog. Watching ConnectionNumber alone is NOT
+ * sufficient for Xlib, for two independent reasons (both reproduced
+ * with Xvfb + a reparenting WM in tests/fdtest2.c):
+ *
+ *  1. The X server defers flushing event batches of a connection that
+ *     recently carried large requests (our XPutImage presents). The
+ *     map-time structure events (Reparent/Configure/Map/Expose) then
+ *     sit in the server's per-connection output buffer indefinitely
+ *     while the fd stays silent — the nested window resizes under us
+ *     without the compositor ever learning about it.
+ *
+ *  2. Xlib's _XReply read-ahead: after any round trip (XSync,
+ *     XGetWindowAttributes, ...) Xlib drains the socket into its own
+ *     internal queue while waiting for the reply. The fd is then empty
+ *     and never becomes readable, yet events are pending in Xlib.
+ *
+ * The same class of problems is why GTK's X11 backend polls XPending
+ * from its event-loop check phase instead of trusting select(). Our
+ * equivalent: a short watchdog that performs one round trip — the
+ * server must answer, which forces it to flush the whole connection
+ * (reply + every deferred event) — and then drains Xlib's queue.
+ * Instant delivery still takes the fd path when the server flushed on
+ * its own (the common busy-server case); the watchdog only bounds the
+ * worst-case staleness to its interval. */
+static int xb_watchdog(void *data) {
+    struct x11_backend *xb = data;
+    if (xb->dpy) {
+        XSync(xb->dpy, False); /* reply forces the server to flush */
+        xb_pump_events(xb);
+    }
+    wl_event_source_timer_update(xb->wdog, 50);
+    return 0;
+}
+
+/* --------------------------------------------------------- X event pump */
 
 /* ------------------------------------------------------------- backend ops */
 
@@ -252,6 +297,8 @@ static void xb_present(struct xw_backend *b, struct xw_output *o) {
 
 static void xb_destroy(struct xw_backend *b) {
     struct x11_backend *xb = (struct x11_backend *)b;
+    if (xb->wdog)
+        wl_event_source_remove(xb->wdog);
     if (xb->xsrc)
         wl_event_source_remove(xb->xsrc);
     xb_invalidate_image(xb);
@@ -359,6 +406,12 @@ struct xw_backend *xw_backend_x11_create(struct xw_compositor *c,
                                     WL_EVENT_READABLE, xb_on_readable, xb);
     if (!xb->xsrc)
         goto fail;
+
+    /* event-delivery watchdog (see xb_watchdog): bounds stale Xlib/
+     * server-side event buffering to 50ms */
+    xb->wdog = wl_event_loop_add_timer(c->loop, xb_watchdog, xb);
+    if (xb->wdog)
+        wl_event_source_timer_update(xb->wdog, 50);
 
     XMapRaised(xb->dpy, xb->win);
     XFlush(xb->dpy);

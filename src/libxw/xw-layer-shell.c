@@ -431,6 +431,37 @@ void xw_layer_role_destroy(struct xw_surface *s) {
     }
 }
 
+/* ------------------------------------------------------------ output resize */
+
+/* Output geometry changed (nested window resized by the host WM, output
+ * management, ...). Layer surfaces anchored to opposite edges derive
+ * their size from the output and MUST be told: send them a fresh
+ * configure with the recomputed size; the client answers with a new
+ * buffer commit that maps them at the new geometry (role_commit ->
+ * ls_layout). Also refresh the interim geometry and damage both the old
+ * and the new extents so nothing renders stale. */
+void xw_layer_reconfigure_output(struct xw_compositor *c, struct xw_output *o) {
+    if (!c || !c->wm || !o)
+        return;
+    for (int layer = 0; layer < 4; layer++) {
+        struct xw_layer_surface *ls;
+        wl_list_for_each(ls, &c->wm->layers[layer], link) {
+            if (ls->output != o)
+                continue;
+            if (ls->mapped) {
+                xw_damage_outputs_rect(c, ls->x, ls->y, ls->w, ls->h);
+                ls_layout(ls);
+                xw_damage_outputs_rect(c, ls->x, ls->y, ls->w, ls->h);
+            }
+            if (ls->configured_sent)
+                ls_configure(ls);
+        }
+    }
+    /* the interim (old-buffer) geometry may change the usable area;
+     * the clients' recommit runs the full recalculation again */
+    xw_wm_recalculate_usable(c->wm);
+}
+
 /* ---------------------------------------------------------------- init */
 
 void xw_layer_shell_init(struct xw_compositor *c) {

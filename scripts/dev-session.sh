@@ -98,7 +98,23 @@ done
 
 echo "== status:"
 "$BIN/xw-session-ctl" status
-echo "== panel autostarted (workspaces, tasklist, clock, exit button)"
+# The panel must actually RUN, not merely be spawned: an autostart entry
+# that dies instantly (bad Exec, missing libs) previously looked exactly
+# like a working one here. The session manager now logs every child exit
+# (see the log above); this check closes the loop from the script side.
+sleep 1
+if command -v pgrep >/dev/null 2>&1; then
+    if pgrep -x xw-panel >/dev/null 2>&1; then
+        echo "== panel running (workspaces, tasklist, clock, exit button)"
+    else
+        echo "dev-session: WARNING: xw-panel is NOT running" >&2
+        echo "  Check the session log above for an exit line (a 127 exit" >&2
+        echo "  means the Exec= path is wrong; other codes mean a startup" >&2
+        echo "  failure — run it by hand to see the error)." >&2
+    fi
+else
+    echo "== panel autostarted; child exits are logged by the session manager"
+fi
 
 rc=0
 if [ "${1:-}" = "--logout" ]; then

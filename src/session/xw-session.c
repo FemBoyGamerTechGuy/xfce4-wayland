@@ -27,6 +27,7 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 
 #include "xw-power.h"
 #include <sys/wait.h>
@@ -36,6 +37,24 @@
 #define MAX_AUTOSTART 64
 #define MAX_RUNTIME_CHILDREN 16
 #define COMPOSITOR_MAX_RESTARTS 5
+
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* human-readable wait status for exit logs */
+static const char *wait_desc(int status) {
+    static char buf[64];
+    if (WIFEXITED(status))
+        snprintf(buf, sizeof(buf), "exit status %d", WEXITSTATUS(status));
+    else if (WIFSIGNALED(status))
+        snprintf(buf, sizeof(buf), "killed by signal %d", WTERMSIG(status));
+    else
+        snprintf(buf, sizeof(buf), "stopped (status 0x%x)", status);
+    return buf;
+}
 
 static volatile sig_atomic_t g_terminate = 0;
 static volatile sig_atomic_t g_child_event = 0;
@@ -47,6 +66,7 @@ struct session {
     char ctl_path[600];
     char socket_name[256];    /* wayland display name */
     pid_t comp_pid;
+    int64_t comp_started_ms;
     int comp_restarts;
     bool comp_ready;
     bool shutting_down;
@@ -54,6 +74,7 @@ struct session {
     bool nested;              /* desktop runs inside the parent session */
     struct {
         pid_t pid;
+        int64_t started_ms;
         char name[300];
     } autostart[MAX_AUTOSTART];
     int n_autostart;
@@ -62,6 +83,7 @@ struct session {
      * shutdown, reaped by the SIGCHLD loop */
     struct {
         pid_t pid;
+        int64_t started_ms;
         char name[300];
     } spawned[MAX_RUNTIME_CHILDREN];
     int n_spawned;
@@ -278,6 +300,7 @@ static pid_t start_compositor(void) {
         return -1;
     }
     S.comp_pid = pid;
+    S.comp_started_ms = now_ms();
     S.comp_ready = true;
     log_msg("info", "compositor ready: display %s (pid %d)", S.socket_name,
             (int)pid);
@@ -382,6 +405,7 @@ static void autostart_scan_dir(const char *dir, const char *override_dir) {
                 snprintf(S.autostart[S.n_autostart].name,
                          sizeof(S.autostart[0].name), "%s", de->d_name);
                 S.autostart[S.n_autostart].pid = pid;
+                S.autostart[S.n_autostart].started_ms = now_ms();
                 S.n_autostart++;
             }
         }
@@ -431,6 +455,7 @@ static pid_t spawn_runtime(const char *exec, const char *name) {
     snprintf(S.spawned[S.n_spawned].name,
              sizeof(S.spawned[0].name), "%s", name);
     S.spawned[S.n_spawned].pid = pid;
+    S.spawned[S.n_spawned].started_ms = now_ms();
     S.n_spawned++;
     log_msg("info", "spawned '%s' (pid %d)", name, (int)pid);
     return pid;
@@ -752,15 +777,20 @@ int main(int argc, char **argv) {
                 if (pid == S.comp_pid) {
                     S.comp_pid = -1;
                     S.comp_ready = false;
+                    int64_t secs =
+                        (now_ms() - S.comp_started_ms + 500) / 1000;
                     if (S.shutting_down) {
                         /* expected during teardown */
+                        log_msg("info", "compositor exited during shutdown "
+                                        "(%s, ran %llds)",
+                                wait_desc(status), (long long)secs);
                     } else if (S.comp_restarts < COMPOSITOR_MAX_RESTARTS) {
                         S.comp_restarts++;
                         log_msg("warn",
-                                "compositor exited (status %d), restarting "
-                                "(%d/%d)",
-                                WEXITSTATUS(status), S.comp_restarts,
-                                COMPOSITOR_MAX_RESTARTS);
+                                "compositor exited (%s, ran %llds), "
+                                "restarting (%d/%d)",
+                                wait_desc(status), (long long)secs,
+                                S.comp_restarts, COMPOSITOR_MAX_RESTARTS);
                         usleep(300000);
                         if (start_compositor() < 0) {
                             log_msg("error", "compositor restart failed");
@@ -774,19 +804,44 @@ int main(int argc, char **argv) {
                         g_exit_code = 1;
                     }
                 } else {
-                    /* autostart or runtime-spawned child exited:
-                     * bookkeeping only */
+                    /* autostart or runtime-spawned child exited: report
+                     * it — a silently dead panel must never look like a
+                     * working one (an autostart that dies instantly is
+                     * almost always a bad Exec= line or a missing
+                     * runtime dependency) */
+                    const char *kind = NULL, *name = NULL;
+                    int64_t started = 0;
                     for (int i = 0; i < S.n_autostart; i++) {
                         if (S.autostart[i].pid == pid) {
+                            kind = "autostart";
+                            name = S.autostart[i].name;
+                            started = S.autostart[i].started_ms;
                             S.autostart[i].pid = -1;
                             break;
                         }
                     }
-                    for (int i = 0; i < S.n_spawned; i++) {
+                    for (int i = 0; !kind && i < S.n_spawned; i++) {
                         if (S.spawned[i].pid == pid) {
+                            kind = "spawned";
+                            name = S.spawned[i].name;
+                            started = S.spawned[i].started_ms;
                             S.spawned[i].pid = -1;
                             break;
                         }
+                    }
+                    if (kind) {
+                        int64_t secs = (now_ms() - started + 500) / 1000;
+                        log_msg("warn", "%s '%s' (pid %d) exited: %s "
+                                        "[ran %llds]",
+                                kind, name, (int)pid, wait_desc(status),
+                                (long long)secs);
+                        if (WIFEXITED(status) &&
+                            WEXITSTATUS(status) == 127)
+                            log_msg("error",
+                                    "  pid %d could not execute its command "
+                                    "(127): check the Exec= line of '%s' — "
+                                    "use an absolute path or extend PATH",
+                                    (int)pid, name);
                     }
                 }
                 pid = waitpid(-1, &status, WNOHANG);

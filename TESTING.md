@@ -150,7 +150,11 @@ requires a running udev instance; run
 what was verified (device, kernel, distro) in WORKLOG.md — that is
 what keeps "verified at Level 3" honest.
 
-## What is covered today (33 Level-1 tests + 75 Level-2 checks + 58 build-regression checks)
+## What is covered today (34 Level-1 tests + 84 Level-2 checks + 49-58 build-regression checks)
+
+The nested-session regression (session 5 below) is the reason several
+of these numbers exist: an invisible panel that looked like a working
+one.
 
 - compositor bootstrap + clean shutdown; socket lifecycle
 - output creation, geometry, scale; multi-output
@@ -195,6 +199,21 @@ what keeps "verified at Level 3" honest.
   clicks switch workspaces end-to-end, exit button sends the ctl
   `exit-dialog` line (fake session manager accepts it), panel survives
   the action
+- **layer reconfigure on output resize: an anchored bar learns the new
+  output size via a fresh configure, recommits, spans the new extent,
+  and the server-side geometry follows (the nested-invisibility root
+  cause class; `layer-shell-resize-reconfigure`)**
+- **nested X11 session under a real reparenting WM (session 5):
+  Xvfb + `tests/miniwm` (reparents + resizes the compositor window),
+  the panel autostarts as a real layer-shell client, survives the
+  resize race, spans the WM-granted geometry, the session logs any
+  child exit, `tests/panelprobe` verifies panel pixels + full-extent
+  background + the compositor's SOFTWARE cursor at an XTEST warp point
+  (the X cursor of the window is invisible, so any visible cursor went
+  through the compositor input path), and logout is clean**
+- **autostart child exits are reported with status + duration, and a
+  127 exit gets an Exec=-line hint (session 7): a dead panel can never
+  again masquerade as a working one**
 - process-level (Level 2): session manager supervises the compositor
   child, ctl protocol (ping/status/power-status/logout/run/
   exit-dialog), honest power failure without logind, **power backend
@@ -236,6 +255,32 @@ Highlights (each verifiable by reverting the fix):
   rewrite) stopped flushing requests that wl_display_dispatch had
   flushed implicitly — the exit dialog never mapped its buffer
   (`exit-dialog-rendered`)
+- X server defers flushing event batches of a connection that just
+  carried a large request (our XPutImage presents): the map-time
+  structure events (Reparent/Configure/Map/Expose) never reached the
+  compositor, so the nested output never learned the WM's resize;
+  Xlib's `_XReply` read-ahead additionally drains the socket into its
+  own queue where a pure fd-poll never looks. Fixed with the x11
+  backend event watchdog (one XSync round trip + XPending drain per
+  50ms; reproduced deterministically by `tests/fdtest2.c`, verified
+  end-to-end by session 5 under `tests/miniwm`)
+- anchored layer surfaces were never reconfigured when the output
+  resized — the panel kept stale geometry forever (nested regression
+  + `layer-shell-resize-reconfigure`)
+- libxwcl freed the wl_output listener state on the first `done`
+  event while the listener stayed attached: the second output
+  announcement (mode change / resize) called into freed memory and
+  the panel segfaulted (session 5, ASan)
+- libxwcl destroyed old wl_buffers at configure time while the
+  compositor still rendered from them (the server-side wl_shm_buffer
+  dies with the resource) — pools are now retired and destroyed only
+  after the replacement buffer is committed (session 5)
+- xw-exit drew with a hardcoded 720px height: on any other output the
+  draw ran past the shm mapping and the dialog crashed (exit status
+  139 in the session log; geometry now derives from the configure)
+- the session manager discarded autostart/spawned child exit statuses
+  — a crashed panel was indistinguishable from a running one (now
+  logged with status, runtime and an Exec hint; session 7)
 - **xwc_drain never flushed the client's outgoing request buffer — a
   request stuck in the socket buffer silently stalled the whole
   handshake (first seen as a missing wl_keyboard keymap event in the

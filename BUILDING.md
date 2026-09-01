@@ -552,6 +552,21 @@ The build system's dependency checks print actionable messages that
 name the missing component, what stops working without it, and where to
 read more. They never call a package manager. Common cases:
 
+**the nested session window appears but the panel does not**
+First check the session log: the session manager reports every
+autostart/spawned child exit with its status and runtime. An entry
+like `autostart 'xw-panel.desktop' (pid N) exited: exit status 127`
+means the Exec line could not run — use an absolute path
+(`Exec=/path/to/build/bin/xw-panel`) or extend PATH. Other exit codes
+mean the panel started but crashed: run it by hand with
+`WAYLAND_DISPLAY=... build/bin/xw-panel` to see the error. A healthy
+panel spans the full width of the nested window; the window's geometry
+changes (host WM resizes) are picked up automatically. The regression
+suite covers exactly this scenario (session 5 under a reparenting WM).
+`scripts/dev-session.sh` also verifies the panel process is alive
+after startup instead of assuming it.
+
+
 **`required dependency check failed: wayland-server wayland-client ...`**
 Core compositor libraries are missing. Install your distribution's
 wayland development package, or point `PKG_CONFIG_PATH` at a sysroot

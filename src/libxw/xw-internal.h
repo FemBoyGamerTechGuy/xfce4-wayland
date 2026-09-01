@@ -498,6 +498,10 @@ void xw_layer_surface_destroy(struct xw_layer_surface *ls);
 void xw_layer_role_commit(struct xw_surface *s);
 void xw_layer_role_unmap(struct xw_surface *s);
 void xw_layer_role_destroy(struct xw_surface *s);
+/* output geometry changed: relayout + reconfigure its layer surfaces
+ * (anchored surfaces must learn the new output size, per layer-shell
+ * semantics) and refresh the usable area. Called by xw_output_resize. */
+void xw_layer_reconfigure_output(struct xw_compositor *c, struct xw_output *o);
 
 /* --------------------------------------------------- foreign toplevel mgmt */
 struct xw_foreign_toplevel_res {

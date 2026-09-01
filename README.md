@@ -44,6 +44,7 @@ for status and what remains, and [BUILDING.md](BUILDING.md) to build it.
 | Session manager | `xw-session` | Session lifecycle, autostart, supervision, power actions |
 | Session control CLI | `xw-session-ctl` | Scriptable session commands (logout/restart/shutdown/...) |
 | Exit dialog | `xw-exit` | Graphical session-exit dialog |
+| Demo client | `xw-demo` | Minimal xdg-shell window (tests the desktop: tasklist, stacking, exclusive zone) |
 | Panel | `xw-panel` | Layer-shell desktop bar: workspace switcher, tasklist, launcher, clock, exit button |
 | Demo client | `xw-demo` | *(planned)* Test/demo toplevel client for development |
 
@@ -102,8 +103,8 @@ shortcut engine (protocol-correct key repeat, full default-table
 coverage), real-input backend (libinput: udev seat + explicit device
 modes), session manager with honest logind/elogind power reporting,
 graphical exit dialog (unavailable actions show their reason), and
-the desktop panel exist and pass an automated suite (33 in-process
-tests + 75 process-level checks + 58 build-system regression checks,
+the desktop panel exist and pass an automated suite (34 in-process
+tests + 84 process-level checks + 49-58 build-system regression checks,
 ASAN/UBSAN/LSAN-clean, incl. the forked panel and dialog children;
 the build is verified on font-less systems and under zsh). Nested
 Wayland and nested X11 backends run the desktop inside an existing

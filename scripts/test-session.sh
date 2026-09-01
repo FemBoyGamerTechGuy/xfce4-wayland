@@ -408,18 +408,49 @@ else
 fi
 
 echo
-echo "== session 5: xw-session --nested (auto x11 under Xvfb) =="
+echo "== session 5: nested x11 session under a reparenting WM =="
+echo "   (panel regression: window resize + layer reconfigure + crashers)"
 
-if command -v Xvfb >/dev/null 2>&1 && [ -x "$ROOT/build/tests/x11probe" ]; then
+# Full reproduction of the nested-session panel-invisibility class:
+#  - a real WM reparents the compositor window and RESIZES it
+#  - the panel autostarts as a real Wayland layer-shell client
+#  - the X server defers the structure events (large PutImage present)
+#  - panelprobe verifies pixels: bar visible, spanning the resized
+#    width, background below, and the compositor's SOFTWARE cursor at
+#    a warp point (the X cursor is invisible -> the visible cursor can
+#    only come through the compositor input path)
+if command -v Xvfb >/dev/null 2>&1 && [ -x "$ROOT/build/tests/panelprobe" ]; then
     rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
     Xvfb :99 -screen 0 800x600x24 >/dev/null 2>&1 &
     XVFB_PID=$!
     sleep 1
 
+    # the reparenting WM: forces the client to 700x450 (from 400x300)
+    if [ -x "$ROOT/build/tests/miniwm" ]; then
+        "$ROOT/build/tests/miniwm" :99 700 450 >/dev/null 2>&1 &
+        MINIWM_PID=$!
+        sleep 0.5
+    else
+        MINIWM_PID=0
+    fi
+
+    # autostart the real panel from a dedicated HOME (the shared
+    # FAKE_HOME carries session-2 filtering entries whose commands exit
+    # immediately, which would legitimately light up the exit log)
+    NEST_HOME="$RTD/home5"
+    mkdir -p "$NEST_HOME/.config/autostart"
+    cat >"$NEST_HOME/.config/autostart/xw-panel.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=xw-panel
+Exec=$ROOT/build/bin/xw-panel
+OnlyShowIn=XFCE;
+DESKTOP
+
     LOG5="$RTD/session5-nested.log"
     # no WAYLAND_DISPLAY, DISPLAY=:99 -> auto-selects the x11 backend
     env -u WAYLAND_DISPLAY DISPLAY=:99 XDG_RUNTIME_DIR="$RTD" \
-        HOME="$FAKE_HOME" "$BIN/xw-session" --nested -n -S xw-nest \
+        HOME="$NEST_HOME" "$BIN/xw-session" --nested -S xw-nest \
         >"$LOG5" 2>&1 &
     SESS_PID=$!
 
@@ -427,16 +458,40 @@ if command -v Xvfb >/dev/null 2>&1 && [ -x "$ROOT/build/tests/x11probe" ]; then
         'wait_for "[ -S \"$RTD/xw-nest.sock\" ]"'
     check "nested: compositor runs with the x11 backend" \
         'wait_for "rg -q \"nested session: backend x11\" \"$LOG5\" 2>/dev/null"'
+    check "nested: panel autostarted" \
+        'wait_for "rg -q \"autostart .*xw-panel\" \"$LOG5\" 2>/dev/null"'
+    # the panel must RUN, not merely be spawned (regression: it used to
+    # segfault on the resize-reconfigure race and die silently)
+    check "nested: panel process alive" \
+        'wait_for "pgrep -x xw-panel >/dev/null 2>/dev/null"'
+    check "nested: no autostart child died" \
+        '! rg -q "exited:" "$LOG5" 2>/dev/null'
 
-    PROBE="$ROOT/build/tests/x11probe"
-    check "nested: desktop window visible in Xvfb" \
-        'wait_for "\"$PROBE\" :99 2>/dev/null | rg -q \"background pixels OK\""'
+    # output resize assertion: the compositor runs with -q (no INFO
+    # logs) — panelprobe proves the resize via the full-extent
+    # background and the bar covering the right edge of the WM geometry
+
+    PROBE="$ROOT/build/tests/panelprobe"
+    check "nested: panel visible, spans resized width, cursor verified" \
+        'wait_for "\"$PROBE\" :99 cursor 2>/dev/null | rg -q \"PASS.*VERIFIED\""'
+    check "nested: no crash lines in the log" \
+        '! rg -q "Segmentation|AddressSanitizer|abort" "$LOG5" 2>/dev/null'
+
+    # panel interaction through the compositor input path: XTEST click
+    # on workspace button 2 switches workspaces (visible in the pixels
+    # of the switcher) — keep it to the probe's PASS for now; the full
+    # interaction matrix is covered by the in-process panel tests.
 
     XDG_RUNTIME_DIR="$RTD" "$BIN/xw-session-ctl" -S xw-nest logout \
         >/dev/null 2>&1
     check "nested: logout exits cleanly" 'wait_pid_exit "$SESS_PID"'
     wait "$SESS_PID"
     check "nested: exit code 0" '[ "$?" -eq 0 ]'
+    check "nested: panel gone with the session" \
+        'wait_for "[ -z \"$(pgrep -x xw-panel 2>/dev/null)\" ]"'
+    if [ "$MINIWM_PID" -gt 0 ]; then
+        kill "$MINIWM_PID" 2>/dev/null
+    fi
     kill "$XVFB_PID" 2>/dev/null
     rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
 else
@@ -486,6 +541,34 @@ if [ -x "$BIN/xw-panel" ]; then
 else
     echo "SKIP session 6 (xw-panel not built)"
 fi
+
+echo
+echo "== session 7: autostart child exits are reported, never silent =="
+
+# A dying autostart entry must be logged with its exit status (127 gets
+# the Exec= hint). Regression: the reap loop used to discard statuses,
+# so a crashed panel looked exactly like a working one.
+LOG7="$RTD/session7-exitlog.log"
+BAD_HOME="$RTD/home7"
+mkdir -p "$BAD_HOME/.config/autostart"
+cat >"$BAD_HOME/.config/autostart/xw-fail.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=xw-fail
+Exec=/nonexistent/xw-definitely-not-here
+OnlyShowIn=XFCE;
+DESKTOP
+env -u WAYLAND_DISPLAY XDG_RUNTIME_DIR="$RTD" HOME="$BAD_HOME" \
+    "$BIN/xw-session" -S xw-fail >"$LOG7" 2>&1 &
+SESS7_PID=$!
+check "exitlog: session starts" 'wait_for "[ -S \"$RTD/xw-fail.sock\" ]"'
+check "exitlog: child exit logged with status" \
+    'wait_for "rg -q \"autostart .xw-fail.*exited: exit status 127\" \"$LOG7\" 2>/dev/null"'
+check "exitlog: 127 hint mentions the Exec line" \
+    'rg -q "Exec= line" "$LOG7" 2>/dev/null'
+XDG_RUNTIME_DIR="$RTD" "$BIN/xw-session-ctl" -S xw-fail logout \
+    >/dev/null 2>&1
+check "exitlog: logout exits cleanly" 'wait_pid_exit "$SESS7_PID"'
 
 echo
 echo "test-session: $pass passed, $fail failed"

@@ -434,6 +434,19 @@ $(OBJ)/tests/client.o: tests/harness/client.c tests/harness/xwtest.h src/libxwcl
 build/tests/x11probe: $(OBJ)/tests/x11probe.o | build/tests
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/x11probe.o $(LDLIBS_X11) $(LDLIBS_XTST) -lm
 
+# nested-X11 regression probe: panel pixels + cursor path (Xvfb)
+build/tests/panelprobe: $(OBJ)/tests/panelprobe.o | build/tests
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/panelprobe.o $(LDLIBS_X11) $(LDLIBS_XTST) -lm
+
+# minimal reparenting WM for the nested regression (Xvfb)
+build/tests/miniwm: $(OBJ)/tests/miniwm.o | build/tests
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/miniwm.o $(LDLIBS_X11) -lm
+
+# Xlib event-delivery starvation reproducer (diagnostic; see
+# xb_watchdog in src/libxw/xw-backend-x11.c)
+build/tests/fdtest2: $(OBJ)/tests/fdtest2.o | build/tests
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/fdtest2.o $(LDLIBS_WLS) $(LDLIBS_X11) -lm
+
 # XTEST probe: xtst dev files live in the optional sysroot (the
 # runtime lib may be there too), so use explicit paths with rpath
 ifeq ($(X11_ON)$(XW_SYSROOT),y$(XW_SYSROOT))
@@ -447,6 +460,15 @@ endif
 $(OBJ)/tests/x11probe.o: tests/x11probe.c | $(OBJ)/tests
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(CFLAGS_X11) $(CFLAGS_XTST) -c $< -o $@
 
+$(OBJ)/tests/panelprobe.o: tests/panelprobe.c | $(OBJ)/tests
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(CFLAGS_X11) $(CFLAGS_XTST) -c $< -o $@
+
+$(OBJ)/tests/miniwm.o: tests/miniwm.c | $(OBJ)/tests
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(CFLAGS_X11) -c $< -o $@
+
+$(OBJ)/tests/fdtest2.o: tests/fdtest2.c | $(OBJ)/tests
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(CFLAGS_WLS) $(CFLAGS_X11) -c $< -o $@
+
 # ---------------------------------------------------------------- targets
 .PHONY: all tests check asan clean dist install uninstall config
 
@@ -458,7 +480,8 @@ CLIENT_BINS := $(if $(wildcard src/clients/xw-demo.c),build/bin/xw-demo,) \
 all: build/.profile build/.features build/bin/xw-compositor $(SESSION_BINS) $(CLIENT_BINS) \
 	build/tests/run-tests
 ifeq ($(X11_ON),y)
-all: build/tests/x11probe
+all: build/tests/x11probe build/tests/panelprobe build/tests/miniwm \
+	build/tests/fdtest2
 endif
 
 # profile stamp consulted by the PROFILE guard near the top

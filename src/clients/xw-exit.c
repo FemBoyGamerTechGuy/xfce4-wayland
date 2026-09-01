@@ -67,12 +67,30 @@ static char g_reason[N_BUTTONS][192];
 struct exit_dialog {
     struct xwc c;
     struct xwc_layer *layer;
+    int layer_w, layer_h; /* actual layer geometry (from configure) */
     int sel;
     bool done;
     char reply[256];
 };
 
 /* ------------------------------------------------------------- drawing */
+
+/* All geometry derives from the CONFIGURED layer size — never a
+ * hardcoded output assumption: the dialog runs on outputs of any
+ * height (nested windows get resized by the host WM). With a fixed
+ * 720 the draw bounds exceeded the buffer on smaller outputs and the
+ * write ran past the shm mapping (SIGSEGV; found by the nested
+ * regression). */
+static void dialog_rect(struct exit_dialog *d, int *px, int *py, int *pw,
+                        int *ph) {
+    *pw = BTN_W * 2 + BTN_GAP + MARGIN * 2;
+    *ph = TITLE_H + (BTN_H + BTN_GAP) * ((N_BUTTONS + 1) / 2) +
+         MARGIN + FOOT_H;
+    int w = d->layer_w > 0 ? d->layer_w : *pw;
+    int h = d->layer_h > 0 ? d->layer_h : *ph;
+    *px = (w - *pw) / 2;
+    *py = (h - *ph) / 2;
+}
 
 static void draw(struct exit_dialog *d, struct xwc_layer *layer) {
     if (!layer)
@@ -81,23 +99,21 @@ static void draw(struct exit_dialog *d, struct xwc_layer *layer) {
     uint32_t *pix = xwc_layer_pixels(layer, &stride);
     if (!pix)
         return;
-    int w = 0, h = 0;
-    /* layer size: query via pixels stride == width */
-    w = stride;
-    (void)h;
+    int w = d->layer_w > 0 ? d->layer_w : stride;
+    int h = d->layer_h > 0 ? d->layer_h : 0;
+    if (w < 1 || h < 1)
+        return;
 
     /* modal backdrop: dark translucent panel */
-    xwc_fill_rect(pix, stride, w, 720, 0, 0, w, 720, 0xd8222226);
-    int pw = BTN_W * 2 + BTN_GAP + MARGIN * 2; /* two columns */
-    int ph = TITLE_H + (BTN_H + BTN_GAP) * ((N_BUTTONS + 1) / 2) +
-             MARGIN + FOOT_H;
-    int px = (w - pw) / 2, py = (720 - ph) / 2;
-    xwc_draw_box(pix, stride, w, 720, px, py, pw, ph, 0xff2e3440,
+    xwc_fill_rect(pix, stride, w, h, 0, 0, w, h, 0xd8222226);
+    int pw, ph, px, py;
+    dialog_rect(d, &px, &py, &pw, &ph);
+    xwc_draw_box(pix, stride, w, h, px, py, pw, ph, 0xff2e3440,
                  0xff8fa4b8);
 
     /* title */
     int tx = px + (pw - xwc_text_width("End Session")) / 2;
-    xwc_draw_text(pix, stride, w, 720, tx, py + 16, "End Session",
+    xwc_draw_text(pix, stride, w, h, tx, py + 16, "End Session",
                   0xffe6e6e6);
 
     for (int i = 0; i < N_BUTTONS; i++) {
@@ -111,15 +127,15 @@ static void draw(struct exit_dialog *d, struct xwc_layer *layer) {
         uint32_t border = !live ? 0xff3b4252
                         : i == d->sel ? 0xffffffff
                                       : 0xff4c566a;
-        xwc_draw_box(pix, stride, w, 720, bx, by, BTN_W, BTN_H, fill,
+        xwc_draw_box(pix, stride, w, h, bx, by, BTN_W, BTN_H, fill,
                      border);
         const char *label = buttons[i].label;
         int lx = bx + (BTN_W - xwc_text_width(label)) / 2;
         uint32_t label_col = live ? 0xffffffff : 0xff6a7080;
-        xwc_draw_text(pix, stride, w, 720, lx, by + 8, label, label_col);
+        xwc_draw_text(pix, stride, w, h, lx, by + 8, label, label_col);
         /* hotkey hint */
         char hint[3] = {buttons[i].hotkey, ')', 0};
-        xwc_draw_text(pix, stride, w, 720, bx + 8, by + 8, hint,
+        xwc_draw_text(pix, stride, w, h, bx + 8, by + 8, hint,
                       live ? 0x88c0d0ff : 0xff4c566a);
     }
 
@@ -129,7 +145,7 @@ static void draw(struct exit_dialog *d, struct xwc_layer *layer) {
     if (reason[0]) {
         int rx = px + (pw - xwc_text_width(reason)) / 2;
         int ry = py + TITLE_H + ((N_BUTTONS + 1) / 2) * (BTN_H + BTN_GAP) + 4;
-        xwc_draw_text(pix, stride, w, 720, rx, ry, reason, 0xffd08770);
+        xwc_draw_text(pix, stride, w, h, rx, ry, reason, 0xffd08770);
     }
     xwc_layer_commit(layer);
 }
@@ -202,15 +218,9 @@ static void on_button(struct xwc_win *win, uint32_t button, bool down, int x,
         d->layer = (struct xwc_layer *)win;
     if (!down || button != 0x110) /* left press */
         return;
-    /* hit test against button rects */
-    int w = 0, stride = 0;
-    uint32_t *pix = xwc_layer_pixels(d->layer, &stride);
-    (void)pix;
-    w = stride;
-    int pw = BTN_W * 2 + BTN_GAP + MARGIN * 2;
-    int ph = TITLE_H + (BTN_H + BTN_GAP) * ((N_BUTTONS + 1) / 2) +
-             MARGIN + FOOT_H;
-    int px = (w - pw) / 2, py = (720 - ph) / 2;
+    /* hit test against button rects (dialog-centered geometry) */
+    int pw, ph, px, py;
+    dialog_rect(d, &px, &py, &pw, &ph);
     for (int i = 0; i < N_BUTTONS; i++) {
         int col = i % 2, row = i / 2;
         int bx = px + MARGIN + col * (BTN_W + BTN_GAP);
@@ -237,14 +247,8 @@ static void on_motion(struct xwc_win *win, int x, int y, void *ud) {
     struct exit_dialog *d = ud;
     if (win && !d->layer)
         d->layer = (struct xwc_layer *)win;
-    int w = 0, stride = 0;
-    uint32_t *pix = xwc_layer_pixels(d->layer, &stride);
-    (void)pix;
-    w = stride;
-    int pw = BTN_W * 2 + BTN_GAP + MARGIN * 2;
-    int ph = TITLE_H + (BTN_H + BTN_GAP) * ((N_BUTTONS + 1) / 2) +
-             MARGIN + FOOT_H;
-    int px = (w - pw) / 2, py = (720 - ph) / 2;
+    int pw, ph, px, py;
+    dialog_rect(d, &px, &py, &pw, &ph);
     for (int i = 0; i < N_BUTTONS; i++) {
         int col = i % 2, row = i / 2;
         int bx = px + MARGIN + col * (BTN_W + BTN_GAP);
@@ -260,13 +264,14 @@ static void on_motion(struct xwc_win *win, int x, int y, void *ud) {
 }
 
 static void on_configure(struct xwc_win *win, int w, int h, void *ud) {
-    (void)w;
-    (void)h;
     struct exit_dialog *d = ud;
     /* the configure callback fires during layer creation, before the
      * caller has stored the layer pointer — take it from the callback */
-    if (win)
+    if (win) {
         d->layer = (struct xwc_layer *)win;
+        d->layer_w = w;
+        d->layer_h = h;
+    }
     draw(d, d->layer);
 }
 

@@ -259,14 +259,17 @@ static void out_done(void *data, struct wl_output *o) {
     (void)o;
     struct xwc_output_state *st = data;
     struct xwc *c = st->c;
-    if (c->n_outputs == 0) {
+    if (c->n_outputs == 0)
         c->n_outputs = 1;
-        c->output_w = st->w / (st->scale > 0 ? st->scale : 1);
-        c->output_h = st->h / (st->scale > 0 ? st->scale : 1);
-    }
-    if (c->output_state == st)
-        c->output_state = NULL;
-    free(st);
+    int sc = st->scale > 0 ? st->scale : 1;
+    c->output_w = st->w / sc;
+    c->output_h = st->h / sc;
+    /* st deliberately stays alive: the compositor re-announces the
+     * output when its mode changes (nested window resize, output
+     * management) and this listener fires again with the same data
+     * pointer — freeing here turned the second announcement into a
+     * use-after-free (found by the nested-resize regression). st is
+     * owned by the connection and freed in xwc_disconnect. */
 }
 
 static void out_scale(void *data, struct wl_output *o, int32_t factor) {

@@ -228,9 +228,11 @@ void xw_output_resize(struct xw_output *o, int w, int h) {
     /* re-announce mode to bound clients */
     output_reannounce(o);
 
-    /* relayout: usable area, maximized/fullscreen windows, damage */
+    /* relayout: layer surfaces first (anchored bars must learn the new
+     * output size and recommit; this also recalculates the usable
+     * area), then maximized/fullscreen windows, then damage */
     if (c->wm)
-        xw_wm_recalculate_usable(c->wm);
+        xw_layer_reconfigure_output(c, o);
     else
         xw_output_set_usable(o, o->x, o->y, w, h);
     pixman_region_union_rect(&o->damage, &o->damage, 0, 0, w, h);

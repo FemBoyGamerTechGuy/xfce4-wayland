@@ -600,8 +600,64 @@ static void test_csd_geometry(struct xwt_ctx *t) {
               "(background click may keep keyboard focus - xfwm4-like)");
 }
 
+/* ------------------------------------------------- output-resize relayout */
+
+/* Regression (nested-session panel invisibility class): when the output
+ * geometry changes, anchored layer surfaces MUST be reconfigured — the
+ * client learns the new width, recommits, and the bar spans the new
+ * extent. Before the fix the layer kept its stale geometry forever. */
+static int resize_conf_w = -1, resize_conf_n = 0;
+
+static void tracking_layer_configure(struct xwc_win *win, int w, int h,
+                                     void *ud) {
+    resize_conf_w = w;
+    resize_conf_n++;
+    solid_layer_configure(win, w, h, ud);
+}
+
+static void test_layer_resize_reconfigure(struct xwt_ctx *t) {
+    struct xwc_callbacks cb = {0};
+    cb.configure = tracking_layer_configure;
+    struct xwc_layer *panel = xwc_layer_create(
+        &t->client, &cb, ZWLR_LAYER_SHELL_V1_LAYER_TOP,
+        ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT,
+        32, 1280, 32);
+    XWT_ASSERT(panel);
+    XWT_WAIT(t, layer_mapped(t, 2));
+    XWT_WAIT(t, pixel_at(t, 5, 10) == PANEL_COLOR);
+    XWT_CHECK(pixel_at(t, 1275, 10) == PANEL_COLOR,
+              "panel spans the full width before the resize");
+
+    struct xw_output *o = wl_container_of(t->comp->outputs.next, o, link);
+    int conf_before = resize_conf_n;
+    xw_output_resize(o, 1000, 700);
+
+    /* the client receives a fresh configure carrying the new width */
+    XWT_WAIT(t, resize_conf_n > conf_before && resize_conf_w == 1000);
+    XWT_CHECK(resize_conf_w == 1000,
+              "client reconfigured to the new width (got %d)", resize_conf_w);
+
+    /* and recommits: the bar renders across the new extent and the
+     * server-side geometry follows */
+    XWT_WAIT(t, pixel_at(t, 995, 10) == PANEL_COLOR);
+    XWT_CHECK(pixel_at(t, 5, 10) == PANEL_COLOR,
+              "panel still renders after the resize");
+    XWT_CHECK(pixel_at(t, 995, 10) == PANEL_COLOR,
+              "panel spans the NEW width");
+    struct xw_layer_surface *ls = first_layer(t->comp, 2);
+    XWT_CHECK(ls && ls->w == 1000,
+              "server-side layer geometry updated (%d, want 1000)",
+              ls ? ls->w : -1);
+    XWT_CHECK(o->usable.y >= 32, "usable area still respects the bar");
+
+    xwc_layer_destroy(panel);
+}
+
 static const struct xwt_test tests[] = {
     {"layer-shell-panel", test_layer_shell_panel},
+    {"layer-shell-resize-reconfigure", test_layer_resize_reconfigure},
     {"layer-shell-focus", test_layer_shell_exclusive_keyboard},
     {"popup-positioning", test_popup_positioning},
     {"clipboard-selection", test_clipboard_selection},

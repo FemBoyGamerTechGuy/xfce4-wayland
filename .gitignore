@@ -13,3 +13,4 @@ __pycache__/
 
 # local editor/environment files
 .env
+tool-results/
