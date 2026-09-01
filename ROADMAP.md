@@ -99,7 +99,33 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
 - DONE xdg-activation (tokens, single-use, focus handover).
 - DONE wlr-foreign-toplevel-management (handles, state, requests).
 - DONE ext-workspace (group + workspace handles, activate switching).
-- TODO ext-idle-notify + ext-session-lock (screen lock).
+- DONE ext-session-lock-v1 (server): full state machine (PENDING ->
+  ACTIVE on a presented locked frame, unlock, denial, client death
+  keeps the session locked with a takeover path for a new client,
+  timeout fallback when the client never commits). Security gates are
+  server-enforced: while locked ONLY lock surfaces render (opaque
+  blank, pixel-verified) and receive input (shortcuts dead, windows
+  silent); strict protocol errors (commit-before-ack, null buffer,
+  dimensions mismatch, invalid serial, duplicate output, role,
+  already-constructed, invalid destroy/unlock) all implemented and
+  tested; output resize reconfigures lock surfaces to the exact new
+  size.
+- DONE ext-idle-notify-v1 (server, v2): per-notification event-loop
+  timers over seat activity timestamps; idled/resumed with re-arm;
+  get_input_idle_notification accepted (identical semantics here: the
+  only activity source is input — no sensors exist).
+- DONE xw-lock client: ext-session-lock + idle client support in
+  libxwcl (xwc_lock/xwc_idle) and a real lock screen binary (prompt,
+  masked input, constant-time passphrase compare, wrong-passphrase
+  feedback, unlock + roundtrip; --idle SECONDS auto-lock via
+  ext-idle-notify; killed lock clients leave the session locked by
+  design). Ctrl+Alt+L (default shortcut) already spawns it via the
+  pre-existing `lock` action.
+  Gaps (honest): authentication is a local passphrase file
+  (development-grade, NOT PAM — see ROADMAP backlog "PAM unlock");
+  libxwcl tracks a single output, so xw-lock covers one output (the
+  server handles any number); lock surfaces use the same shm-only
+  buffer path as every other client.
 - TODO ext-image-copy-capture (screenshot protocol; the internal pixel
   API exists and is tested).
 - TODO wlr-output-management (display settings UI).

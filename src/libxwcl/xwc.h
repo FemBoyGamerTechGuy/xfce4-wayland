@@ -67,6 +67,11 @@ struct xwc {
     uint32_t ftm_global; /* registry global name (0 = not advertised) */
     uint32_t wsm_global;
 
+    void *lock_mgr;       /* ext_session_lock_manager_v1 (bound eagerly;
+                             xwc_lock_create needs it and a lock client
+                             has no other reason to connect) */
+    void *idle_notifier;  /* ext_idle_notifier_v1 (eager; xwc_idle_create) */
+
     void *focused_owner;  /* win or layer with keyboard focus */
     struct xwc_callbacks focused_cb; /* callback block of the focused owner */
     bool has_focus;
@@ -189,5 +194,52 @@ int xwc_text_width(const char *text);
 /* roundrect outline+fill, a UI primitive used by all clients */
 void xwc_draw_box(uint32_t *pix, int stride, int w, int h, int x, int y,
                   int bw, int bh, uint32_t fill, uint32_t border);
+
+/* ---------------------------------------------------- session lock */
+/* ext-session-lock-v1 client. xwc_lock_create locks the session and
+ * creates one lock surface for the bound (first) output; v0 of the
+ * library tracks a single output, so exactly one lock surface is
+ * created — the server side itself supports any number of outputs.
+ *
+ * Lifecycle: create -> configure(w,h) callback fires with the output
+ * size (draw into xwc_lock_pixels() and call xwc_lock_commit() there)
+ * -> locked() event once the compositor presented the locked frame
+ * (or finished() if the lock was denied: another client holds it).
+ * Keyboard/pointer events of the lock surface arrive through the
+ * key/button/motion callbacks while the session is locked. Unlock via
+ * xwc_lock_unlock() (roundtrips so the server processes it). */
+struct xwc_lock;
+struct xwc_lock_cbs {
+    void (*locked)(struct xwc_lock *l, void *ud);
+    void (*finished)(struct xwc_lock *l, void *ud);
+    /* draw + commit the lock surface for the new size */
+    void (*configure)(struct xwc_lock *l, int w, int h, void *ud);
+    void (*key)(struct xwc_lock *l, uint32_t keycode, bool down,
+                xkb_keysym_t keysym, uint32_t mods, void *ud);
+    void (*button)(struct xwc_lock *l, uint32_t button, bool down, int x,
+                   int y, void *ud);
+    void (*motion)(struct xwc_lock *l, int x, int y, void *ud);
+    void *ud;
+};
+struct xwc_lock *xwc_lock_create(struct xwc *c, const struct xwc_lock_cbs *cb);
+void xwc_lock_destroy(struct xwc_lock *l);
+/* pixels of the current back buffer (ARGB, stride = width) */
+uint32_t *xwc_lock_pixels(struct xwc_lock *l, int *stride);
+void xwc_lock_size(struct xwc_lock *l, int *w, int *h);
+/* attach + damage-everything + commit */
+void xwc_lock_commit(struct xwc_lock *l);
+bool xwc_lock_locked(struct xwc_lock *l);
+bool xwc_lock_finished(struct xwc_lock *l);
+/* unlock_and_destroy + wl_display roundtrip (the protocol requires the
+ * sync: without it the server may not have processed the unlock). */
+void xwc_lock_unlock(struct xwc_lock *l);
+
+/* ------------------------------------------------------- idle notify */
+/* ext-idle-notify-v1 client: one notification with a timeout. */
+struct xwc_idle;
+struct xwc_idle *xwc_idle_create(struct xwc *c, uint32_t timeout_ms,
+                                 void (*idled)(void *ud),
+                                 void (*resumed)(void *ud), void *ud);
+void xwc_idle_destroy(struct xwc_idle *i);
 
 #endif /* XWC_H */

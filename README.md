@@ -46,7 +46,7 @@ for status and what remains, and [BUILDING.md](BUILDING.md) to build it.
 | Exit dialog | `xw-exit` | Graphical session-exit dialog |
 | Demo client | `xw-demo` | Minimal xdg-shell window (tests the desktop: tasklist, stacking, exclusive zone) |
 | Panel | `xw-panel` | Layer-shell desktop bar: workspace switcher, tasklist, launcher, clock, exit button |
-| Demo client | `xw-demo` | *(planned)* Test/demo toplevel client for development |
+| Screen lock | `xw-lock` | ext-session-lock client: passphrase lock screen, auto-lock on idle (Ctrl+Alt+L) |
 
 ## Quick start (development)
 
@@ -102,8 +102,10 @@ Early-stage but functional: the compositor core, window manager,
 shortcut engine (protocol-correct key repeat, full default-table
 coverage), real-input backend (libinput: udev seat + explicit device
 modes), session manager with honest logind/elogind power reporting,
-graphical exit dialog (unavailable actions show their reason), and
-the desktop panel exist and pass an automated suite (34 in-process
+graphical exit dialog (unavailable actions show their reason), the
+desktop panel, and a real screen locker (ext-session-lock with
+server-enforced blanking and input gating — a killed locker leaves the
+session locked) exist and pass an automated suite (45 in-process
 tests + 84 process-level checks + 49-58 build-system regression checks,
 ASAN/UBSAN/LSAN-clean, incl. the forked panel and dialog children;
 the build is verified on font-less systems and under zsh). Nested

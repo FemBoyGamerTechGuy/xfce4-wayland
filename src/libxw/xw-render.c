@@ -161,6 +161,23 @@ void xw_render_output(struct xw_output *o) {
     struct xw_compositor *c = o->comp;
     struct xw_wm *wm = c->wm;
 
+    /* 0. session lock: the ONLY thing rendered is the lock layer
+     * (opaque blank + lock surfaces + cursor). No window, layer,
+     * popup or snap-preview pixel may leak while locked — this is a
+     * security invariant of ext-session-lock, enforced here. */
+    if (xw_session_lock_active(c)) {
+        xw_session_lock_render(o);
+
+        /* software cursor still renders (lock surfaces take input and
+         * need to see the pointer) */
+        struct xw_seat *seat;
+        wl_list_for_each(seat, &c->seats, link) {
+            draw_cursor(o, seat);
+            break; /* render cursor of the first seat only (v0) */
+        }
+        return;
+    }
+
     /* 1. layer-shell background + bottom (rendered list tail → head) */
     for (int layer = 0; layer <= 1; layer++) {
         struct xw_layer_surface *ls;

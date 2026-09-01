@@ -143,6 +143,8 @@ the configurable install prefix.
 | `XW_INPUT_DEVICES` | colon-separated evdev nodes for the input source's path mode (`/dev/input/event3:/dev/input/event5`); deterministic, no udev needed. Setting it is the explicit opt-in that lets AUTO mode touch real devices |
 | `XW_REPEAT_DELAY_MS`, `XW_REPEAT_RATE_HZ` | override the key-repeat parameters for debugging/testing (defaults 500 ms / 30 Hz) |
 | `XW_BACKEND`, `XW_COMPOSITOR` | used by `xw-session` (see `xw-session --help`) |
+| `XW_LOCK_TIMEOUT_MS` | session-lock grace period before the `locked` event is forced with a blank frame when the lock client has not committed surfaces (default 1000 ms) |
+| `XW_LOCK_PASSPHRASE_FILE` | passphrase file for `xw-lock` (default: `~/.config/xfce4-wayland/lock-pass`, first line, `chmod 600` it; see `xw-lock --help`) |
 
 ---
 

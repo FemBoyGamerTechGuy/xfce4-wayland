@@ -13,6 +13,8 @@
 #include "ext-workspace-protocol.h"
 #include "single-pixel-buffer-protocol.h"
 #include "wlr-layer-shell-unstable-v1-protocol.h"
+#include "ext-session-lock-protocol.h"
+#include "ext-idle-notify-protocol.h"
 #include "wlr-foreign-toplevel-management-unstable-v1-protocol.h"
 
 #define XW_MAX_WS 12
@@ -59,6 +61,7 @@ enum xw_surface_role {
     XW_SURFACE_ROLE_XDG_TOPLEVEL,
     XW_SURFACE_ROLE_XDG_POPUP,
     XW_SURFACE_ROLE_LAYER,
+    XW_SURFACE_ROLE_SESSION_LOCK,
 };
 
 struct xw_surface {
@@ -280,6 +283,10 @@ struct xw_seat {
                                       an implicit grab (popup/drag/move) */
     bool ptr_grab_is_drag;
     struct xw_surface *grab_surface; /* surface receiving grab events */
+
+    /* last input activity (ext-idle-notify; updated by every key,
+     * pointer and axis event, injected input included) */
+    int64_t last_activity_ms;
 };
 
 struct xw_seat *xw_seat_create(struct xw_compositor *c, const char *name);
@@ -498,6 +505,10 @@ void xw_layer_surface_destroy(struct xw_layer_surface *ls);
 void xw_layer_role_commit(struct xw_surface *s);
 void xw_layer_role_unmap(struct xw_surface *s);
 void xw_layer_role_destroy(struct xw_surface *s);
+
+/* session-lock role hooks (xw-session-lock.c) */
+void xw_lock_role_commit(struct xw_surface *s);
+void xw_lock_role_destroy(struct xw_surface *s);
 /* output geometry changed: relayout + reconfigure its layer surfaces
  * (anchored surfaces must learn the new output size, per layer-shell
  * semantics) and refresh the usable area. Called by xw_output_resize. */
@@ -616,6 +627,8 @@ struct xw_compositor {
      * compositors can live in one process (nested backend tests, the
      * session manager embedding), so no file-static module state. */
     void *layer_shell_state;   /* struct xw_layer_shell */
+    void *session_lock_state;  /* struct xw_session_lock (xw-session-lock.c) */
+    void *idle_state;          /* struct xw_idle (xw-idle.c) */
     void *ws_state;            /* ext-workspace manager state */
     void *activation_state;    /* struct xw_activation */
     struct wl_global *ddm_global; /* wl_data_device_manager global */
@@ -648,5 +661,56 @@ enum {
     XW_ERR_SURFACE_STATE,
     XW_ERR_XDG_STATE,
 };
+
+/* ---------------------------------------------------- session lock (xw-session-lock.c) */
+/* ext-session-lock-v1 server. While a lock is engaged (from the lock()
+ * request until unlock_and_destroy, or indefinitely after the lock
+ * client dies) the compositor stops rendering and delivering input to
+ * normal clients: only lock surfaces render and receive input, all
+ * other content is blanked. See xw-session-lock.c for the state
+ * machine and the security invariants. */
+void xw_session_lock_init(struct xw_compositor *c);
+void xw_session_lock_fin(struct xw_compositor *c);
+/* the security gate is engaged (lock pending, locked, or lock client
+ * died while locked). Renders/seat code must consult this. */
+bool xw_session_lock_active(struct xw_compositor *c);
+/* the `locked` event was actually sent (or the lock client died after
+ * locking): the session is really locked, not merely engaging.
+ * White-box test surface. */
+bool xw_session_lock_locked(struct xw_compositor *c);
+/* render the lock layer for an output (blank + lock surfaces + nothing
+ * else). Called by xw_render_output when the gate is engaged. */
+void xw_session_lock_render(struct xw_output *o);
+/* lock surface keyboard-focus owner (topmost mapped lock surface), for
+ * the focus override in xw_seat_set_kb_focus */
+struct xw_surface *xw_session_lock_kb_owner(struct xw_compositor *c);
+/* pointer hit-testing while engaged: lock surfaces only, by output
+ * coverage (they always cover their whole output) */
+struct xw_surface *xw_session_lock_surface_at(struct xw_compositor *c,
+                                              int x, int y);
+/* called after each repaint cycle presented all damaged outputs: sends
+ * the pending ext_session_lock_v1.locked event once a locked frame has
+ * actually been presented. */
+void xw_session_lock_after_present(struct xw_compositor *c);
+/* output lifecycle: re-send configure on resize (lock surfaces must
+ * track the exact output size); a removed output's lock surfaces are
+ * destroyed server-side; a new output is blanked until the lock client
+ * covers it. */
+void xw_session_lock_reconfigure_output(struct xw_compositor *c,
+                                         struct xw_output *o);
+void xw_session_lock_output_removed(struct xw_compositor *c,
+                                     struct xw_output *o);
+
+/* ------------------------------------------------------ idle (xw-idle.c) */
+/* ext-idle-notify-v1 server. Seat activity timestamps live in the seat
+ * (last_activity_ms); every input entry point must call
+ * xw_idle_activity() to keep them current. */
+void xw_idle_init(struct xw_compositor *c);
+void xw_idle_fin(struct xw_compositor *c);
+/* input arrived on this seat: update the timestamp and resume any
+ * notifications that had gone idle. Cheap; call from every entry. */
+void xw_idle_activity(struct xw_seat *s);
+/* the seat is going away: destroy its notifications (no events sent). */
+void xw_idle_seat_destroyed(struct xw_compositor *c, struct xw_seat *s);
 
 #endif /* XW_INTERNAL_H */

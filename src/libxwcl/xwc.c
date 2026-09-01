@@ -15,6 +15,8 @@
 #include "wlr-layer-shell-unstable-v1.h"
 #include "wlr-foreign-toplevel-management-unstable-v1.h"
 #include "ext-workspace.h"
+#include "ext-session-lock.h"
+#include "ext-idle-notify.h"
 
 /* xwc-input.c */
 extern void xwc_seat_init(struct xwc *c);
@@ -155,6 +157,13 @@ static void registry_global(void *data, struct wl_registry *r, uint32_t name,
         /* same: xwc_wspaces_create binds on demand (1 group + N
          * workspace proxies arrive as new_id events on bind) */
         c->wsm_global = name;
+    } else if (strcmp(iface, "ext_session_lock_manager_v1") == 0) {
+        c->lock_mgr =
+            wl_registry_bind(r, name, &ext_session_lock_manager_v1_interface,
+                             1);
+    } else if (strcmp(iface, "ext_idle_notifier_v1") == 0) {
+        c->idle_notifier =
+            wl_registry_bind(r, name, &ext_idle_notifier_v1_interface, 1);
     } else if (strcmp(iface, "wl_data_device_manager") == 0) {
         c->ddm =
             wl_registry_bind(r, name, &wl_data_device_manager_interface, 3);
@@ -302,6 +311,10 @@ void xwc_disconnect(struct xwc *c) {
         zwlr_foreign_toplevel_manager_v1_destroy(c->ftm);
     if (c->wsm)
         ext_workspace_manager_v1_destroy(c->wsm);
+    if (c->idle_notifier)
+        ext_idle_notifier_v1_destroy(c->idle_notifier);
+    if (c->lock_mgr)
+        ext_session_lock_manager_v1_destroy(c->lock_mgr);
     if (c->wm_base)
         xdg_wm_base_destroy(c->wm_base);
     if (c->seat)
@@ -809,4 +822,37 @@ void xwc_input_axis(struct xwc *c, uint32_t axis, double value) {
     if (c->has_focus && c->focused_cb.axis)
         c->focused_cb.axis(c->focused_owner, axis, value,
                            c->focused_cb.ud);
+}
+
+/* --------------------------------------- pool helpers shared with xwc-lock.c */
+/* Thin non-static thunks over the static pool machinery so the
+ * session-lock surface (xwc-lock.c) can reuse the exact double-buffer
+ * + retire-on-configure lifecycle the windows and layers use. */
+
+bool xwc_pool_create(struct xwc *c, int w, int h,
+                     struct wl_shm_pool **pool_out, struct wl_buffer **bufs,
+                     uint32_t **data_out, size_t *size_out) {
+    return pool_create(c, NULL, w, h, pool_out, bufs, data_out, size_out);
+}
+
+void xwc_pool_destroy(struct wl_shm_pool *pool, struct wl_buffer **bufs,
+                      uint32_t *data, size_t size) {
+    pool_destroy(pool, bufs, data, size);
+}
+
+void xwc_pool_retired_destroy(struct wl_shm_pool *pool,
+                              struct wl_buffer **bufs, uint32_t *data,
+                              size_t size) {
+    pool_retired_destroy(pool, bufs, data, size);
+}
+
+void xwc_pool_retire(struct wl_shm_pool **pool, struct wl_buffer **bufs,
+                     uint32_t **data, size_t *size,
+                     struct wl_shm_pool **old_pool, struct wl_buffer **old_bufs,
+                     uint32_t **old_data, size_t *old_size) {
+    pool_retire(pool, bufs, data, size, old_pool, old_bufs, old_data, old_size);
+}
+
+const struct wl_buffer_listener *xwc_buf_listener(void) {
+    return &buf_listener;
 }

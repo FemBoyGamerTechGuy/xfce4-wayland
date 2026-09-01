@@ -182,6 +182,10 @@ struct xw_output *xw_output_create(struct xw_compositor *c, const char *name,
 void xw_output_destroy(struct xw_output *o) {
     if (!o)
         return;
+    /* session-lock surfaces bound to this output must not outlive it
+     * (the client should have destroyed them on global remove; this is
+     * the server-side guarantee) */
+    xw_session_lock_output_removed(o->comp, o);
     wl_list_remove(&o->link);
     if (o->global)
         wl_global_destroy(o->global);
@@ -230,11 +234,15 @@ void xw_output_resize(struct xw_output *o, int w, int h) {
 
     /* relayout: layer surfaces first (anchored bars must learn the new
      * output size and recommit; this also recalculates the usable
-     * area), then maximized/fullscreen windows, then damage */
-    if (c->wm)
+     * area), then session-lock surfaces (they must match the exact new
+     * output size), then maximized/fullscreen windows, then damage */
+    if (c->wm) {
         xw_layer_reconfigure_output(c, o);
-    else
+        xw_session_lock_reconfigure_output(c, o);
+    } else {
+        xw_session_lock_reconfigure_output(c, o);
         xw_output_set_usable(o, o->x, o->y, w, h);
+    }
     pixman_region_union_rect(&o->damage, &o->damage, 0, 0, w, h);
     xw_schedule_repaint(c);
 }

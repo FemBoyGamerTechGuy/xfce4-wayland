@@ -248,6 +248,72 @@ never create these objects never pay for them (an eager version leaked
 with a 1-second timeout ceiling: the poll timeout exists precisely so
 timer-driven redraws (the clock) can fire between server events.
 
+## Session lock (ext-session-lock) and idle (ext-idle-notify)
+
+The lock is a security boundary, so every guarantee is enforced by the
+compositor and never delegated to the client:
+
+- **Render gate.** While a lock is engaged (from the `lock()` request —
+  PENDING counts — until `unlock_and_destroy`, or indefinitely after
+  the lock client dies), `xw_render_output()` draws ONLY an opaque
+  blank plus the lock surfaces plus the software cursor. No window,
+  layer, popup or snap-preview pixel can leak; the regression suite
+  scans every output pixel for window content while locked, not just
+  spot-checks. The input gate matches: `surface_at()` hit-tests only
+  lock surfaces, keyboard focus is pinned to them, and the shortcut
+  engine / interactive move/resize / popup dismissal are skipped — a
+  shortcut could otherwise spawn a shell and bypass the lock.
+- **`locked` ordering.** The spec forbids sending `locked` before a
+  locked frame has been presented. The event is flushed from the
+  post-present hook (`xw_session_lock_after_present`, called at the end
+  of every repaint cycle) once every output is covered by a committed
+  lock surface — or when the grace timer expires ($XW_LOCK_TIMEOUT_MS,
+  default 1000 ms) with the blank frame as the locked frame. Obscuring
+  content from `lock()` onward (before the event) is strictly safer
+  than the reverse and allowed.
+- **Client death.** A lock client that dies while locked leaves the
+  session locked: the gate stays, all outputs blank, and a NEW client
+  may `lock()` and take over (the documented recovery path; the
+  takeover is a normal PENDING lock). A client that dies while PENDING
+  (never received `locked`) releases the gate — nothing was locked.
+- **Object lifetimes.** Per protocol, lock surface objects outlive the
+  lock object ("existing objects created through this interface remain
+  valid"): the lock struct turns into a zombie (res == NULL) that its
+  last lock surface frees. This matters during client-death teardown:
+  libwayland destroys resources in wl_map id order, so the wl_surface
+  (lower id) dies before ext_session_lock_v1 — the seat focus must be
+  dropped by the surface destructor, not the lock destructor, or the
+  later refocus dereferences freed memory (found by ASan, fixed by
+  clearing kb/ptr focus in the unmap path).
+- **Strictness.** All protocol errors are implemented: invalid_destroy,
+  invalid_unlock, role, duplicate_output, already_constructed,
+  commit_before_first_ack, null_buffer, dimensions_mismatch and
+  invalid_serial (the acked configure's own dimensions are enforced on
+  every commit, tracked through a small serial->size history ring so
+  acking an older-but-unacked configure is honored exactly).
+
+idle-notify keeps a last-activity timestamp per seat (updated by every
+input entry point, injected input included) and one event-loop timer
+per notification armed for the remaining window. Two subtleties:
+`wl_event_source_timer_update(src, 0)` DISARMS a timer rather than
+firing it — notifications whose deadline already elapsed (created after
+the seat went idle) must use a 1 ms floor; and `get_input_idle_notification`
+(v2) is accepted with semantics identical to `get_idle_notification`
+because this compositor has no non-input activity source (no sensors).
+
+The client side is `libxwcl`'s `xwc_lock`/`xwc_idle` plus the
+`xw-lock` binary: a lock screen drawn with the shared bitmap font, a
+passphrase prompt with masked input and constant-time comparison,
+wrong-passphrase feedback, unlock via `unlock_and_destroy` followed by
+a `wl_display` roundtrip (the protocol's note about exiting right after
+unlocking), and `--idle SECONDS` auto-lock driven by an idle
+notification. Killing the lock client is deliberately NOT an unlock —
+the session stays locked; only the passphrase (or session termination)
+unlocks. Authentication is v0-honest: a local passphrase file
+($XW_LOCK_PASSPHRASE_FILE or ~/.config/xfce4-wayland/lock-pass); PAM is
+roadmapped. xw-lock refuses to start without a passphrase file — a
+lock that can never be unlocked is worse than no lock.
+
 ## Surfaces, buffers, damage
 
 wl_shm buffers are mapped server-side and wrapped in pixman images.

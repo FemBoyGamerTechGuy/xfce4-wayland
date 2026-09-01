@@ -199,6 +199,12 @@ static void on_repaint_idle(void *data) {
         if (pixman_region_not_empty(&o->damage))
             xw_output_repaint(o);
     }
+    /* session lock: now that this cycle presented every damaged
+     * output, a pending `locked` event can be flushed (the spec
+     * forbids sending it before a locked frame was presented). Runs
+     * even when nothing repainted: with zero outputs the presentation
+     * requirement is vacuously met. */
+    xw_session_lock_after_present(c);
     wl_display_flush_clients(c->display);
     /* idle sources are one-shot */
 }
@@ -329,6 +335,8 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
     xw_actions_init(c);
     xw_xdg_shell_init(c);
     xw_layer_shell_init(c);
+    xw_session_lock_init(c);
+    xw_idle_init(c);
     xw_foreign_toplevel_init(c);
     xw_ext_workspace_init(c);
     xw_activation_init(c);
@@ -436,6 +444,8 @@ void xw_compositor_destroy(struct xw_compositor *c) {
     c->backend = NULL;
 
     xw_layer_shell_fin(c);
+    xw_session_lock_fin(c);
+    xw_idle_fin(c);
     xw_activation_fin(c);
 
     if (c->display)

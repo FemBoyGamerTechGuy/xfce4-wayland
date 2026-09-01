@@ -39,7 +39,10 @@ Persistent task list (mirrors the live development tracker). Status:
 - [ ] touch input; per-seat layout switching
 - [ ] DRM/KMS backend (Phase 4): device discovery, CRTCs, planes,
       atomic modesetting, multi-monitor, hotplug; logind DRM master
-- [ ] ext-session-lock + idle-notify (screen lock, screensaver)
+- [x] ext-session-lock + idle-notify (screen lock, screensaver):
+      server protocol + security gates, xw-lock client, xwc_lock/xwc_idle
+- [~] PAM unlock backend (current authenticator: local passphrase file
+      via $XW_LOCK_PASSPHRASE_FILE or ~/.config/xfce4-wayland/lock-pass)
 - [ ] ext-image-copy-capture screenshot tool
 - [ ] wlr-output-management display settings
 - [ ] panel plugin API; notification daemon; desktop icons; wallpaper

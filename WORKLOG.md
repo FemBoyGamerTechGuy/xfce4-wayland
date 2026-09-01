@@ -808,3 +808,82 @@ Stage Summary:
   scripts/wire-nested-tests-mk.py, src/clients/xw-demo.c; suites:
   34 in-process + 84 process-level + 49-58 build regressions,
   sanitizer-clean.
+
+---
+Task ID: 2026-09-01-repush
+Agent: main (Super Z)
+Task: Configure GitHub PAT, push eb57104, re-verify tree from bare state
+
+Work Log:
+- Container came back bare (build/ and .toolchain/ gone, git repo
+  intact, working tree clean after core.fileMode=false for the
+  rwxr-xr-x mount noise).
+- PAT configured at ~/.git-credentials (600, outside the repo, never
+  committed); push eb57104 -> origin/main verified via ls-remote
+  (remote tip == local HEAD).
+- Rebuilt from zero: bootstrap-sysroot.sh (apt download, rootless,
+  wayland 1.23.1), . scripts/env.sh, make — clean with X11 backend +
+  libinput, -Werror, no warnings.
+- Re-ran all suites on the fresh tree: 34/34 in-process, 84/84
+  process-level (nested panel pixel regression included, under Xvfb),
+  49 passed / 0 failed / 1 env-skip build regressions.
+
+Stage Summary:
+- The nested-session panel invisibility fix (eb57104) is pushed,
+  reproducible from a bare container, and fully re-verified in this
+  session. Repo state: clean at eb57104 on origin/main.
+
+---
+Task ID: 2026-09-01-session-lock
+Agent: main (Super Z)
+Task: ext-session-lock-v1 + ext-idle-notify-v1 (screen lock) — server,
+client library, xw-lock binary, tests, docs
+
+Work Log:
+- Server: src/libxw/xw-session-lock.c (new) — full protocol state
+  machine (PENDING/ACTIVE/RELEASED + owner-dead takeover), security
+  gates wired into xw-render.c (locked render = opaque blank + lock
+  surfaces + cursor ONLY, pixel-verified) and xw-seat.c (input to lock
+  surfaces only; shortcuts/interactive/popups dead while locked),
+  `locked`-event flush from the post-present hook (spec ordering),
+  grace timer ($XW_LOCK_TIMEOUT_MS) for never-committing clients,
+  output add/resize/remove hooks, strict protocol errors (all 9),
+  zombie-lifetime rule (lock surface objects outlive the lock object
+  per spec; wl_map id-order teardown focus clearing — UAF found by
+  ASan in the child test, fixed).
+- Server: src/libxw/xw-idle.c (new) — ext-idle-notify v2, per-note
+  event-loop timers over per-seat activity timestamps (all input entry
+  points call xw_idle_activity), idled/resumed + re-arm,
+  timer_update(0)-DISARMS pitfall handled (1ms floor for already-
+  elapsed deadlines — caught by the independence test).
+- Client: libxwcl xwc-lock.c (xwc_lock/xwc_idle) reusing the shared
+  pool machinery via thunks; registry binds the two new globals;
+  xw-lock.c client: passphrase prompt, masked input, constant-time
+  compare, wrong-pass feedback, unlock+roundtrip, --idle autolock,
+  refuses to start without a passphrase file. Ctrl+Alt+L was already
+  wired to the `lock` action -> cmd_lock "xw-lock".
+- Tests: tests/suite/test_lock.c — 8 in-process (lifecycle, input
+  gate, denial, client death + takeover, timeout, resize, idle,
+  raw-protocol commit-before-first-ack) + 3 child-process tests with
+  the real binary (unlock flow incl. wrong passphrase, SIGKILL while
+  locked stays locked + takeover, --idle autolock). 34 -> 45 in-process.
+- Client NULL-global ordering bug found + fixed (configure fires
+  during xwc_lock_create before g_lock is assigned — draw must use
+  the callback's lock parameter). Child-test race found + fixed
+  (waiting on the engaged gate races the child's handshake; wait for
+  the locked event via the new white-box xw_session_lock_locked()).
+- Full verification: 45/45 in-process, 84/84 process-level, 49/49
+  build regressions (+1 env skip), ASan/UBSan/LSan clean (44/44 under
+  sanitizers pre-release-restore, exit-time leak of the child display
+  is the wl_display finalization, benign).
+- Docs: ROADMAP (M4 entries + honest gaps: file-based auth not PAM,
+  single-output client lib), ARCHITECTURE (security model + lifetimes
+  + idle subtleties), TESTING (45 + new coverage entries), README
+  (component table + counts), BUILDING (XW_LOCK_* env vars), TODO.
+
+Stage Summary:
+- The session can now be locked (Ctrl+Alt+L or xw-lock [--idle N]) and
+  unlocked only with the passphrase; killing the locker keeps the
+  session locked; a second locker takes over. Security properties are
+  server-enforced and pixel-verified.
+- Remaining honest gaps: PAM unlock backend, multi-output lock client.

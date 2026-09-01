@@ -73,6 +73,11 @@ absent rather than half-working.
   path-mode contexts (no devices — deterministic everywhere).
 - `tests/suite/test_session.c` — the graphical exit dialog as a real
   child process against the in-process compositor.
+- `tests/suite/test_lock.c` — session-lock + idle-notify coverage
+  (in-process white-box + libxwcl client, plus the real xw-lock binary
+  as a child process: passphrase unlock flow, kill-while-locked
+  security, --idle autolock; a raw wayland connection drives the
+  strict protocol-error paths).
 - `tests/suite/test_panel.c` — panel coverage (see below).
 - `tests/suite/test_backends.c` — nested backend coverage: a real
   compositor (B, nested) running inside another real compositor (A,
@@ -150,7 +155,7 @@ requires a running udev instance; run
 what was verified (device, kernel, distro) in WORKLOG.md — that is
 what keeps "verified at Level 3" honest.
 
-## What is covered today (34 Level-1 tests + 84 Level-2 checks + 49-58 build-regression checks)
+## What is covered today (45 Level-1 tests + 84 Level-2 checks + 49-58 build-regression checks)
 
 The nested-session regression (session 5 below) is the reason several
 of these numbers exist: an invisible panel that looked like a working
@@ -163,6 +168,26 @@ one.
 - workspaces: switching, wrap-around, visibility
 - shortcut engine: default table dispatch, consume-vs-forward
   suppression, show-desktop
+- **session lock (ext-session-lock-v1): lock lifecycle with the
+  `locked`-event-after-presented-frame ordering, unlock, second-lock
+  denial (finished), client death while locked keeps the session
+  locked (pixel-scanned: no window content anywhere) with takeover by
+  a new client, grace-timer flush when the client never commits,
+  output-resize reconfigure to the exact new size, and the
+  commit-before-first-ack protocol error via a raw (non-libxwcl)
+  connection — a PENDING offender's death must release the gate**
+- **session lock input gate: while locked, keys and buttons are
+  delivered to the lock surface ONLY — the window's callbacks stay
+  silent (asserted both directions), shortcut interactivity is dead**
+- **idle-notify (ext-idle-notify-v1): idled after the timeout with no
+  input, resumed immediately on input, re-arm and second idled,
+  independent timeouts; timers need paced real-time waits (the same
+  pattern as key repeat)**
+- **xw-lock (the real binary as a child process, Level 1 harness):
+  wrong passphrase keeps the lock, correct passphrase unlocks and
+  exits 0, SIGKILL while locked leaves the session locked and a
+  second xw-lock takes over, --idle auto-lock engages only after the
+  idle timeout (continuous input suppresses it)**
 - focus: click-to-focus + activation, pointer hit-testing
 - **key repeat: repeat_info delivery (default + configured values),
   exactly one press per keypress to clients (no server-side double

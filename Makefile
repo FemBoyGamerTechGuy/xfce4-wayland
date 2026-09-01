@@ -291,6 +291,8 @@ PROT_PAIRS := \
 	$(WP_DIR)/staging/xdg-activation/xdg-activation-v1.xml|xdg-activation \
 	$(WP_DIR)/staging/ext-workspace/ext-workspace-v1.xml|ext-workspace \
 	$(WP_DIR)/staging/single-pixel-buffer/single-pixel-buffer-v1.xml|single-pixel-buffer \
+	$(WP_DIR)/staging/ext-session-lock/ext-session-lock-v1.xml|ext-session-lock \
+	$(WP_DIR)/staging/ext-idle-notify/ext-idle-notify-v1.xml|ext-idle-notify \
 	protocols/wlr-layer-shell-unstable-v1.xml|wlr-layer-shell-unstable-v1 \
 	protocols/wlr-foreign-toplevel-management-unstable-v1.xml|wlr-foreign-toplevel-management-unstable-v1
 
@@ -378,7 +380,9 @@ LIBXWCL_PROTO := $(OBJ)/gen/xdg-shell-protocol.o \
 	$(OBJ)/gen/wlr-layer-shell-unstable-v1-protocol.o \
 	$(OBJ)/gen/wlr-foreign-toplevel-management-unstable-v1-protocol.o \
 	$(OBJ)/gen/ext-workspace-protocol.o \
-	$(OBJ)/gen/single-pixel-buffer-protocol.o
+	$(OBJ)/gen/single-pixel-buffer-protocol.o \
+	$(OBJ)/gen/ext-session-lock-protocol.o \
+	$(OBJ)/gen/ext-idle-notify-protocol.o
 
 build/lib/libxwcl.a: $(LIBXWCL_OBJ) $(LIBXWCL_PROTO) | build/lib
 	$(AR) rcs $@ $(LIBXWCL_OBJ) $(LIBXWCL_PROTO)
@@ -412,6 +416,9 @@ build/bin/xw-exit: $(OBJ)/clients/xw-exit.o $(OBJ)/clients/xw-ctl.o $(OBJ)/sessi
 
 build/bin/xw-demo: $(OBJ)/clients/xw-demo.o build/lib/libxwcl.a | build/bin
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-demo.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
+
+build/bin/xw-lock: $(OBJ)/clients/xw-lock.o build/lib/libxwcl.a | build/bin
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-lock.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
 
 $(OBJ)/clients/%.o: src/clients/%.c src/clients/*.h src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/clients
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLC) $(CFLAGS_PIX) -c $< -o $@
@@ -476,6 +483,7 @@ $(OBJ)/tests/fdtest2.o: tests/fdtest2.c | $(OBJ)/tests
 SESSION_BINS := $(if $(wildcard src/session/xw-session.c),build/bin/xw-session build/bin/xw-session-ctl,)
 CLIENT_BINS := $(if $(wildcard src/clients/xw-demo.c),build/bin/xw-demo,) \
 	$(if $(wildcard src/clients/xw-exit.c),build/bin/xw-exit,) \
+	$(if $(wildcard src/clients/xw-lock.c),build/bin/xw-lock,) \
 	$(if $(wildcard src/clients/xw-panel.c),build/bin/xw-panel,)
 all: build/.profile build/.features build/bin/xw-compositor $(SESSION_BINS) $(CLIENT_BINS) \
 	build/tests/run-tests

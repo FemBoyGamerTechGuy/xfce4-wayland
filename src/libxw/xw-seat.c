@@ -175,9 +175,14 @@ static struct xw_layer_surface *layer_keyboard_owner(struct xw_compositor *c) {
 }
 
 /* topmost surface at global point, excluding windows (used for layers);
- * windows are hit-tested by the wm. */
+ * windows are hit-tested by the wm. While the session lock gate is
+ * engaged, ONLY lock surfaces are hit-testable: input belongs to the
+ * lock client (ext-session-lock security requirement). */
 static struct xw_surface *surface_at(struct xw_seat *s, int x, int y) {
     struct xw_compositor *c = s->comp;
+
+    if (xw_session_lock_active(c))
+        return xw_session_lock_surface_at(c, x, y);
 
     /* active grabs capture everything */
     if (s->grab_surface)
@@ -241,6 +246,14 @@ static void send_modifiers(struct xw_seat *s) {
 
 void xw_seat_set_kb_focus(struct xw_seat *s, struct xw_surface *surface) {
     disarm_interactive_repeat(s);
+    /* session lock: lock surfaces own the keyboard absolutely while
+     * engaged (shortcuts are dead, clients never see keys) */
+    if (xw_session_lock_active(s->comp)) {
+        struct xw_surface *lk = xw_session_lock_kb_owner(s->comp);
+        if (lk != surface) {
+            surface = lk;
+        }
+    }
     /* exclusive layer interactivity overrides window focus */
     struct xw_layer_surface *owner = layer_keyboard_owner(s->comp);
     if (owner && owner->surface != surface)
@@ -364,8 +377,27 @@ void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
     xkb_state_update_key(s->xkb_state, keycode + 8,
                          down ? XKB_KEY_DOWN : XKB_KEY_UP);
     send_modifiers(s);
+    xw_idle_activity(s);
 
     uint32_t time = (uint32_t)xw_now_ms();
+
+    /* session lock: input goes ONLY to the focused lock surface — no
+     * shortcuts, no interactive move/resize (security gate). The
+     * keyboard focus is pinned to a lock surface by
+     * xw_seat_set_kb_focus while the gate is engaged. */
+    if (xw_session_lock_active(s->comp)) {
+        if (!s->kb_focus || wl_list_empty(&s->keyboards))
+            return;
+        struct wl_client *cl = wl_resource_get_client(s->kb_focus->res);
+        struct wl_resource *k;
+        wl_list_for_each(k, &s->keyboards, link) {
+            if (wl_resource_get_client(k) == cl)
+                wl_keyboard_send_key(k, ++s->serial, time, keycode + 8,
+                                     down ? WL_KEYBOARD_KEY_STATE_PRESSED
+                                          : WL_KEYBOARD_KEY_STATE_RELEASED);
+        }
+        return;
+    }
 
     /* 1. shortcut engine (key-down only; releases of consumed keys are
      *    suppressed so clients never see a stray release) */
@@ -425,8 +457,9 @@ void xw_seat_pointer_motion(struct xw_seat *s, int x, int y) {
     int old_x = s->cursor_x, old_y = s->cursor_y;
     s->cursor_x = x;
     s->cursor_y = y;
+    xw_idle_activity(s);
 
-    if (s->drag.active) {
+    if (s->drag.active && !xw_session_lock_active(c)) {
         xw_data_device_drag_motion(c, s, x, y);
         damage_cursor(c, old_x, old_y);
         damage_cursor(c, x, y);
@@ -438,9 +471,10 @@ void xw_seat_pointer_motion(struct xw_seat *s, int x, int y) {
         set_ptr_focus(s, target);
     }
 
-    /* interactive window move/resize follows the cursor */
+    /* interactive window move/resize follows the cursor (impossible
+     * while locked: cancel_interactions ran when the gate engaged) */
     struct xw_window *iw = xw_wm_interactive_window(c->wm);
-    if (iw && s->ptr_grab) {
+    if (iw && s->ptr_grab && !xw_session_lock_active(c)) {
         xw_wm_interactive_motion(c->wm, iw, x, y);
         damage_cursor(c, old_x, old_y);
         damage_cursor(c, x, y);
@@ -468,6 +502,25 @@ void xw_seat_pointer_button(struct xw_seat *s, uint32_t linux_button,
     uint32_t time = (uint32_t)xw_now_ms();
     uint32_t state =
         down ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED;
+    xw_idle_activity(s);
+
+    /* session lock: buttons go only to the lock surface under the
+     * pointer (surface_at pins ptr_focus while engaged); a press on a
+     * lock surface also moves keyboard focus to it (multi-output). No
+     * popups, no wm focus/raise, no grabs, no drag-drop. */
+    if (xw_session_lock_active(c)) {
+        if (s->ptr_focus && !wl_list_empty(&s->pointers)) {
+            if (down)
+                xw_seat_set_kb_focus(s, s->ptr_focus);
+            struct wl_resource *p;
+            PTR_FOR_EACH(s->ptr_focus, p) {
+                wl_pointer_send_button(p, ++s->serial, time, linux_button,
+                                       state);
+                wl_pointer_send_frame(p);
+            }
+        }
+        return;
+    }
 
     /* drag-and-drop: release performs the drop */
     if (!down && s->drag.active) {
@@ -594,6 +647,7 @@ void xw_seat_pointer_axis(struct xw_seat *s, uint32_t axis, double value) {
     if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL &&
         axis != WL_POINTER_AXIS_HORIZONTAL_SCROLL)
         return;
+    xw_idle_activity(s);
     if (s->ptr_focus && !wl_list_empty(&s->pointers)) {
         struct wl_resource *p;
         PTR_FOR_EACH(s->ptr_focus, p) {
@@ -617,6 +671,7 @@ struct xw_seat *xw_seat_create(struct xw_compositor *c, const char *name) {
     wl_list_init(&s->keyboards);
     wl_list_init(&s->data_devices);
     s->keymap_fd = -1;
+    s->last_activity_ms = xw_now_ms(); /* idle-notify baseline */
 
     s->xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     if (!s->xkb_ctx)
@@ -712,6 +767,8 @@ void xw_seat_destroy(struct xw_seat *s) {
     wl_list_remove(&s->link);
     if (s->global)
         wl_global_destroy(s->global);
+    /* idle notifications bound to this seat die with it (no events) */
+    xw_idle_seat_destroyed(s->comp, s);
     /* client-side resources (keyboards/pointers/data devices) are destroyed
      * with their clients; just unlink ours */
     while (!wl_list_empty(&s->keyboards))

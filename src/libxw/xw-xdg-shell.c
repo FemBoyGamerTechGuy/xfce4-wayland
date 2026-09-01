@@ -1118,6 +1118,9 @@ void xw_role_commit(struct xw_surface *s) {
     case XW_SURFACE_ROLE_LAYER:
         xw_layer_role_commit(s);
         return;
+    case XW_SURFACE_ROLE_SESSION_LOCK:
+        xw_lock_role_commit(s);
+        return;
     default:
         return;
     }
@@ -1134,6 +1137,11 @@ void xw_role_unmap(struct xw_surface *s) {
         break;
     case XW_SURFACE_ROLE_LAYER:
         xw_layer_role_unmap(s);
+        break;
+    case XW_SURFACE_ROLE_SESSION_LOCK:
+        /* unmap bookkeeping lives in xw-session-lock.c; the lock role
+         * has no unmap request path (null-buffer commits are a
+         * protocol error there), so this is a no-op */
         break;
     default:
         break;
@@ -1199,6 +1207,9 @@ void xw_role_destroy(struct xw_surface *s) {
     }
     case XW_SURFACE_ROLE_LAYER:
         xw_layer_role_destroy(s);
+        break;
+    case XW_SURFACE_ROLE_SESSION_LOCK:
+        xw_lock_role_destroy(s);
         break;
     default:
         break;
