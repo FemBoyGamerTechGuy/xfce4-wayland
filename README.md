@@ -1,5 +1,12 @@
 # xfce4-wayland
 
+A community-driven native Wayland implementation of XFCE4, preserving the
+XFCE desktop experience while replacing X11-specific components with
+modern Wayland-native implementations.
+
+> **Unofficial project.** Not affiliated with or endorsed by the Xfce
+> project.
+
 A native Wayland desktop environment that reproduces the functionality,
 workflow, configurability, and user experience of XFCE4 on a modern,
 Wayland-native architecture.

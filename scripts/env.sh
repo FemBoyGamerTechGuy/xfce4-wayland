@@ -1,18 +1,29 @@
 #!/bin/sh
 # Source this file to set up the build environment for xfce4-wayland.
 #
-# It makes the locally extracted sysroot (wayland dev files, protocol XML,
+# It makes a locally extracted sysroot (wayland dev files, protocol XML,
 # wayland-scanner) visible to pkg-config and PATH without requiring root.
 #
-# The sysroot lives outside the repository (../.toolchain/sysroot) because it
-# contains third-party binaries/headers under their own licenses; the
-# repository itself stays clean of prebuilt artifacts.
+# The sysroot is optional and never committed: it is looked up at
+# ./.toolchain/sysroot (gitignored) or ../.toolchain/sysroot. It contains
+# third-party binaries/headers under their own licenses; the repository
+# itself stays clean of prebuilt artifacts.
 
 # ${BASH_SOURCE:-$0}: when sourced with '.', $0 is the shell, not this file
 XW_ROOT="$(cd "$(dirname "${BASH_SOURCE:-$0}")/.." && pwd)"
-XW_SYSROOT="$(cd "$XW_ROOT/.." 2>/dev/null && pwd)/.toolchain/sysroot"
 
-if [ -d "$XW_SYSROOT/usr" ]; then
+# Optional local sysroot: looked up at ./.toolchain/sysroot (gitignored,
+# never committed) and ../.toolchain/sysroot; otherwise system-wide dev
+# files are used.
+XW_SYSROOT=""
+for candidate in "$XW_ROOT/.toolchain/sysroot" "$XW_ROOT/../.toolchain/sysroot"; do
+    if [ -d "$candidate/usr" ]; then
+        XW_SYSROOT="$candidate"
+        break
+    fi
+done
+
+if [ -n "$XW_SYSROOT" ]; then
     export XW_SYSROOT
     export PKG_CONFIG_PATH="$XW_SYSROOT/usr/lib/x86_64-linux-gnu/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
     export PATH="$XW_SYSROOT/usr/bin:$PATH"

@@ -12,10 +12,11 @@
 # Optional local overrides (sysroot, CC, extra flags).
 -include config.local.mk
 
-# Optional out-of-tree sysroot holding wayland dev files (headers, scanner,
-# protocol XML). If unset we fall back to a sibling .toolchain/sysroot
-# directory, then to system-wide installs.
-XW_SYSROOT ?= $(if $(wildcard $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../.toolchain/sysroot)),$(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../.toolchain/sysroot),)
+# Optional local sysroot holding wayland dev files (headers, scanner,
+# protocol XML); never committed. If unset we auto-detect
+# ./.toolchain/sysroot, then ../.toolchain/sysroot, then fall back to
+# system-wide installs.
+XW_SYSROOT ?= $(if $(wildcard $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/.toolchain/sysroot)),$(abspath $(dir $(lastword $(MAKEFILE_LIST)))/.toolchain/sysroot),$(if $(wildcard $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../.toolchain/sysroot)),$(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../.toolchain/sysroot),))
 
 CC       ?= cc
 AR       ?= ar

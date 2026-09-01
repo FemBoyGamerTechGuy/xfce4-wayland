@@ -1,8 +1,15 @@
 # xfce4-wayland build artifacts
 build/
+dist/
 *.o
 *.a
 *.so
 *.deb
 *.log
 __pycache__/
+
+# optional local sysroot (see BUILDING.md); never committed
+.toolchain/
+
+# local editor/environment files
+.env

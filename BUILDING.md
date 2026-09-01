@@ -25,15 +25,15 @@ Outputs land in `build/bin/`, libraries in `build/lib/`.
 If the system lacks the Wayland dev packages (common on locked-down
 machines), fetch the distro packages without root and extract them:
 
-    mkdir -p ../.toolchain/debs ../.toolchain/sysroot
-    cd ../.toolchain/debs
+    mkdir -p .toolchain/debs .toolchain/sysroot
+    cd .toolchain/debs
     apt-get download libwayland-dev libwayland-bin libxkbcommon-dev \
                     wayland-protocols
     for d in *.deb; do dpkg -x "$d" ../sysroot; done
 
-The Makefile auto-detects `../.toolchain/sysroot` (or `XW_SYSROOT=` /
-`config.local.mk`). `scripts/env.sh` documents the same paths for
-interactive shells.
+The Makefile auto-detects `.toolchain/sysroot` (gitignored, never
+committed; or `XW_SYSROOT=` / `config.local.mk`). `scripts/env.sh`
+documents the same paths for interactive shells.
 
 ## Targets
 
