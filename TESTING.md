@@ -123,7 +123,7 @@ requires a running udev instance; run
 what was verified (device, kernel, distro) in WORKLOG.md — that is
 what keeps "verified at Level 3" honest.
 
-## What is covered today (31 Level-1 tests + 61 Level-2 checks)
+## What is covered today (33 Level-1 tests + 71 Level-2 checks)
 
 - compositor bootstrap + clean shutdown; socket lifecycle
 - output creation, geometry, scale; multi-output
