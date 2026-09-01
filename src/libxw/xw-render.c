@@ -71,27 +71,36 @@ static void draw_cursor(struct xw_output *o, struct xw_seat *seat) {
     }
 }
 
+/* gx/gy/gw/gh: destination rect (layout coords). src_x/src_y: origin
+ * of the source rect in SURFACE-LOCAL (logical, pre-scale) coordinates
+ * -- the xdg set_window_geometry offset for CSD toplevels: the content
+ * rect starts there inside the buffer, and only the content is
+ * composited (the spec makes rendering outside the geometry optional;
+ * we drop it, which keeps damage and input rectangles exact). */
 static void blit_surface(struct xw_output *o, struct xw_surface *s, int gx,
-                         int gy, int gw, int gh) {
+                         int gy, int gw, int gh, int src_x, int src_y) {
     pixman_image_t *src = xw_surface_get_image(s);
     if (!src)
         return;
-    int sx = gx - o->x, sy = gy - o->y;
+    int dx = gx - o->x, dy = gy - o->y;
     int bw = s->buf_w, bh = s->buf_h;
     int sc = s->scale > 0 ? s->scale : 1;
-    if (bw == gw && bh == gh && sc == 1) {
-        pixman_image_composite(PIXMAN_OP_OVER, src, NULL, o->logical, 0, 0, 0, 0,
-                               sx, sy, gw, gh);
+    if (bw >= (src_x + gw) * sc && bh >= (src_y + gh) * sc) {
+        /* the buffer contains the declared source rect: 1:1 sub-rect
+         * (exact match, CSD shadows, oversized buffers) */
+        pixman_image_composite(PIXMAN_OP_OVER, src, NULL, o->logical,
+                               src_x * sc, src_y * sc, 0, 0, dx, dy, gw, gh);
     } else {
-        /* scale the buffer to the target geometry (buffer scale / CSD
-         * mismatch tolerance) */
+        /* scale the buffer to the target geometry (buffer scale /
+         * mismatched-size tolerance; geometry offsets do not apply
+         * here by definition -- the source is the whole buffer) */
         pixman_transform_t t;
         pixman_fixed_t fx = pixman_int_to_fixed(bw) / gw;
         pixman_fixed_t fy = pixman_int_to_fixed(bh) / gh;
         pixman_transform_init_scale(&t, fx, fy);
         pixman_image_set_transform(src, &t);
         pixman_image_composite(PIXMAN_OP_OVER, src, NULL, o->logical, 0, 0, 0, 0,
-                               sx, sy, gw, gh);
+                               dx, dy, gw, gh);
         pixman_image_set_transform(src, NULL);
     }
     pixman_image_unref(src);
@@ -100,7 +109,12 @@ static void blit_surface(struct xw_output *o, struct xw_surface *s, int gx,
 static void render_window(struct xw_output *o, struct xw_window *w) {
     if (!w->surface || (!w->surface->shm && !w->surface->has_single_pixel))
         return;
-    blit_surface(o, w->surface, w->x, w->y, w->w, w->h);
+    int ox = 0, oy = 0;
+    if (w->geometry_set) {
+        ox = w->geo_x;
+        oy = w->geo_y;
+    }
+    blit_surface(o, w->surface, w->x, w->y, w->w, w->h, ox, oy);
 }
 
 
@@ -109,7 +123,7 @@ static void render_layer(struct xw_output *o, struct xw_layer_surface *ls) {
         return;
     if (!ls->surface->shm && !ls->surface->has_single_pixel)
         return;
-    blit_surface(o, ls->surface, ls->x, ls->y, ls->w, ls->h);
+    blit_surface(o, ls->surface, ls->x, ls->y, ls->w, ls->h, 0, 0);
 }
 
 static void render_snap_preview(struct xw_output *o, struct xw_wm *wm,
@@ -174,7 +188,7 @@ void xw_render_output(struct xw_output *o) {
     wl_list_for_each_reverse(p, &c->popups, link) {
         if (!p->mapped || !p->surface)
             continue;
-        blit_surface(o, p->surface, p->anchor_x, p->anchor_y, p->w, p->h);
+        blit_surface(o, p->surface, p->anchor_x, p->anchor_y, p->w, p->h, 0, 0);
     }
 
     /* 5. snap preview of the window being moved */

@@ -286,11 +286,26 @@ bool xw_surface_has_input_at(struct xw_surface *s, int gx, int gy) {
     xw_surface_get_pos(s, &x, &y, &w, &h);
     if (w <= 0 || h <= 0)
         return false;
+    /* surface-local coordinates are relative to the BUFFER origin. For
+     * CSD toplevels with set_window_geometry the buffer origin sits
+     * geo_* left/above the content origin, and the default interactive
+     * rect is the geometry (content) rect, not the whole buffer --
+     * clicks on client-side shadows must fall through. */
+    int gl = 0, gt = 0;
+    if (s->role == XW_SURFACE_ROLE_XDG_TOPLEVEL && s->role_data) {
+        struct xw_window *win = s->role_data;
+        if (win->geometry_set) {
+            gl = win->geo_x;
+            gt = win->geo_y;
+        }
+    }
+    int lx = gx - x + gl, ly = gy - y + gt; /* surface-local */
+    if (!s->input_set) {
+        /* no input region set: the geometry rect is interactive */
+        return lx >= gl && lx < gl + w && ly >= gt && ly < gt + h;
+    }
     if (gx < x || gx >= x + w || gy < y || gy >= y + h)
         return false;
-    if (!s->input_set)
-        return true;
-    int lx = gx - x, ly = gy - y;
     return pixman_region_contains_point(&s->input, lx, ly, NULL) != 0;
 }
 

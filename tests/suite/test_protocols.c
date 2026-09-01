@@ -539,12 +539,74 @@ static void test_foreign_toplevel_and_activation(struct xwt_ctx *t) {
 
 /* ------------------------------------------------------------ registration */
 
+/* CSD toplevels: set_window_geometry(x, y, w, h) declares the content
+ * rect inside the (larger) buffer. Content must render at the window
+ * rect, the shadow margin must NOT be composited, and clicks on the
+ * shadow area must fall through (input = geometry rect). */
+static void test_csd_geometry(struct xwt_ctx *t) {
+    const uint32_t shadow = 0xff202020;
+    const uint32_t content = 0xff30d070;
+    struct xwc_win *win = xwt_window_solid(t, content, 100, 100, "CSDWin");
+    XWT_ASSERT(win);
+    XWT_WAIT(t, xw_compositor_window_count(t->comp) == 1);
+    struct xw_window *w = find_window(t, "CSDWin");
+    XWT_ASSERT(w);
+
+    /* declare a content rect offset 10,10 with 80x80 size */
+    struct xdg_surface *xs = xwc_win_xdg_surface(win);
+    XWT_ASSERT(xs);
+    xdg_surface_set_window_geometry(xs, 10, 10, 80, 80);
+    for (int i = 0; i < 10; i++)
+        xwt_pump(t);
+
+    XWT_CHECK(w->w == 80 && w->h == 80, "window sized to the geometry "
+              "(got %dx%d)", w->w, w->h);
+    XWT_CHECK(w->geometry_set && w->geo_x == 10 && w->geo_y == 10,
+              "geometry offset stored");
+
+    /* commit a buffer with a shadow margin and distinct content */
+    int stride = 0;
+    uint32_t *pix = xwc_win_pixels(win, &stride);
+    XWT_ASSERT(pix);
+    xwc_fill_rect(pix, stride, 100, 100, 0, 0, 100, 100, shadow);
+    xwc_fill_rect(pix, stride, 100, 100, 10, 10, 80, 80, content);
+    xwc_win_commit(win);
+    for (int i = 0; i < 10; i++)
+        xwt_pump(t);
+
+    /* content renders at the window rect; the shadow margin is not
+     * composited (outside the window = background) */
+    XWT_CHECK(pixel_at(t, w->x + 5, w->y + 5) == content,
+              "content color inside the geometry rect");
+    XWT_CHECK(pixel_at(t, w->x + 75, w->y + 75) == content,
+              "content color at the far corner");
+    XWT_CHECK(pixel_at(t, w->x - 5, w->y - 5) != shadow,
+              "shadow margin not composited outside the geometry");
+
+    /* input: clicks inside content focus the window; clicks on the
+     * shadow area (buffer coordinates < geometry) fall through */
+    xw_compositor_inject_pointer_motion(t->comp, w->x + 40, w->y + 40);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    xwt_pump(t);
+    XWT_CHECK(t->comp->wm->focused == w, "click inside content focuses");
+
+    xw_compositor_inject_pointer_motion(t->comp, w->x - 5, w->y - 5);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    xwt_pump(t);
+    XWT_CHECK(xw_seat_first(t->comp)->ptr_focus != w->surface,
+              "click on the shadow area does not hit the window "
+              "(background click may keep keyboard focus - xfwm4-like)");
+}
+
 static const struct xwt_test tests[] = {
     {"layer-shell-panel", test_layer_shell_panel},
     {"layer-shell-focus", test_layer_shell_exclusive_keyboard},
     {"popup-positioning", test_popup_positioning},
     {"clipboard-selection", test_clipboard_selection},
     {"foreign-toplevel-activation", test_foreign_toplevel_and_activation},
+    {"csd-geometry", test_csd_geometry},
 };
 
 __attribute__((constructor)) static void register_tests(void) {
