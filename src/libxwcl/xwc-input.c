@@ -19,6 +19,7 @@ extern void xwc_input_key(struct xwc *c, uint32_t keycode, bool down,
 extern void xwc_input_button(struct xwc *c, uint32_t button, bool down, int x,
                              int y);
 extern void xwc_input_motion(struct xwc *c, int x, int y);
+extern void xwc_input_axis(struct xwc *c, uint32_t axis, double value);
 
 /* ------------------------------------------------------------ keyboard */
 
@@ -101,12 +102,22 @@ static void kb_modifiers(void *data, struct wl_keyboard *kb,
                               group);
 }
 
+static void kb_repeat_info(void *data, struct wl_keyboard *kb, int32_t rate,
+                           int32_t delay) {
+    (void)kb;
+    struct xwc *c = data;
+    c->repeat_rate_hz = rate;
+    c->repeat_delay_ms = delay;
+    c->repeat_info_received = true;
+}
+
 static const struct wl_keyboard_listener kb_listener = {
     .keymap = kb_keymap,
     .enter = kb_enter,
     .leave = kb_leave,
     .key = kb_key,
     .modifiers = kb_modifiers,
+    .repeat_info = kb_repeat_info,
 };
 
 /* ------------------------------------------------------------- pointer */
@@ -150,11 +161,10 @@ static void ptr_button(void *data, struct wl_pointer *p, uint32_t serial,
 
 static void ptr_axis(void *data, struct wl_pointer *p, uint32_t time,
                      uint32_t axis, wl_fixed_t value) {
-    (void)data;
     (void)p;
     (void)time;
-    (void)axis;
-    (void)value;
+    struct xwc *c = data;
+    xwc_input_axis(c, axis, wl_fixed_to_double(value));
 }
 
 static void ptr_frame(void *data, struct wl_pointer *p) {

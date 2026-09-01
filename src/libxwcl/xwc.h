@@ -26,6 +26,7 @@ struct xwc_callbacks {
     void (*button)(struct xwc_win *win, uint32_t button, bool down, int x,
                    int y, void *ud);
     void (*motion)(struct xwc_win *win, int x, int y, void *ud);
+    void (*axis)(struct xwc_win *win, uint32_t axis, double value, void *ud);
     void (*configure)(struct xwc_win *win, int w, int h, void *ud);
     void (*close)(struct xwc_win *win, void *ud);
     void *ud;
@@ -71,6 +72,11 @@ struct xwc {
     bool has_focus;
     int ptr_x, ptr_y;     /* last pointer position (surface-local) */
     bool running;
+
+    /* wl_keyboard.repeat_info as advertised by the server (client-side
+     * repeat parameters; 0/0 = not received yet) */
+    int repeat_rate_hz, repeat_delay_ms;
+    bool repeat_info_received;
 };
 
 /* Connect to the compositor (NULL socket = $WAYLAND_DISPLAY). Blocks

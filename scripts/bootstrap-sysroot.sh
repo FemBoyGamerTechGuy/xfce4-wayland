@@ -22,7 +22,7 @@ DL="$TC/dl"
 SYS="$TC/sysroot"
 
 PKGS="libwayland-dev libwayland-bin wayland-protocols libxkbcommon-dev \
-libinput-dev libinput10 libudev-dev libxtst-dev libxtst6 libxi-dev libxi6"
+libinput-dev libinput10 libudev-dev libxtst-dev libxtst6 libxi-dev libxi6 libevdev2 libwacom9"
 
 command -v apt-get >/dev/null 2>&1 || {
     echo "bootstrap: apt-get not found — this helper is Debian-family only." >&2
@@ -66,10 +66,13 @@ do
 done
 
 # libinput runtime is NOT installed system-wide here: keep the sysroot
-# copy and record an rpath for it via libinput.pc Libs.
-if [ -e "$LIB/libinput.so.10" ] && [ ! -e "$LIB/libinput.so" ]; then
+# copy, link the dev name to it, and record the rpath in libinput.pc
+# (upstream's Requires: libudev is preserved so -ludev resolves too).
+if [ -e "$LIB/libinput.so.10" ]; then
     ln -sf libinput.so.10 "$LIB/libinput.so"
     sed -i "s|^Libs:.*|Libs: -L\${libdir} -Wl,-rpath,\${libdir} -linput|" "$PC/libinput.pc"
+    grep -q "^Requires: libudev" "$PC/libinput.pc" ||
+        sed -i "s|^Libs:|Requires: libudev\nLibs:|" "$PC/libinput.pc"
 fi
 
 echo "bootstrap: verifying wayland-scanner"

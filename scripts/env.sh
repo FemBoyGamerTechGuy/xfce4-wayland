@@ -27,6 +27,9 @@ if [ -n "$XW_SYSROOT" ]; then
     export XW_SYSROOT
     export PKG_CONFIG_PATH="$XW_SYSROOT/usr/lib/x86_64-linux-gnu/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
     export PATH="$XW_SYSROOT/usr/bin:$PATH"
+    # runtime libs pulled from the sysroot (libinput and its dependencies
+    # are not installed system-wide in locked-down containers)
+    export LD_LIBRARY_PATH="$XW_SYSROOT/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     echo "env: using sysroot $XW_SYSROOT"
 else
     echo "env: no local sysroot found; relying on system-wide wayland dev files"

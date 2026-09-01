@@ -24,6 +24,8 @@ static void usage(const char *prog) {
            "\n"
            "Options:\n"
            "  -B, --backend NAME     headless | nested | x11\n"
+           "  -I, --input MODE       auto | libinput | none (real input;\n"
+           "                            auto only with $XW_INPUT_DEVICES)\n"
            "  -c, --config-dir DIR   configuration directory (INI files)\n"
            "  -s, --socket NAME      wayland socket name (default: auto)\n"
            "  -o, --output SPEC      output spec WxH (repeatable, e.g. -o 1280x720)\n"
@@ -45,6 +47,16 @@ static int parse_backend(const char *name) {
     return -1;
 }
 
+static int parse_input(const char *name) {
+    if (!name || strcmp(name, "auto") == 0)
+        return XW_INPUT_AUTO;
+    if (strcmp(name, "libinput") == 0)
+        return XW_INPUT_LIBINPUT;
+    if (strcmp(name, "none") == 0)
+        return XW_INPUT_NONE;
+    return -1;
+}
+
 int main(int argc, char **argv) {
     struct xw_compositor_config cfg = {0};
     struct xw_output_spec outputs[8];
@@ -53,6 +65,7 @@ int main(int argc, char **argv) {
 
     static const struct option longopts[] = {
         {"backend", required_argument, NULL, 'B'},
+        {"input", required_argument, NULL, 'I'},
         {"config-dir", required_argument, NULL, 'c'},
         {"socket", required_argument, NULL, 's'},
         {"output", required_argument, NULL, 'o'},
@@ -64,12 +77,20 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "B:c:s:o:D:qvh", longopts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "B:I:c:s:o:D:qvh", longopts, NULL)) != -1) {
         switch (opt) {
         case 'B':
             backend = parse_backend(optarg);
             if (backend < 0) {
                 fprintf(stderr, "unknown backend '%s' (headless|nested|x11)\n",
+                        optarg);
+                return 1;
+            }
+            break;
+        case 'I':
+            cfg.input_mode = parse_input(optarg);
+            if (cfg.input_mode < 0) {
+                fprintf(stderr, "unknown input mode '%s' (auto|libinput|none)\n",
                         optarg);
                 return 1;
             }

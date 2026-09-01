@@ -48,6 +48,10 @@ struct x11_backend {
     struct wl_event_source *xsrc; /* X fd on our loop */
 
     int win_w, win_h;
+
+    /* linux keycodes currently logically down (X synthetic repeat
+     * filter; see xw_x11_key_filter) */
+    uint32_t pressed_keys[8];
 };
 
 /* ------------------------------------------------------------- helpers */
@@ -101,6 +105,22 @@ static void xb_update_image(struct x11_backend *xb) {
 #define XW_BTN_RIGHT  0x111
 #define XW_BTN_MIDDLE 0x112
 
+bool xw_x11_key_filter(uint32_t *pressed_words, uint32_t linux_keycode,
+                       bool down) {
+    if (linux_keycode > 255)
+        return true; /* outside the bitmap: forward untouched */
+    uint32_t bit = 1u << (linux_keycode % 32);
+    uint32_t *word = &pressed_words[linux_keycode / 32];
+    if (down) {
+        if (*word & bit)
+            return false; /* press of an already-held key: X autorepeat */
+        *word |= bit;
+        return true;
+    }
+    *word &= ~bit;
+    return true;
+}
+
 static void xb_key(struct x11_backend *xb, unsigned int keycode, bool down) {
     struct xw_seat *s = xb_seat(xb);
     if (!s)
@@ -108,6 +128,10 @@ static void xb_key(struct x11_backend *xb, unsigned int keycode, bool down) {
     if (keycode < 8 || keycode > 8 + 255)
         return;
     uint32_t linux_keycode = keycode - 8;
+    /* clients repeat via wl_keyboard.repeat_info; drop the X server's
+     * synthetic repeats so keys are never delivered twice over */
+    if (!xw_x11_key_filter(xb->pressed_keys, linux_keycode, down))
+        return;
     xw_seat_key(s, linux_keycode, down);
 }
 

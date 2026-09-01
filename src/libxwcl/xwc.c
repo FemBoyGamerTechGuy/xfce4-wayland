@@ -198,6 +198,10 @@ int xwc_sync(struct xwc *c) {
 /* Non-blocking drain: read whatever arrived and dispatch it. Returns 0,
  * or -1 on connection error. */
 int xwc_drain(struct xwc *c) {
+    /* send whatever requests we have queued first: poll() alone never
+     * flushes, and a request stuck in the out buffer stalls the whole
+     * handshake (bit us as a silently missing keymap event) */
+    wl_display_flush(c->display);
     while (wl_display_prepare_read(c->display) != 0) {
         if (wl_display_dispatch_pending(c->display) < 0)
             return -1;
@@ -706,4 +710,10 @@ void xwc_input_motion(struct xwc *c, int x, int y) {
     c->ptr_y = y;
     if (c->has_focus && c->focused_cb.motion)
         c->focused_cb.motion(c->focused_owner, x, y, c->focused_cb.ud);
+}
+
+void xwc_input_axis(struct xwc *c, uint32_t axis, double value) {
+    if (c->has_focus && c->focused_cb.axis)
+        c->focused_cb.axis(c->focused_owner, axis, value,
+                           c->focused_cb.ud);
 }

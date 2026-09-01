@@ -94,6 +94,22 @@ enum xw_backend_type {
     XW_BACKEND_X11,
 };
 
+/* Real-input source selection (libinput; build-time optional, see
+ * XW_LIBINPUT in BUILDING.md).
+ *
+ * AUTO (default) never touches system devices unless XW_INPUT_DEVICES
+ * explicitly lists evdev nodes (a deliberate opt-in that also works
+ * for headless debugging); nested/X11 backends always inherit input
+ * from the parent session instead.
+ * LIBINPUT always runs the real-input source (udev seat mode, or path
+ * mode when XW_INPUT_DEVICES is set).
+ * NONE compiles it out of this instance entirely. */
+enum xw_input_mode {
+    XW_INPUT_AUTO = 0,
+    XW_INPUT_LIBINPUT,
+    XW_INPUT_NONE,
+};
+
 struct xw_compositor_config {
     const char *config_dir;    /* directory with INI config; NULL = defaults */
     const char *socket_name;   /* NULL = automatic */
@@ -103,6 +119,7 @@ struct xw_compositor_config {
     int n_outputs;             /* 0 = one 1280x720 headless output */
     int log_level;
     int backend;               /* enum xw_backend_type; 0 = headless */
+    int input_mode;            /* enum xw_input_mode; 0 = auto */
     /* parent display for nested backends: a WAYLAND_DISPLAY name for
      * XW_BACKEND_NESTED (NULL = inherit $WAYLAND_DISPLAY) or an X
      * display string for XW_BACKEND_X11 (NULL = inherit $DISPLAY) */
@@ -112,6 +129,16 @@ struct xw_compositor_config {
      * in-process compositor) making progress. NULL = none */
     void (*nested_pump)(void *ud);
     void *nested_pump_ud;
+
+    /* key repeat advertised to clients via wl_keyboard.repeat_info
+     * (clients implement the repeat themselves per the Wayland
+     * protocol; the seat additionally auto-repeats only the keys used
+     * by interactive keyboard move/resize). 0 selects the defaults
+     * (500 ms delay, 30 Hz rate). Runtime overrides: keyboard.conf
+     * [keyboard] repeat_delay_ms / repeat_rate_hz, then
+     * $XW_REPEAT_DELAY_MS / $XW_REPEAT_RATE_HZ. */
+    int repeat_delay_ms;
+    int repeat_rate_hz;
 };
 
 struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cfg);

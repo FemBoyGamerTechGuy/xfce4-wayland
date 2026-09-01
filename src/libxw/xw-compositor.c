@@ -270,6 +270,27 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
                 c->bg_color = (uint32_t)strtoul(v, NULL, 0);
             xw_ini_free(ini);
         }
+        snprintf(path, sizeof(path), "%s/keyboard.conf", c->conf_dir_owned);
+        ini = xw_ini_load(path);
+        if (ini) {
+            const char *v;
+            if ((v = xw_ini_get(ini, "keyboard", "repeat_delay_ms")) &&
+                atoi(v) > 0)
+                c->conf.repeat_delay_ms = atoi(v);
+            if ((v = xw_ini_get(ini, "keyboard", "repeat_rate_hz")) &&
+                atoi(v) > 0)
+                c->conf.repeat_rate_hz = atoi(v);
+            xw_ini_free(ini);
+        }
+    }
+    /* env overrides (debug/testing knobs, documented in BUILDING.md) */
+    {
+        const char *e = getenv("XW_REPEAT_DELAY_MS");
+        if (e && atoi(e) > 0)
+            c->conf.repeat_delay_ms = atoi(e);
+        e = getenv("XW_REPEAT_RATE_HZ");
+        if (e && atoi(e) > 0)
+            c->conf.repeat_rate_hz = atoi(e);
     }
 
     /* backend + outputs */
@@ -318,6 +339,36 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
     if (!c->shortcuts)
         goto fail;
 
+    /* real-input source (libinput). AUTO keeps tests and nested
+     * sessions off system devices; only an explicit XW_INPUT_DEVICES
+     * list, XW_INPUT_LIBINPUT or (later) a DRM backend opts in. */
+#ifdef XW_HAVE_LIBINPUT
+    {
+        bool want_input = false;
+        switch (cfg->input_mode) {
+        case XW_INPUT_LIBINPUT:
+            want_input = true;
+            break;
+        case XW_INPUT_NONE:
+            want_input = false;
+            break;
+        default: {
+            const char *devs = getenv("XW_INPUT_DEVICES");
+            want_input = devs && *devs &&
+                         cfg->backend != XW_BACKEND_NESTED &&
+                         cfg->backend != XW_BACKEND_X11;
+            break;
+        }
+        }
+        if (want_input) {
+            c->input = xw_input_libinput_create(c);
+            if (!c->input)
+                xw_log(XW_LOG_WARN, "input: real-input source unavailable; "
+                                    "continuing with injection-only input");
+        }
+    }
+#endif
+
     /* socket */
     const char *sock = NULL;
     if (c->conf.socket_name) {
@@ -363,6 +414,13 @@ void xw_compositor_destroy(struct xw_compositor *c) {
         wl_event_source_remove(c->sigchld_src);
     if (c->repaint_idle)
         wl_event_source_remove(c->repaint_idle);
+
+#ifdef XW_HAVE_LIBINPUT
+    if (c->input) {
+        xw_input_libinput_destroy(c->input);
+        c->input = NULL;
+    }
+#endif
 
     xw_shortcuts_destroy(c->shortcuts);
     c->shortcuts = NULL;

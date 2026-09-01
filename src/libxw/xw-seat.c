@@ -13,10 +13,15 @@
 #include "xw-internal.h"
 
 #include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+/* XFCE defaults: 500 ms delay, 30 repeats per second */
+#define XW_REPEAT_DELAY_DEFAULT_MS 500
+#define XW_REPEAT_RATE_DEFAULT_HZ 30
 
 #define XW_SEAT_VERSION 8
 
@@ -59,6 +64,7 @@ static void pointer_release(struct wl_client *client, struct wl_resource *res) {
 /* ------------------------------------------------------------ wl_seat */
 
 static void send_modifiers(struct xw_seat *s);
+static void disarm_interactive_repeat(struct xw_seat *s);
 
 static void seat_get_pointer(struct wl_client *client, struct wl_resource *res,
                              uint32_t id) {
@@ -98,6 +104,10 @@ static void seat_get_keyboard(struct wl_client *client, struct wl_resource *res,
         wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd,
                                 (uint32_t)s->keymap_len);
     }
+    /* repeat rate/delay (wayland: the CLIENT repeats, the server only
+     * advertises the parameters — v4+) */
+    if (wl_resource_get_version(k) >= WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION)
+        wl_keyboard_send_repeat_info(k, s->repeat_rate_hz, s->repeat_delay_ms);
     /* if this client already owns keyboard focus (surface mapped and
      * focused before the keyboard object existed), send enter now */
     if (s->kb_focus &&
@@ -230,6 +240,7 @@ static void send_modifiers(struct xw_seat *s) {
 }
 
 void xw_seat_set_kb_focus(struct xw_seat *s, struct xw_surface *surface) {
+    disarm_interactive_repeat(s);
     /* exclusive layer interactivity overrides window focus */
     struct xw_layer_surface *owner = layer_keyboard_owner(s->comp);
     if (owner && owner->surface != surface)
@@ -314,6 +325,36 @@ static void mark_consumed(struct xw_seat *s, uint32_t code, bool on) {
         s->consumed_keys[code / 32] &= ~(1u << (code % 32));
 }
 
+/* ------------------------------------------------ interactive repeat */
+
+static void arm_interactive_repeat(struct xw_seat *s, uint32_t keycode) {
+    s->repeat_key = keycode;
+    s->repeat_active = true;
+    wl_event_source_timer_update(s->repeat_src, s->repeat_delay_ms);
+}
+
+static void disarm_interactive_repeat(struct xw_seat *s) {
+    if (!s->repeat_active)
+        return;
+    s->repeat_active = false;
+    wl_event_source_timer_update(s->repeat_src, 0);
+}
+
+static int interactive_repeat_cb(void *data) {
+    struct xw_seat *s = data;
+    if (!s->repeat_active)
+        return 0;
+    struct xw_window *iw = xw_wm_interactive_window(s->comp->wm);
+    if (!iw) {
+        /* interactive mode ended without a key release */
+        disarm_interactive_repeat(s);
+        return 0;
+    }
+    xw_wm_interactive_key(s->comp->wm, iw, s->repeat_key, true);
+    wl_event_source_timer_update(s->repeat_src, s->repeat_period_ms);
+    return 0;
+}
+
 void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
     if (!s->xkb_state)
         return;
@@ -334,14 +375,31 @@ void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
         return;
     }
     if (!down && is_consumed(s, keycode)) {
+        /* the press was consumed (shortcut or interactive move/resize):
+         * the release never reaches the client, and any interactive
+         * auto-repeat of this key stops here */
+        if (s->repeat_active && keycode == s->repeat_key)
+            disarm_interactive_repeat(s);
         mark_consumed(s, keycode, false);
         return;
     }
 
-    /* 2. interactive move/resize keys */
+    /* 2. interactive move/resize keys (server-side repeat: held arrow
+     *    keys keep moving; client-visible keys are never repeated by
+     *    the server — clients repeat via repeat_info). The press
+     *    is consumed like a shortcut press so its release never leaks
+     *    to the client as a stray event. */
     struct xw_window *iw = xw_wm_interactive_window(s->comp->wm);
-    if (iw && xw_wm_interactive_key(s->comp->wm, iw, keycode, down))
+    if (iw && xw_wm_interactive_key(s->comp->wm, iw, keycode, down)) {
+        if (down) {
+            arm_interactive_repeat(s, keycode);
+            mark_consumed(s, keycode, true);
+        } else if (s->repeat_active && keycode == s->repeat_key)
+            disarm_interactive_repeat(s);
         return;
+    }
+    if (!down && s->repeat_active && keycode == s->repeat_key)
+        disarm_interactive_repeat(s);
 
     /* 3. deliver to the focused client (evdev + 8) */
     if (!s->kb_focus || wl_list_empty(&s->keyboards))
@@ -613,6 +671,24 @@ struct xw_seat *xw_seat_create(struct xw_compositor *c, const char *name) {
     s->keymap_fd = fd;
     s->keymap_area = km;
 
+    /* key repeat parameters (config: keyboard.conf / xw_compositor_config;
+     * see the defaults note at the top of this file) */
+    s->repeat_delay_ms =
+        c->conf.repeat_delay_ms > 0 ? c->conf.repeat_delay_ms
+                                    : XW_REPEAT_DELAY_DEFAULT_MS;
+    s->repeat_rate_hz =
+        c->conf.repeat_rate_hz > 0 ? c->conf.repeat_rate_hz
+                                   : XW_REPEAT_RATE_DEFAULT_HZ;
+    s->repeat_period_ms = 1000 / s->repeat_rate_hz;
+    if (s->repeat_period_ms < 1)
+        s->repeat_period_ms = 1; /* clamp for very high rates */
+    s->repeat_active = false;
+    s->repeat_key = 0;
+    s->repeat_src =
+        wl_event_loop_add_timer(c->loop, interactive_repeat_cb, s);
+    if (!s->repeat_src)
+        goto fail;
+
     s->global = wl_global_create(c->display, &wl_seat_interface,
                                  XW_SEAT_VERSION, s, bind_seat);
     if (!s->global)
@@ -644,6 +720,8 @@ void xw_seat_destroy(struct xw_seat *s) {
         wl_list_remove(s->pointers.next);
     while (!wl_list_empty(&s->resources))
         wl_list_remove(s->resources.next);
+    if (s->repeat_src)
+        wl_event_source_remove(s->repeat_src);
     if (s->keymap_fd >= 0)
         close(s->keymap_fd);
     free(s->keymap_area);

@@ -226,9 +226,44 @@ static void test_nested(struct xwt_ctx *t) {
     xw_compositor_destroy(a);
 }
 
+#ifdef XW_HAVE_X11_BACKEND
+/* X synthetic-repeat filter: with detectable auto-repeat the server
+ * re-sends KeyPress for held keys; those must be dropped because
+ * clients already repeat via wl_keyboard.repeat_info. */
+static void test_x11_repeat_filter(struct xwt_ctx *t) {
+    (void)t;
+    uint32_t pressed[8] = {0};
+
+    XWT_CHECK(xw_x11_key_filter(pressed, 30, true), "first press forwarded");
+    XWT_CHECK(!xw_x11_key_filter(pressed, 30, true),
+              "repeat press for a held key dropped");
+    XWT_CHECK(!xw_x11_key_filter(pressed, 30, true),
+              "another repeat still dropped");
+    XWT_CHECK(xw_x11_key_filter(pressed, 30, false), "release forwarded");
+    XWT_CHECK(xw_x11_key_filter(pressed, 30, true),
+              "press after release forwarded again");
+
+    /* different keys held at the same time do not interfere */
+    XWT_CHECK(xw_x11_key_filter(pressed, 42, true), "second key press");
+    XWT_CHECK(!xw_x11_key_filter(pressed, 42, true),
+              "second key repeat dropped");
+    XWT_CHECK(xw_x11_key_filter(pressed, 30, false),
+              "release of the other held key forwards");
+    XWT_CHECK(xw_x11_key_filter(pressed, 30, true),
+              "press after that release forwards");
+
+    /* out-of-bitmap range: forwarded untouched, no crash */
+    XWT_CHECK(xw_x11_key_filter(pressed, 999, true), "large keycode passes");
+    XWT_CHECK(xw_x11_key_filter(pressed, 999, false), "large keycode release");
+}
+#endif
+
 __attribute__((constructor)) static void register_backends(void) {
     static const struct xwt_test tests[] = {
         {"nested-compositor", test_nested},
+#ifdef XW_HAVE_X11_BACKEND
+        {"x11-repeat-filter", test_x11_repeat_filter},
+#endif
     };
     xwt_register(tests, sizeof(tests) / sizeof(tests[0]));
 }

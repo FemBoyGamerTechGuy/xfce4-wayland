@@ -183,6 +183,39 @@ void xw_backend_destroy(struct xw_backend *b);
 /* destroys all outputs of the compositor (shared by backend destroys) */
 void xw_backend_destroy_outputs(struct xw_compositor *c);
 
+/* X11 synthetic key-repeat filter (libxw/xw-backend-x11.c; exposed for
+ * white-box tests — no X server needed to exercise the logic).
+ * With XKB detectable auto-repeat, the X server re-sends KeyPress for
+ * held keys; clients already repeat via wl_keyboard.repeat_info, so
+ * those synthetic presses must be dropped: a press of an already-down
+ * key is a repeat. pressed_words is an 8-word bitmap of linux
+ * keycodes; returns whether the event should be forwarded. */
+bool xw_x11_key_filter(uint32_t *pressed_words, uint32_t linux_keycode,
+                       bool down);
+
+/* --------------------------------------------------------- real input */
+/* libinput-backed input source (xw-input-libinput.c). Build-time
+ * optional: the module is compiled only when libinput was found
+ * (XW_LIBINPUT); callers guard with XW_HAVE_LIBINPUT. */
+struct xw_input_libinput;
+struct xw_input_libinput *xw_input_libinput_create(struct xw_compositor *c);
+void xw_input_libinput_destroy(struct xw_input_libinput *in);
+
+/* Event handlers: the real translation pipeline used by the libinput
+ * event loop, callable directly (white-box tests, no hardware).
+ * Coordinates are output-layout logical pixels; keycodes/buttons are
+ * raw linux input codes. */
+void xw_input_handle_key(struct xw_input_libinput *in, uint32_t linux_keycode,
+                         bool down);
+void xw_input_handle_pointer_rel(struct xw_input_libinput *in, double dx,
+                                 double dy);
+void xw_input_handle_pointer_abs(struct xw_input_libinput *in, double nx,
+                                 double ny);
+void xw_input_handle_button(struct xw_input_libinput *in,
+                            uint32_t linux_button, bool down);
+void xw_input_handle_axis(struct xw_input_libinput *in, uint32_t axis,
+                          double value, bool continuous);
+
 /* ------------------------------------------------------------------- seat */
 struct xw_window;
 
@@ -210,6 +243,16 @@ struct xw_seat {
 
     uint32_t serial;            /* input event serial */
     int32_t cursor_x, cursor_y;
+
+    /* key repeat (see xw.h struct xw_compositor_config): advertised to
+     * clients via wl_keyboard.repeat_info; the server-side timer
+     * repeats only keys consumed by interactive keyboard move/resize
+     * (client-visible keys are never server-repeated — clients repeat
+     * themselves per the Wayland protocol) */
+    int repeat_delay_ms, repeat_period_ms, repeat_rate_hz;
+    struct wl_event_source *repeat_src;
+    uint32_t repeat_key;        /* linux keycode currently repeating */
+    bool repeat_active;
 
     /* keyboard focus */
     struct xw_surface *kb_focus;
@@ -536,6 +579,9 @@ struct xw_compositor {
     int n_children;
 
     struct xw_backend *backend;
+
+    /* real-input source (libinput; NULL when absent or disabled) */
+    struct xw_input_libinput *input;
 
     struct wl_list outputs;   /* xw_output.link */
     struct wl_list surfaces;  /* xw_surface.link */
