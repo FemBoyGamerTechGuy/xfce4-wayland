@@ -3,11 +3,25 @@
 
 The desktop clients (panel, exit dialog) must render text without pulling a
 font stack (fontconfig/freetype/pango) into the runtime dependency set. This
-build-time tool rasterizes ASCII 0x20..0x7E from a system TrueType font into
-per-glyph 8-bit alpha bitmaps; the generated data is compiled into the
-client library. The font file itself is never embedded or redistributed.
+build-time tool rasterizes ASCII 0x20..0x7E into per-glyph 8-bit alpha
+bitmaps; the generated data is compiled into the client library.
 
-Usage: genfont.py [-o OUTPUT] [--font PATH] [--size PX]
+Font source policy (distro-agnostic by design):
+
+  1. Default: the font bundled in this repository, assets/fonts/
+     DejaVuSans-ascii.ttf (a subset of DejaVu Sans 2.37, see
+     assets/fonts/README.md and THIRD-PARTY-LICENSES.md). It is always
+     present in a clean checkout, so no system font package is ever a build
+     requirement and the generated table is identical on every distribution.
+  2. --font PATH: explicit override (a packager can rasterize their own
+     TTF/OTF; Pillow must be able to open it).
+
+System fonts are deliberately NOT searched: font paths and names differ per
+distribution (/usr/share/fonts/truetype/... vs /usr/share/fonts/TTF/...),
+and relying on them made the build fail on systems where the documented
+package list was in fact installed.
+
+Usage: genfont.py -o OUTPUT [--font PATH] [--size PX]
 
 Output: a C header defining xw_glyph[] and xw_font_meta.
 """
@@ -16,11 +30,9 @@ import argparse
 import os
 import sys
 
-DEFAULT_FONT_CANDIDATES = [
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/chinese/NotoSansSC-Regular.ttf",
-    "/usr/share/fonts/truetype/english/Tinos-Regular.ttf",
-]
+# tools/genfont.py -> repository root (works from any cwd, also in build copies)
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BUNDLED_FONT = os.path.join(REPO_ROOT, "assets", "fonts", "DejaVuSans-ascii.ttf")
 
 START, END = 0x20, 0x7E  # printable ASCII
 
@@ -28,31 +40,56 @@ START, END = 0x20, 0x7E  # printable ASCII
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("-o", "--output", required=True)
-    ap.add_argument("--font")
+    ap.add_argument("--font",
+                    help="explicit font file to rasterize (default: the "
+                         "font bundled in this repository)")
     ap.add_argument("--size", type=int, default=16)
     args = ap.parse_args()
 
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError:
-        print("error: Pillow is required at build time (python3 -m pip install pillow)",
+        print("error: the Pillow python module is required at build time to\n"
+              "       rasterize the bundled font into the client bitmap font.\n"
+              "       Install your distribution's package (python3-pil on\n"
+              "       Debian/Ubuntu, python-pillow on Arch/Artix,\n"
+              "       python3-pillow on Fedora/openSUSE; see BUILDING.md), or\n"
+              "       run: python3 -m pip install --user pillow",
               file=sys.stderr)
         return 1
 
     font_path = args.font
-    if not font_path:
-        for c in DEFAULT_FONT_CANDIDATES:
-            if os.path.exists(c):
-                font_path = c
-                break
-    if not font_path or not os.path.exists(font_path):
-        print("error: no usable system TTF font found", file=sys.stderr)
+    if font_path:
+        if not os.path.exists(font_path):
+            print("error: --font '%s' does not exist" % font_path,
+                  file=sys.stderr)
+            return 1
+        source_note = os.path.basename(font_path) + " (explicit --font)"
+    else:
+        font_path = BUNDLED_FONT
+        if not os.path.exists(font_path):
+            print("error: the bundled font asset is missing:\n"
+                  "       expected: %s\n"
+                  "       It ships in the repository and is the default\n"
+                  "       build-time font source (no system font is used).\n"
+                  "       A missing asset means a damaged checkout — restore it\n"
+                  "       with: git checkout -- assets/fonts\n"
+                  "       or re-extract the release archive." % font_path,
+                  file=sys.stderr)
+            return 1
+        source_note = os.path.basename(font_path) + " (bundled asset, see assets/fonts/README.md)"
+
+    try:
+        font = ImageFont.truetype(font_path, args.size)
+    except Exception as e:
+        print("error: could not open '%s' as a font: %s\n"
+              "       (Pillow/%s)" % (font_path, e,
+                                    getattr(Image, "__version__", "?")),
+              file=sys.stderr)
         return 1
 
-    font = ImageFont.truetype(font_path, args.size)
     glyphs = {}
     ascent, descent = font.getmetrics()
-    max_w = 0
     for cp in range(START, END + 1):
         ch = chr(cp)
         try:
@@ -67,13 +104,19 @@ def main() -> int:
         d = ImageDraw.Draw(img)
         d.text((-bbox[0] + 1, -bbox[1] + 1), ch, font=font, fill=255)
         glyphs[cp] = (w + 2, h + 2, img)
-        max_w = max(max_w, w + 2)
+
+    if len(glyphs) < (END - START + 1) // 2:
+        print("error: '%s' provides only %d of %d ASCII glyphs — unusable"
+              % (font_path, len(glyphs), END - START + 1), file=sys.stderr)
+        return 1
 
     line_h = ascent + descent
     out = ["/* Generated by tools/genfont.py — DO NOT EDIT.",
-           " * Rasterized at build time from: " + os.path.basename(font_path),
-           " * (see THIRD-PARTY-LICENSES.md). Only bitmap data is used;",
-           " * the font file itself is not embedded or redistributed.",
+           " * Rasterized at build time from: " + source_note,
+           " * The bundled asset is a subset of DejaVu Sans 2.37 — license",
+           " * and provenance: assets/fonts/LICENSE-DejaVuSans.txt and",
+           " * THIRD-PARTY-LICENSES.md. Only bitmap data is compiled in; the",
+           " * font file itself is used at build time only.",
            " */",
            "#ifndef XW_FONT_DATA_H",
            "#define XW_FONT_DATA_H",
@@ -116,9 +159,13 @@ def main() -> int:
     out.append("")
     out.append("#endif")
 
+    outdir = os.path.dirname(os.path.abspath(args.output))
+    if outdir and not os.path.isdir(outdir):
+        os.makedirs(outdir, exist_ok=True)
     with open(args.output, "w") as f:
         f.write("\n".join(out) + "\n")
-    print("genfont: %d glyphs, line height %d -> %s" % (len(glyphs), line_h, args.output))
+    print("genfont: %d glyphs, line height %d, source: %s -> %s"
+          % (len(glyphs), line_h, os.path.basename(font_path), args.output))
     return 0
 
 

@@ -29,24 +29,26 @@ file are preserved verbatim.
 | C runtime | glibc | LGPL-2.1+ | Dynamically linked | Yes — LGPL dynamic-linking exception |
 | Protocol definitions | `wayland-protocols` (1.44) | MIT | Processed at build time by wayland-scanner into C glue | Yes |
 | Font rasterization (build only) | Pillow (11.x), Python 3 | HPND (historical permission notice, BSD-like) / PSF | Build-time tool | Yes — build tools do not affect shipped code licensing |
-| Glyph source (build only) | DejaVu Sans TTF | DejaVu license (free, permission-based, with attribution requirement) | Rasterized to bitmap glyph data at build time; the font file is **not** embedded or redistributed; the bitmap table is generated locally per build | Yes — DejaVu license permits use/modification; we keep attribution here |
+| Glyph source (bundled asset) | `assets/fonts/DejaVuSans-ascii.ttf` — subset of **DejaVu Sans 2.37** | Bitstream Vera license + Arev license + public-domain DejaVu changes (full verbatim text: `assets/fonts/LICENSE-DejaVuSans.txt`, also embedded in the font's `name` table) | Rasterized to bitmap glyph data at build time by `tools/genfont.py`; **the font file is committed and redistributed with this repository** (43,932 bytes, ASCII U+0020..U+007E subset created with pyftsubset; name table, layout features and hinting preserved; rendering verified bit-identical to the full font) | Yes — the license permits redistribution and modification provided this license text accompanies the font; the retained name "DejaVu Sans" contains neither "Bitstream" nor "Vera", satisfying the rename condition for modified derivatives |
 
-**Attribution for DejaVu Sans** (as required by its license when derived
-works are distributed):
+**Attribution for the bundled DejaVu Sans subset** (as required by its
+license when derived works are distributed):
 
     DejaVu fonts v2.37
     Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved.
     Bitstream Vera is a trademark of Bitstream, Inc.
     DejaVu changes: Copyright (c) 2006-2023 DejaVu Project contributors
-    (https://github.com/dejavu-fonts/dejavu-fonts). Permission is hereby
-    granted, free of charge, to copy the fonts and use, modify, sell
-    and/or redistribute them. See the full license text at
-    https://github.com/dejavu-fonts/dejavu-fonts/blob/master/LICENSE.
+    (https://github.com/dejavu-fonts/dejavu-fonts), public domain.
+    Glyphs imported from Arev fonts: Copyright (c) 2006 Tavmjong Bah.
+    Permission is hereby granted, free of charge, to copy the fonts
+    and use, modify, sell and/or redistribute them. The full license
+    text ships with the asset: assets/fonts/LICENSE-DejaVuSans.txt
+    (upstream: https://github.com/dejavu-fonts/dejavu-fonts/blob/master/LICENSE).
 
-If the build falls back to another font file (Noto Sans SC: SIL OFL 1.1;
-Tinos: Apache 2.0), the generated file records which font was used, and the
-corresponding notice applies; none of those licenses restrict embedding of
-rendered glyph bitmaps.
+The generated `build/gen/xw-font-data.h` records its font source in the
+header comment; a packager overriding `make XW_FONT=path` rasterizes a
+different file and must add the corresponding notice here. No system
+font is ever searched at build time.
 
 ## 3. Code copied or adapted from XFCE
 

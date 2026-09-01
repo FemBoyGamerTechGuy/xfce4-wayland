@@ -28,7 +28,7 @@ rules apply and are documented.
 | **libudev** (via libinput) | udev-seat device discovery + hotplug for libinput | 183 | LGPL-2.1+ | runtime (libinput dep) | – | ✔ | – | with libinput | LGPL: relinking rights + license notice on redistribution |
 | **libX11** | nested X11 backend: window, XPutImage present path, XKB detectable-autorepeat handling | any (1.6+) | MIT | both (backend optional) | ✔ (X11 parents, XLibre) | – | ✔ | **yes** (`XW_X11`) | none |
 | **libXtst / libXi** | XTEST synthetic input for the process-level X11 backend tests | 1.2 / 1.5 | MIT | dev/test only | ✔ (tests) | – | – | yes (`make check` only) | none |
-| **python3 + Pillow** | build-time bitmap font rasterization (`tools/genfont.py`); no runtime font stack | py3.8+ / Pillow 9+ | PSF / HPND-MIT | build only | ✔ | ✔ | ✔ | no (build) | none |
+| **python3 + Pillow** | build-time bitmap font rasterization (`tools/genfont.py`) of the bundled `assets/fonts/DejaVuSans-ascii.ttf`; no runtime font stack, **no system font package** | py3.8+ / Pillow 9+ | PSF / HPND-MIT (font asset: DejaVu license, see THIRD-PARTY-LICENSES.md) | build only | ✔ | ✔ | ✔ | no (build) | none |
 | **xkeyboard-config** | xkb keymap data (`evdev/pc105/us` + configured layouts) | any recent | MIT/HPND | **runtime only** | ✔ | ✔ | – | no (runtime) | none |
 | **loginctl (systemd-logind or elogind)** | power actions (suspend/hibernate/poweroff/reboot) without root; later: session/seat/DRM-master acquisition | any | LGPL-2.1+ (systemd) / MIT-0 (elogind) | **runtime only** (probed, never linked) | ✔ | ✔ (planned) | – | yes (fails honestly without it) | none (external program) |
 | **Xvfb** | virtual X server driving the X11-backend process checks | any | MIT | dev/test only | ✔ (tests) | – | – | yes | none |
@@ -56,9 +56,11 @@ rules apply and are documented.
 - **libX11**: only for the *nested X11* backend — the development
   workflow for users living in X11/XLibre sessions. The core never
   links it when built with `XW_X11=0`.
-- **Pillow**: build-time only, replaces a runtime font stack
-  (fontconfig/freetype/harfbuzz) with a 95-glyph generated bitmap —
-  the entire client surface stays font-free.
+- **Pillow**: build-time only, rasterizes the bundled font subset
+  (a 43 KB licensed DejaVu Sans asset ships in the repository) into a
+  95-glyph generated bitmap — the entire client surface stays
+  font-free and the build never touches a system font (which made
+  builds fail on distributions with different font layouts).
 
 ## Explicitly rejected
 

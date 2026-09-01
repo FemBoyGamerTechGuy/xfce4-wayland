@@ -21,6 +21,8 @@
 #                          `make clean`; the guard enforces it)
 #   prefix=DIR             installation prefix ($HOME/.local works)
 #   CC/AR/CFLAGS/LDFLAGS   standard toolchain overrides
+#   XW_FONT=PATH           override the build-time font source
+#                          (default: bundled assets/fonts asset)
 
 # Optional local overrides (sysroot, CC, extra flags).
 -include config.local.mk
@@ -143,6 +145,21 @@ endif
 ifeq ($(wildcard $(WP_DIR)),)
 $(error the wayland-protocols data directory was not found (looked for $(WP_DIR)). The xdg-shell/activation/ext-workspace XMLs are required at build time. Install the wayland-protocols package of your distribution.)
 endif
+ifeq ($(shell command -v $(PYTHON) >/dev/null 2>&1 && echo y),)
+$(error $(PYTHON) was not found. It runs the build-time generators (font rasterization, Makefile feature wiring). Install python3, or pass PYTHON=/path/to/python3.)
+endif
+ifeq ($(shell $(PYTHON) -c 'import PIL' 2>/dev/null && echo y),)
+$(error the Pillow python module is required at build time to rasterize the bundled font into the client bitmap font. Install your distribution's package (python3-pil on Debian/Ubuntu, python-pillow on Arch/Artix, python3-pillow on Fedora/openSUSE; see BUILDING.md) or run: $(PYTHON) -m pip install --user pillow)
+endif
+ifneq ($(XW_FONT),)
+ifeq ($(wildcard $(XW_FONT)),)
+$(error XW_FONT is set to '$(XW_FONT)' but that file does not exist.)
+endif
+else
+ifeq ($(wildcard assets/fonts/DejaVuSans-ascii.ttf),)
+$(error the bundled font asset assets/fonts/DejaVuSans-ascii.ttf is missing. It is the default build-time font source (no system font is needed or searched). A missing asset means a damaged checkout; restore it with: git checkout -- assets/fonts)
+endif
+endif
 endif # XW_SKIP_DEPS
 
 # ------------------------------------------------ optional components
@@ -228,11 +245,17 @@ GEN_PROTO_SRC += $(GEN)/$(2)-protocol.c
 endef
 $(foreach p,$(PROT_PAIRS),$(eval $(call PROT_RULE,$(word 1,$(subst |, ,$(p))),$(word 2,$(subst |, ,$(p))))))
 
-# Font bitmap generation (build-time; runtime has no font dependency)
+# Font bitmap generation (build-time; runtime has no font dependency).
+# Default source: the font bundled in assets/fonts/ -- distro-agnostic
+# and deterministic (no system font is searched or required; see
+# assets/fonts/README.md). XW_FONT=PATH overrides the source file for
+# packagers who want to rasterize their own font (needs Pillow).
+XW_FONT ?=
+XW_FONT_DEP := $(if $(XW_FONT),$(XW_FONT),assets/fonts/DejaVuSans-ascii.ttf)
 GEN_HEADERS += $(GEN)/xw-font-data.h
 
-$(GEN)/xw-font-data.h: tools/genfont.py | $(GEN)
-	$(PYTHON) tools/genfont.py -o $@
+$(GEN)/xw-font-data.h: tools/genfont.py $(XW_FONT_DEP) | $(GEN)
+	$(PYTHON) tools/genfont.py -o $@ $(if $(XW_FONT),--font $(XW_FONT))
 
 # consolidated directory rule
 DIRECTORIES := $(GEN) $(OBJ)/libxw $(OBJ)/libxwcl $(OBJ)/compositor \
@@ -440,4 +463,5 @@ config:
 	@echo "  pixman         $(shell pkg-config --modversion pixman-1 2>/dev/null || echo missing)"
 	@echo "  X11 backend    $(if $(X11_ON),yes (libX11 $(shell pkg-config --modversion x11 2>/dev/null)),no)"
 	@echo "  libinput       $(if $(LIBINPUT_ON),yes ($(shell pkg-config --modversion libinput 2>/dev/null)),no)"
+	@echo "  font source    $(if $(XW_FONT),$(XW_FONT) (XW_FONT override),bundled asset assets/fonts/DejaVuSans-ascii.ttf)"
 	@echo "  install prefix $(prefix)"
