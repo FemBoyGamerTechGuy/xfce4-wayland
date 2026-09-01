@@ -302,8 +302,8 @@ build/bin/xw-compositor: $(OBJ)/compositor/xw-compositor.o build/lib/libxw.a bui
 $(OBJ)/compositor/%.o: src/compositor/%.c $(LIBXW_DEPS) $(GEN_HEADERS) | $(OBJ)/compositor
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_XKB) $(CFLAGS_PIX) -c $< -o $@
 
-build/bin/xw-session: $(OBJ)/session/xw-session.o | build/bin
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/session/xw-session.o $(LDLIBS_M)
+build/bin/xw-session: $(OBJ)/session/xw-session.o $(OBJ)/session/xw-power.o | build/bin
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/session/xw-session.o $(OBJ)/session/xw-power.o $(LDLIBS_M)
 
 build/bin/xw-session-ctl: $(OBJ)/session/xw-session-ctl.o | build/bin
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)/session/xw-session-ctl.o $(LDLIBS_M)
@@ -316,8 +316,8 @@ $(OBJ)/session/%.o: src/session/%.c | $(OBJ)/session
 build/bin/xw-panel: $(OBJ)/clients/xw-panel.o $(OBJ)/clients/xw-ctl.o build/lib/libxwcl.a | build/bin
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-panel.o $(OBJ)/clients/xw-ctl.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
 
-build/bin/xw-exit: $(OBJ)/clients/xw-exit.o $(OBJ)/clients/xw-ctl.o build/lib/libxwcl.a | build/bin
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-exit.o $(OBJ)/clients/xw-ctl.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
+build/bin/xw-exit: $(OBJ)/clients/xw-exit.o $(OBJ)/clients/xw-ctl.o $(OBJ)/session/xw-power.o build/lib/libxwcl.a | build/bin
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-exit.o $(OBJ)/clients/xw-ctl.o $(OBJ)/session/xw-power.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
 
 build/bin/xw-demo: $(OBJ)/clients/xw-demo.o build/lib/libxwcl.a | build/bin
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-demo.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)

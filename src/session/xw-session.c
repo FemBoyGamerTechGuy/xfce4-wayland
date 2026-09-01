@@ -27,6 +27,8 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+#include "xw-power.h"
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -179,15 +181,41 @@ static const char *find_compositor(void) {
     return "xw-compositor"; /* PATH fallback */
 }
 
+/* user configuration directory: $XDG_CONFIG_HOME/xfce4-wayland
+ * (created on first run so the INI files short-cuts and rules live in
+ * actually take effect inside the session) */
+static const char *user_config_dir(void) {
+    static char dir[512];
+    const char *base = getenv("XDG_CONFIG_HOME");
+    if (!base || !*base) {
+        static char home[448];
+        const char *h = getenv("HOME");
+        if (!h || !*h)
+            return NULL;
+        snprintf(home, sizeof(home), "%s/.config", h);
+        base = home;
+    }
+    snprintf(dir, sizeof(dir), "%s/xfce4-wayland", base);
+    mkdir(dir, 0700); /* fine if it exists */
+    return dir;
+}
+
 /* spawn the compositor; returns pid, or -1 */
 static pid_t start_compositor(void) {
     int outpipe[2];
     if (pipe(outpipe) < 0)
         return -1;
 
-    /* build the argument list: -q plus the backend when nesting */
-    const char *args[8] = {find_compositor(), "-q", NULL, NULL, NULL, NULL, NULL, NULL};
+    /* build the argument list: -q, the user config dir, and the
+     * backend when nesting */
+    const char *args[12] = {find_compositor(), "-q", NULL, NULL, NULL,
+                            NULL, NULL, NULL, NULL, NULL, NULL, NULL};
     int nargs = 2;
+    const char *conf = user_config_dir();
+    if (conf) {
+        args[nargs++] = "--config-dir";
+        args[nargs++] = conf;
+    }
     if (S.nested) {
         const char *be = nested_backend_arg();
         if (!be) {
@@ -420,21 +448,6 @@ static const char *exit_dialog_command(void) {
 
 /* ------------------------------------------------------------ control */
 
-/* power management via loginctl (works with logind and elogind) */
-static bool power_action(const char *verb) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "loginctl %s", verb);
-    int rc = system(cmd);
-    if (rc == -1 || !WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
-        log_msg("error",
-                "power action '%s' failed (no logind/elogind or not "
-                "permitted)",
-                verb);
-        return false;
-    }
-    return true;
-}
-
 static void session_shutdown(bool restart) {
     if (S.shutting_down)
         return;
@@ -484,25 +497,53 @@ static void handle_ctl_line(int fd, char *line) {
         g_terminate = 1;
         return;
     }
+    if (strcmp(line, "power-status") == 0) {
+        struct xw_power_caps caps;
+        xw_power_probe(&caps);
+        char buf[768];
+        snprintf(buf, sizeof(buf),
+                 "ok loginctl=%s suspend=%s%s hibernate=%s%s poweroff=%s%s "
+                 "reboot=%s%s",
+                 caps.loginctl_ok ? "yes" : "no",
+                 caps.suspend ? "yes" : "no:",
+                 caps.suspend ? "" : caps.suspend_reason,
+                 caps.hibernate ? "yes" : "no:",
+                 caps.hibernate ? "" : caps.hibernate_reason,
+                 caps.poweroff ? "yes" : "no:",
+                 caps.poweroff ? "" : caps.poweroff_reason,
+                 caps.reboot ? "yes" : "no:",
+                 caps.reboot ? "" : caps.reboot_reason);
+        /* one line: fold reasons to '_' for the line protocol */
+        for (char *p = buf; *p; p++)
+            if (*p == ' ')
+                *p = '_';
+        send_line(fd, buf);
+        return;
+    }
     if (strcmp(line, "shutdown") == 0 || strcmp(line, "reboot") == 0 ||
         strcmp(line, "suspend") == 0 || strcmp(line, "hibernate") == 0) {
-        if (strcmp(line, "shutdown") == 0 && power_action("poweroff")) {
+        char err[192] = {0};
+        if (strcmp(line, "shutdown") == 0 &&
+            xw_power_exec("poweroff", err, sizeof(err))) {
             send_line(fd, "ok powering off");
             session_shutdown(false);
-        } else if (strcmp(line, "reboot") == 0 && power_action("reboot")) {
+        } else if (strcmp(line, "reboot") == 0 &&
+                   xw_power_exec("reboot", err, sizeof(err))) {
             send_line(fd, "ok rebooting");
             session_shutdown(false);
         } else if (strcmp(line, "suspend") == 0 &&
-                   power_action("suspend")) {
+                   xw_power_exec("suspend", err, sizeof(err))) {
             send_line(fd, "ok suspending");
             /* suspend does not end the session */
         } else if (strcmp(line, "hibernate") == 0 &&
-                   power_action("hibernate")) {
+                   xw_power_exec("hibernate", err, sizeof(err))) {
             send_line(fd, "ok hibernating");
         } else {
-            send_line(fd,
-                      "error power management unavailable (loginctl "
-                      "failed)");
+            char reply[256];
+            snprintf(reply, sizeof(reply),
+                     "error power management unavailable%s%s",
+                     err[0] ? ": " : "", err);
+            send_line(fd, reply);
         }
         return;
     }

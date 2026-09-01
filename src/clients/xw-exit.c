@@ -10,6 +10,7 @@
  */
 #include "xwc.h"
 #include "xw-ctl.h"
+#include "../session/xw-power.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,11 +44,17 @@ static const struct {
     {"Cancel", NULL, 'c'},
 };
 
+/* power-action availability (probed once at startup; logout/restart/
+ * cancel are always available — they are pure session operations) */
+static bool g_avail[N_BUTTONS];
+static char g_reason[N_BUTTONS][192];
+
 #define BTN_W 190
 #define BTN_H 36
 #define BTN_GAP 10
 #define MARGIN 24
 #define TITLE_H 46
+#define FOOT_H 24 /* reason line for unavailable actions */
 
 /* keysyms we care about */
 #define XK_Escape 0xff1b
@@ -82,7 +89,8 @@ static void draw(struct exit_dialog *d, struct xwc_layer *layer) {
     /* modal backdrop: dark translucent panel */
     xwc_fill_rect(pix, stride, w, 720, 0, 0, w, 720, 0xd8222226);
     int pw = BTN_W * 2 + BTN_GAP + MARGIN * 2; /* two columns */
-    int ph = TITLE_H + (BTN_H + BTN_GAP) * ((N_BUTTONS + 1) / 2) + MARGIN;
+    int ph = TITLE_H + (BTN_H + BTN_GAP) * ((N_BUTTONS + 1) / 2) +
+             MARGIN + FOOT_H;
     int px = (w - pw) / 2, py = (720 - ph) / 2;
     xwc_draw_box(pix, stride, w, 720, px, py, pw, ph, 0xff2e3440,
                  0xff8fa4b8);
@@ -96,16 +104,32 @@ static void draw(struct exit_dialog *d, struct xwc_layer *layer) {
         int col = i % 2, row = i / 2;
         int bx = px + MARGIN + col * (BTN_W + BTN_GAP);
         int by = py + TITLE_H + row * (BTN_H + BTN_GAP);
-        uint32_t fill = i == d->sel ? 0xff3584e4 : 0xff3b4252;
-        uint32_t border = i == d->sel ? 0xffffffff : 0xff4c566a;
+        bool live = g_avail[i];
+        uint32_t fill = !live ? 0xff262a31
+                       : i == d->sel ? 0xff3584e4
+                                     : 0xff3b4252;
+        uint32_t border = !live ? 0xff3b4252
+                        : i == d->sel ? 0xffffffff
+                                      : 0xff4c566a;
         xwc_draw_box(pix, stride, w, 720, bx, by, BTN_W, BTN_H, fill,
                      border);
         const char *label = buttons[i].label;
         int lx = bx + (BTN_W - xwc_text_width(label)) / 2;
-        xwc_draw_text(pix, stride, w, 720, lx, by + 8, label, 0xffffffff);
+        uint32_t label_col = live ? 0xffffffff : 0xff6a7080;
+        xwc_draw_text(pix, stride, w, 720, lx, by + 8, label, label_col);
         /* hotkey hint */
         char hint[3] = {buttons[i].hotkey, ')', 0};
-        xwc_draw_text(pix, stride, w, 720, bx + 8, by + 8, hint, 0x88c0d0ff);
+        xwc_draw_text(pix, stride, w, 720, bx + 8, by + 8, hint,
+                      live ? 0x88c0d0ff : 0xff4c566a);
+    }
+
+    /* reason line: why the selected action is unavailable */
+    const char *reason =
+        g_avail[d->sel] ? "" : g_reason[d->sel];
+    if (reason[0]) {
+        int rx = px + (pw - xwc_text_width(reason)) / 2;
+        int ry = py + TITLE_H + ((N_BUTTONS + 1) / 2) * (BTN_H + BTN_GAP) + 4;
+        xwc_draw_text(pix, stride, w, 720, rx, ry, reason, 0xffd08770);
     }
     xwc_layer_commit(layer);
 }
@@ -126,6 +150,10 @@ static void on_key(struct xwc_win *win, uint32_t keycode, bool down,
         d->done = true;
         break;
     case XK_Return:
+        if (!g_avail[d->sel]) {
+            draw(d, d->layer); /* show the reason */
+            break;
+        }
         if (buttons[d->sel].cmd)
             d->done = xw_ctl_send(buttons[d->sel].cmd, d->reply,
                                    sizeof(d->reply)) ||
@@ -150,6 +178,10 @@ static void on_key(struct xwc_win *win, uint32_t keycode, bool down,
                      ? (xkb_keysym_t)(buttons[i].hotkey - 'a' + 'A')
                      : (xkb_keysym_t)0) == keysym) {
                 d->sel = i;
+                if (!g_avail[i]) {
+                    draw(d, d->layer); /* show the reason */
+                    return;
+                }
                 if (buttons[i].cmd)
                     d->done = xw_ctl_send(buttons[i].cmd, d->reply,
                                            sizeof(d->reply)) ||
@@ -176,15 +208,20 @@ static void on_button(struct xwc_win *win, uint32_t button, bool down, int x,
     (void)pix;
     w = stride;
     int pw = BTN_W * 2 + BTN_GAP + MARGIN * 2;
-    int ph = TITLE_H + (BTN_H + BTN_GAP) * ((N_BUTTONS + 1) / 2) + MARGIN;
+    int ph = TITLE_H + (BTN_H + BTN_GAP) * ((N_BUTTONS + 1) / 2) +
+             MARGIN + FOOT_H;
     int px = (w - pw) / 2, py = (720 - ph) / 2;
     for (int i = 0; i < N_BUTTONS; i++) {
         int col = i % 2, row = i / 2;
         int bx = px + MARGIN + col * (BTN_W + BTN_GAP);
         int by = py + TITLE_H + row * (BTN_H + BTN_GAP);
         if (x >= bx && x < bx + BTN_W && y >= by && y < by + BTN_H) {
+            d->sel = i;
+            if (!g_avail[i]) {
+                draw(d, d->layer); /* unavailable: show the reason */
+                return;
+            }
             if (buttons[i].cmd) {
-                d->sel = i;
                 d->done = xw_ctl_send(buttons[i].cmd, d->reply,
                                        sizeof(d->reply)) ||
                           true;
@@ -205,7 +242,8 @@ static void on_motion(struct xwc_win *win, int x, int y, void *ud) {
     (void)pix;
     w = stride;
     int pw = BTN_W * 2 + BTN_GAP + MARGIN * 2;
-    int ph = TITLE_H + (BTN_H + BTN_GAP) * ((N_BUTTONS + 1) / 2) + MARGIN;
+    int ph = TITLE_H + (BTN_H + BTN_GAP) * ((N_BUTTONS + 1) / 2) +
+             MARGIN + FOOT_H;
     int px = (w - pw) / 2, py = (720 - ph) / 2;
     for (int i = 0; i < N_BUTTONS; i++) {
         int col = i % 2, row = i / 2;
@@ -242,6 +280,39 @@ int main(int argc, char **argv) {
     }
     struct exit_dialog d = {0};
     d.sel = BTN_LOGOUT;
+
+    /* probe power capabilities once: unavailable actions render dim
+     * with their reason instead of failing silently later */
+    struct xw_power_caps caps;
+    xw_power_probe(&caps);
+    for (int i = 0; i < N_BUTTONS; i++) {
+        g_avail[i] = true;
+        switch (i) {
+        case BTN_SUSPEND:
+            g_avail[i] = caps.suspend;
+            snprintf(g_reason[i], sizeof(g_reason[i]), "%s: %s",
+                     "Suspend unavailable", caps.suspend_reason);
+            break;
+        case BTN_HIBERNATE:
+            g_avail[i] = caps.hibernate;
+            snprintf(g_reason[i], sizeof(g_reason[i]), "%s: %s",
+                     "Hibernate unavailable", caps.hibernate_reason);
+            break;
+        case BTN_REBOOT:
+            g_avail[i] = caps.reboot;
+            snprintf(g_reason[i], sizeof(g_reason[i]), "%s: %s",
+                     "Reboot unavailable", caps.reboot_reason);
+            break;
+        case BTN_SHUTDOWN:
+            g_avail[i] = caps.poweroff;
+            snprintf(g_reason[i], sizeof(g_reason[i]), "%s: %s",
+                     "Shutdown unavailable", caps.poweroff_reason);
+            break;
+        default:
+            g_reason[i][0] = 0; /* session ops are always available */
+            break;
+        }
+    }
 
     if (xwc_connect(&d.c, socket_name) < 0)
         return 1;

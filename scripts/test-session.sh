@@ -88,6 +88,11 @@ has_wayland_socket() {
 
 echo "== session 1: supervision + ctl protocol + logout =="
 
+# deterministic power environment: a bogus sleep-modes file makes
+# suspend/hibernate unavailable on any host (a real loginctl would
+# otherwise actually suspend dev machines running the suite)
+export XW_POWER_STATE_PATH="$RTD/nonexistent-power-state"
+
 "$BIN/xw-session" -n >"$LOG" 2>&1 &
 SESS_PID=$!
 
@@ -102,10 +107,18 @@ reply="$("$BIN/xw-session-ctl" status 2>/dev/null)"
 check "status reports compositor=running" \
     'case "$reply" in *compositor=running*) true ;; *) false ;; esac'
 
-# power management without logind/elogind must fail honestly (no pretending)
+# power-status: honest capability report (suspend forced off by the
+# bogus state file; loginctl yes/no depends on the host)
+reply="$("$BIN/xw-session-ctl" power-status 2>/dev/null)"
+check "power-status reports suspend unavailable with reason" \
+    'case "$reply" in "ok_loginctl="*"suspend=no:"*) true ;; *) false ;; esac'
+check "power-status reports hibernate unavailable with reason" \
+    'case "$reply" in "ok_loginctl="*"hibernate=no:"*) true ;; *) false ;; esac'
+
+# power management must fail honestly when unavailable (no pretending)
 reply="$("$BIN/xw-session-ctl" suspend 2>/dev/null)"
-check "suspend without logind -> honest error" \
-    'case "$reply" in "error power management unavailable"*) true ;; ok*) true ;; *) false ;; esac'
+check "suspend unavailable -> honest error" \
+    'case "$reply" in "error power management unavailable"*) true ;; *) false ;; esac'
 
 # session manager and compositor still alive after failed power action
 check "session survives failed power action" 'kill -0 "$SESS_PID" 2>/dev/null'
@@ -120,6 +133,61 @@ check "wayland socket removed" '! has_wayland_socket'
 check "compositor child gone" \
     'wait_for "[ -z \"$(pgrep -f xw-compositor 2>/dev/null)\" ]"'
 check "no unexpected errors in log" '! log_has_unexpected_error'
+
+echo
+echo "== session 1b: power backend (fake loginctl + fake sleep modes) =="
+
+# a fake loginctl that logs its arguments; hibernate fails with stderr
+FBIN="$RTD/fakebin"
+mkdir -p "$FBIN"
+cat >"$FBIN/loginctl" <<'FAKE'
+#!/bin/sh
+echo "loginctl $*" >>"$FAKE_LOG"
+if [ "$1" = "hibernate" ]; then
+    echo "Sleep verb 'hibernate' not supported" >&2
+    exit 1
+fi
+exit 0
+FAKE
+chmod +x "$FBIN/loginctl"
+export FAKE_LOG="$RTD/loginctl-calls.log"
+: >"$FAKE_LOG"
+printf 'freeze mem disk\n' >"$RTD/power-state"
+export XW_POWER_STATE_PATH="$RTD/power-state"
+
+PATH="$FBIN:$PATH" "$BIN/xw-session" -n >"$LOG" 2>&1 &
+SESS_PID=$!
+check "1b: control socket appears" \
+    'wait_for "[ -S \"$RTD/xw-session.sock\" ]"'
+
+reply="$("$BIN/xw-session-ctl" power-status 2>/dev/null)"
+check "1b: power-status sees working loginctl" \
+    'case "$reply" in "ok_loginctl=yes_suspend=yes_"*) true ;; *) false ;; esac'
+check "1b: power-status suspend=yes" \
+    'case "$reply" in *"suspend=yes_hibernate="*) true ;; *) false ;; esac'
+check "1b: power-status hibernate=yes" \
+    'case "$reply" in *"hibernate=yes_poweroff="*) true ;; *) false ;; esac'
+check "1b: power-status poweroff=yes" \
+    'case "$reply" in *"poweroff=yes_reboot="*) true ;; *) false ;; esac'
+
+reply="$("$BIN/xw-session-ctl" suspend 2>/dev/null)"
+check "1b: suspend -> ok (fake backend)" '[ "$reply" = "ok suspending" ]'
+check "1b: fake loginctl was invoked with suspend" \
+    'rg -q "^loginctl suspend$" "$FAKE_LOG"'
+
+reply="$("$BIN/xw-session-ctl" hibernate 2>/dev/null)"
+check "1b: hibernate failure carries backend stderr" \
+    'case "$reply" in "error power management unavailable: loginctl: Sleep verb"*) true ;; *) false ;; esac'
+
+# session still alive; clean logout
+check "1b: session alive after power round-trip" 'kill -0 "$SESS_PID" 2>/dev/null'
+"$BIN/xw-session-ctl" logout >/dev/null 2>&1
+check "1b: logout -> session exits" 'wait_pid_exit "$SESS_PID"'
+wait "$SESS_PID"
+check "1b: logout exit code 0" '[ "$?" -eq 0 ]'
+check "1b: no unexpected errors in log" '! log_has_unexpected_error'
+unset FAKE_LOG
+export XW_POWER_STATE_PATH="$RTD/nonexistent-power-state"
 
 echo
 echo "== session 2: XDG autostart filtering =="

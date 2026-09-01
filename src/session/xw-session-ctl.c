@@ -13,8 +13,9 @@ static int usage(const char *prog, int rc) {
             "Usage: %s [-S NAME] COMMAND\n"
             "       %s [-S NAME] run -- COMMAND [ARGS...]\n"
             "\n"
-            "Commands: status | ping | logout | restart | shutdown | reboot |\n"
-            "          suspend | hibernate | exit-dialog | run -- CMD...\n"
+            "Commands: status | ping | power-status | logout | restart |\n"
+            "          shutdown | reboot | suspend | hibernate |\n"
+            "          exit-dialog | run -- CMD...\n"
             "Connects to the session control socket ($XDG_RUNTIME_DIR/"
             "NAME.sock; default NAME=xw-session, matching xw-session -S).\n",
             prog, prog);
@@ -55,10 +56,11 @@ int main(int argc, char **argv) {
         }
         cmd = run_buf;
     } else {
-        static const char *known[] = {"status",      "ping",  "logout",
-                                      "restart",     "shutdown", "reboot",
-                                      "suspend",     "hibernate",
-                                      "exit-dialog"};
+        static const char *known[] = {"status",      "ping",
+                                      "power-status", "logout",
+                                      "restart",      "shutdown",
+                                      "reboot",       "suspend",
+                                      "hibernate",    "exit-dialog"};
         bool ok = false;
         for (unsigned i = 0; i < sizeof(known) / sizeof(known[0]); i++)
             if (strcmp(cmd, known[i]) == 0)
