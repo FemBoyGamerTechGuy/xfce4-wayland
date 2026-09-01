@@ -11,6 +11,12 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
   output-management) with provenance recorded.
 - DONE build-time bitmap font (DejaVu rasterized by tools/genfont.py;
   no runtime font dependency).
+- DONE build hardening (Phase 2.5): feature toggles (XW_X11/XW_LIBINPUT
+  = auto/1/0 with actionable diagnostics), PROFILE presets
+  (release/debug/asan) with a stale-tree guard, required-dependency
+  validation, install/uninstall with configurable prefix + DESTDIR,
+  `make config` summary, wayland-sessions .desktop entry, example
+  configs; zero-root verified end to end (BUILDING.md).
 
 ## M1 — Compositor core (libxw)
 - DONE `wl_display` server bootstrap, socket, globals registry.
@@ -27,8 +33,17 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
 - DONE nested backends (Phase 2): Wayland (a client of the parent via
   libxwcl) and X11 (libX11 + XPutImage present path, XTEST-verified
   input). `xw-compositor -B nested|x11`, `xw-session --nested`.
-- TODO DRM/KMS backend (Phase 4) for physical displays; libinput seat
-  backend for real devices; GL renderer path.
+- DONE real-input source (Phase 3 groundwork): libinput-backed input
+  module orthogonal to the output backends — udev seat mode (device
+  discovery + hotplug, for real sessions) and path mode
+  ($XW_INPUT_DEVICES, deterministic testing; also drives headless
+  debugging from real keyboards). `-I/--input auto|libinput|none`;
+  AUTO never touches system devices unless explicitly opted in.
+  Translation pipeline (clamping, sub-pixel accumulation, abs→layout,
+  v120 wheels) covered white-box at Level 1; the thin libinput_event
+  decoder is Level 3 (TESTING.md).
+- TODO DRM/KMS backend (Phase 4) for physical displays; GL renderer
+  path (the libinput source is the input half of that phase).
 - TODO presentation-time feedback.
 
 ## M2 — Shell + window management
@@ -62,7 +77,18 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
 - DONE xfwm4 4.20 default table (verified against the official
   docs.xfce.org keyboard-shortcuts page) + xfce4-settings command
   defaults; shortcuts.conf overrides.
-- TODO key repeat (configurable rate/delay).
+- DONE keysym canonicalization: modifier-produced variants
+  (Shift+Tab→ISO_Left_Tab, Alt+Print→Sys_Req, KP_Enter) match their
+  physical key like keycode-based matchers do — without it
+  Alt+Shift+Tab / Alt+Print bindings could never fire.
+- DONE key repeat, protocol-correct: wl_keyboard.repeat_info
+  (rate/delay, keyboard.conf + env overrides; 500ms/30Hz XFCE
+  defaults) lets clients repeat themselves; the server repeats ONLY
+  interactive keyboard move/resize keys; the X11 backend filters the
+  X server's synthetic repeats so keys are never delivered twice.
+- DONE full default-table coverage test (47/47 bindings dispatched
+  through the real key pipeline, modifiers as real keys, keypad
+  bindings under NumLock).
 - TODO touch input.
 - TODO xkb per-seat runtime layout switching.
 
@@ -91,21 +117,29 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
   OnlyShowIn/NotShowIn/Hidden + user-overrides-system), compositor
   supervision with bounded restarts, control socket line protocol,
   clean shutdown ordering (clients → compositor → sockets).
-- DONE xw-session-ctl: status/ping/logout/restart/shutdown/reboot/
-  suspend/hibernate/exit-dialog/run commands. Runtime spawns (exit
-  dialog, `run CMD`) are supervised session children: SIGTERM at
-  shutdown, reaped by the SIGCHLD loop.
-- DONE power actions via loginctl CLI; fails honestly when logind/
-  elogind is unavailable (asserted by the process-level test).
+- DONE xw-session-ctl: status/ping/power-status/logout/restart/
+  shutdown/reboot/suspend/hibernate/exit-dialog/run commands. Runtime
+  spawns (exit dialog, `run CMD`) are supervised session children:
+  SIGTERM at shutdown, reaped by the SIGCHLD loop.
+- DONE power backend (xw-power): loginctl liveness probe (works with
+  systemd-logind and elogind; a loginctl without a running daemon
+  reads as unavailable), kernel sleep-mode probing, capability report
+  with human-readable reasons, execution via fork+execvp (no shell)
+  with the backend's stderr captured into error replies. xw-session
+  passes the user config dir to the compositor (INI config actually
+  takes effect in sessions now).
 - DONE xw-exit graphical exit dialog (layer-shell modal overlay,
   exclusive keyboard, arrows/Enter/Escape/per-button hotkeys, mouse
-  hit-testing, ctl wiring for all six actions).
+  hit-testing, ctl wiring for all six actions); unavailable power
+  actions render dim with their reason and cannot be activated.
 - PART Ctrl+Alt+Delete fires the exit-dialog action; the dialog
   appears only if `cmd_exit` resolves to the xw-exit binary in the
   compositor's actions.conf search path (default shipped config does).
 - PART session restart path (re-exec) implemented but not covered by
   an automated test.
-- TODO session save/restore, screen lock, idle actions.
+- TODO session save/restore, screen lock, idle actions, direct
+  D-Bus Can* queries (currently probed via loginctl + /sys, see
+  DEPENDENCIES.md "explicitly rejected" for the rationale).
 
 ## M7 — Panel / desktop
 - DONE xw-panel v0: layer-shell top bar (exclusive zone, windows never

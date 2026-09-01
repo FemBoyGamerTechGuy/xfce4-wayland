@@ -1,66 +1,86 @@
-# Dependency policy and audit
+# Dependencies
 
-Every dependency in this project exists for a documented reason. The
-philosophy: a small number of permissively licensed, widely deployed,
-focused libraries — no desktop-ecosystem frameworks, no D-Bus requirement,
-no wlroots, no systemd requirement.
+Philosophy: **minimal dependencies, but not at the expense of
+functionality, maintainability, security or correctness.** Every entry
+below earns its place; the build system makes optional ones degradable
+with actionable messages (see [BUILDING.md](BUILDING.md)). No wlroots,
+no GLib, no D-Bus linkage, no toolkit — see
+[ARCHITECTURE.md](ARCHITECTURE.md) for the rationale.
 
-## Runtime dependencies of shipped code
+Licenses were audited against the upstream projects; provenance of
+vendored files lives in
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md). "Copyleft" flags
+the *obligations using the library triggers* — linking a (L)GPL library
+does not force our proprietary license to change, but redistribution
+rules apply and are documented.
 
-| Library | License | Version | Why |
-|---------|---------|---------|-----|
-| libwayland-server | MIT | >= 1.21 | The Wayland display server protocol library. Irreplaceable: implements the wire protocol, object model, event loop. We use `wl_display`/`wl_event_loop`/`wl_resource` directly. |
-| libwayland-client | MIT | >= 1.21 | Same, client side, for panel/exit-dialog/test clients. |
-| libxkbcommon | MIT/X11 | >= 1.0 | XKB keymap and keyboard state. Required for correct modifier/keysym handling (XKB is the Wayland keyboard standard). Reads keymap data from `xkeyboard-config` at runtime. |
-| pixman | MIT | >= 0.42 | Software compositing (ARGB blending, regions, damage). Chosen over an EGL/GLES pipeline so the compositor renders correctly on systems without GPU acceleration; a GPU path can be added later behind the same internal API. |
-| libc (glibc/musl) | LGPL-2.1+ (dynamic) | — | C runtime; dynamic linking, LGPL-compliant. |
-| python3 + Pillow (build time only) | PSF / HPND | — | Rasterizes the bitmap font into generated C data at build time. **Not a runtime dependency.** |
+## Matrix
 
-**Explicitly rejected:**
+| Library / tool | Why it is required | Min version | License | Build / runtime | Nested | DRM/KMS | X11 compat | Optional | Copyleft obligations |
+|---|---|---|---|---|---|---|---|---|---|
+| **libwayland-server** | the display server core: client connections, protocol marshalling, event loop | 1.21 | MIT | both | ✔ | ✔ | ✔ | no | none (permissive) |
+| **libwayland-client** | the nested backend is a client of the parent compositor; `libxwcl` client library; tests | 1.21 | MIT | both | ✔ | – | – | no | none |
+| **wayland-scanner** | generates protocol C glue from the XML definitions at build time | matches libwayland | MIT | build only | ✔ | ✔ | ✔ | no | none |
+| **wayland-protocols** | protocol XMLs we implement: xdg-shell, xdg-activation, ext-workspace, single-pixel-buffer | 1.36 (1.44 recommended) | MIT | build only (data) | ✔ | ✔ | ✔ | no | none |
+| **libxkbcommon** | keymap compilation, modifier state, keysym resolution for the shortcut engine | 1.0 | MIT | both | ✔ | ✔ | – | no | none |
+| **pixman-1** | software renderer: compositing, damage regions, image ops (output-pixel introspection used by tests) | 0.42 | MIT | both | ✔ | ✔ | ✔ | no | none |
+| **libinput** | real input backend: keyboard/pointer events, device discovery, hotplug, pointer acceleration, v120 wheel protocol | 1.19 | MIT | both (backend optional) | – (parent feeds input) | ✔ (device ownership) | – | **yes** (`XW_LIBINPUT`) | none |
+| **libudev** (via libinput) | udev-seat device discovery + hotplug for libinput | 183 | LGPL-2.1+ | runtime (libinput dep) | – | ✔ | – | with libinput | LGPL: relinking rights + license notice on redistribution |
+| **libX11** | nested X11 backend: window, XPutImage present path, XKB detectable-autorepeat handling | any (1.6+) | MIT | both (backend optional) | ✔ (X11 parents, XLibre) | – | ✔ | **yes** (`XW_X11`) | none |
+| **libXtst / libXi** | XTEST synthetic input for the process-level X11 backend tests | 1.2 / 1.5 | MIT | dev/test only | ✔ (tests) | – | – | yes (`make check` only) | none |
+| **python3 + Pillow** | build-time bitmap font rasterization (`tools/genfont.py`); no runtime font stack | py3.8+ / Pillow 9+ | PSF / HPND-MIT | build only | ✔ | ✔ | ✔ | no (build) | none |
+| **xkeyboard-config** | xkb keymap data (`evdev/pc105/us` + configured layouts) | any recent | MIT/HPND | **runtime only** | ✔ | ✔ | – | no (runtime) | none |
+| **loginctl (systemd-logind or elogind)** | power actions (suspend/hibernate/poweroff/reboot) without root; later: session/seat/DRM-master acquisition | any | LGPL-2.1+ (systemd) / MIT-0 (elogind) | **runtime only** (probed, never linked) | ✔ | ✔ (planned) | – | yes (fails honestly without it) | none (external program) |
+| **Xvfb** | virtual X server driving the X11-backend process checks | any | MIT | dev/test only | ✔ (tests) | – | – | yes | none |
+| **libdrm** | *(future)* DRM/KMS backend: device discovery, CRTCs, planes, atomic modesetting, page flips | 2.4.110+ | MIT | future (Phase 4) | – | ✔ | – | **yes** (planned) | none |
+| **XWayland** | *(future)* optional compatibility server for legacy X11 applications only — never a foundation of this desktop | 22+ | MIT/X11 | future (Phase 8) | – | – | ✔ | **yes** (planned) | none |
 
-- **wlroots** — architectural constraint (project spec). We implement the
-  backend/compositor/protocol plumbing ourselves.
-- **GLib / GIO / GObject** — convenient but drags a large abstraction layer
-  into every component. We use plain C with `wl_event_loop` and `poll()`.
-- **D-Bus** — not required by the core. Power actions shell out to the
-  `loginctl` CLI when logind/elogind is present (no daemon linkage). See
-  ARCHITECTURE.md, "Session and power management".
-- **GTK / Qt** — the panel and dialogs are native Wayland clients built on
-  libxwcl; this keeps the dependency tree flat and licensing clean. A
-  GTK-based settings GUI remains a roadmap option.
-- **cairo/pango/fontconfig/freetype (runtime)** — replaced by the
-  build-time bitmap font generator (`tools/genfont.py`) for panel/dialog
-  text. Revisit when proper text shaping becomes necessary.
+✔ = required for that mode · – = not used in that mode.
 
-## Protocol definitions
+## Why these and nothing else
 
-| Protocol | Source | License | Server side | Client side |
-|----------|--------|---------|-------------|-------------|
-| wayland core (xdg data-device, wl_seat, wl_shm...) | libwayland | MIT | provided by libwayland | provided by libwayland |
-| xdg-shell | wayland-protocols (stable) | MIT | yes | yes |
-| xdg-activation | wayland-protocols (staging) | MIT | yes | panel |
-| ext-workspace | wayland-protocols (staging) | MIT | yes | panel |
-| single-pixel-buffer | wayland-protocols (staging) | MIT | yes | clients |
-| wlr-layer-shell-unstable-v1 | wlr-protocols (vendored XML) | MIT | yes | panel |
-| wlr-foreign-toplevel-management-unstable-v1 | wlr-protocols (vendored XML) | MIT | yes | panel |
+- **libwayland + wayland-protocols**: the definition of a Wayland
+  compositor; there is no Wayland without them. Implementing the wire
+  format by hand would be weeks of code with zero user-visible gain.
+- **libxkbcommon**: the only maintained XKB keymap engine; keyboard
+  maps and modifiers are a correctness surface, not a place for a
+  hand-rolled subset.
+- **pixman**: a battle-tested software rasterizer. Software rendering
+  keeps every pixel deterministic and testable (the whole test suite
+  asserts real framebuffer contents); a GL renderer path is a *later*
+  accelerator, not a foundation.
+- **libinput**: the input stack every non-wlroots Wayland compositor
+  and every X server uses; it solves acceleration curves, wheel
+  protocols, device quirks and hotplug correctly. Our input module is
+  deliberately thin over it.
+- **libX11**: only for the *nested X11* backend — the development
+  workflow for users living in X11/XLibre sessions. The core never
+  links it when built with `XW_X11=0`.
+- **Pillow**: build-time only, replaces a runtime font stack
+  (fontconfig/freetype/harfbuzz) with a 95-glyph generated bitmap —
+  the entire client surface stays font-free.
 
-wlr-protocol XML files are protocol *descriptions*, not code: both sides are
-implemented in this repository. Vendoring them introduces no wlroots
-code linkage. `ext-workspace` and `xdg-activation` are staging protocols —
-chosen deliberately because they are the standardized direction; our
-compatibility surface is small and tracked in the ROADMAP.
+## Explicitly rejected
 
-## Optional runtime integrations (not linked, discovered at runtime)
+| Candidate | Reason |
+|---|---|
+| wlroots | the project's core constraint: original implementation on libwayland-server, no wlroots code (behavioral inspiration from protocol specs only) |
+| GLib / GIO | event loop + utilities we already have (libwayland's loop, our own INI/log/region code); D-Bus-free power path via loginctl CLI |
+| GTK / Qt | clients are native Wayland on `libxwcl` with a generated bitmap font; a toolkit would be a larger dependency than the panel itself |
+| cairo | pixman already does everything the software renderer needs; cairo would add a second rasterizer |
+| D-Bus (libdbus/sdbus) | power + session actions go through `loginctl` (works with systemd-logind *and* elogind, explicit argv, no shell). A direct D-Bus `Can*` query is on the roadmap as an optional refinement |
+| systemd libraries | loginctl CLI only; the project hard-codes no systemd assumptions and works with elogind |
 
-- **loginctl / eloginctl (logind or elogind)** — used for
-  Shutdown/Reboot/Suspend/Hibernate and session seat handling. Absent
-  systems degrade gracefully (buttons report the limitation).
-- **XWayland** — future optional component for legacy X11 clients
+## Adding a dependency: the bar
 
-### Runtime/build, optional
-
-| Dependency | License | Needed for |
-|------------|---------|------------|
-| libX11 | X11 (MIT-style) | the nested X11 backend (runs the desktop inside an X11/XLibre session). Absent at build time: the backend is compiled out and `-B x11` reports a clear error; everything else still builds. |
-| libXtst + libXext | X11 (MIT-style) | test-only: the Xvfb x11-backend check injects XTEST keyboard input. Fetched rootless into `.toolchain/sysroot` when the system package is missing. |
-  (ROADMAP). Never a foundation of the desktop.
+1. It must be impossible (or clearly harmful) to implement correctly
+   ourselves (see "rejected" for the counter-examples).
+2. Permissive license preferred; copyleft accepted only when no
+   equally capable permissive alternative exists (libudev is the only
+   current case, inherited via libinput) — obligations documented
+   above and in THIRD-PARTY-LICENSES.md.
+3. Runtime dependency must degrade honestly (probe + actionable
+   message), like loginctl does.
+4. Build dependency must be optional or trivially satisfied on all
+   target distributions.
+5. The decision is recorded in this file with the reason.

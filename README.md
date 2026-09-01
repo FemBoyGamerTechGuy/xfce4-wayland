@@ -54,8 +54,13 @@ for status and what remains, and [BUILDING.md](BUILDING.md) to build it.
 make                    # build everything
 make check              # in-process suite + process-level session tests
 make asan               # full sanitizer regression pass
-./scripts/dev-session.sh --logout   # headless dev session, clean logout
+make install prefix=$HOME/.local   # user-local install (no root)
+./scripts/dev-session.sh --logout  # headless dev session, clean logout
 ```
+
+See [BUILDING.md](BUILDING.md) for the full distribution-agnostic
+build guide (requirements, profiles, zero-root workflow, distro
+package examples, session integration).
 
 ## Backends
 
@@ -83,13 +88,18 @@ process boundaries.
 ## Status
 
 Early-stage but functional: the compositor core, window manager,
-shortcut engine, session manager, graphical exit dialog, and the
-desktop panel exist and pass an automated suite (22 in-process tests +
-47 process-level checks, ASAN/UBSAN/LSAN-clean, incl. the forked panel
-and dialog children). Nested Wayland and nested X11 backends run the
-desktop inside an existing session (Phase 2 of the roadmap). The [ROADMAP](ROADMAP.md) tracks remaining XFCE
-feature parity honestly — incomplete features are listed, never
-silently omitted.
+shortcut engine (protocol-correct key repeat, full default-table
+coverage), real-input backend (libinput: udev seat + explicit device
+modes), session manager with honest logind/elogind power reporting,
+graphical exit dialog (unavailable actions show their reason), and
+the desktop panel exist and pass an automated suite (32 in-process
+tests + 61 process-level checks, ASAN/UBSAN/LSAN-clean, incl. the
+forked panel and dialog children). Nested Wayland and nested X11
+backends run the desktop inside an existing session (Phase 2 of the
+roadmap). The DRM/KMS backend for direct hardware output is the
+current phase (input groundwork landed; scanout pending). The
+[ROADMAP](ROADMAP.md) tracks remaining XFCE feature parity honestly
+— incomplete features are listed, never silently omitted.
 
 ## License
 

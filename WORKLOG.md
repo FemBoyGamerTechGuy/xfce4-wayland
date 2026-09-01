@@ -335,3 +335,94 @@ development workflow before DRM/KMS).
 Phase 3: real input (libinput seat backend for DRM sessions);
 meanwhile keyboard move/resize + shortcut gaps from the XFCE table,
 notification daemon, XWayland detection for nested-X11 sessions.
+
+## 2026-09-01 — session 5
+
+Phase 2.5/3: build-system hardening, real input, protocol-correct key
+repeat, the logind/elogind power backend, and a shortcut-engine parity
+fix — each driven by tests that found real bugs.
+
+- **Environment recovery**: the container was reset between sessions;
+  the rootless sysroot had to be rebuilt. scripts/bootstrap-sysroot.sh
+  now automates it (downloads dev packages + the runtimes libinput
+  needs: libevdev/libwacom/mtdev/libgudev, rewrites .pc prefixes,
+  rpaths libinput, links matching system SONAMEs) and
+  scripts/env.sh exports LD_LIBRARY_PATH for the sysroot (RUNPATH is
+  not transitive to libinput's own dependencies).
+- **Build system**: XW_X11/XW_LIBINPUT toggles (auto/1/0) with the
+  directive-grade diagnostics (what breaks, how to enable, how to
+  silence); PROFILE presets (release/debug/asan) + a build/.profile
+  stamp that REFUSES profile switches over a populated tree (stale
+  sanitized/plain mixing was a real bug class here); required-dep
+  validation with actionable $(error) messages; make config summary;
+  install/uninstall (prefix/DESTDIR, wayland-sessions .desktop, example
+  INI configs documenting every parser key — rules.conf examples were
+  corrected against the real fnmatch semantics); dist tarball sorted.
+  Verified zero-root end to end.
+- **Real input (Phase 3)**: xw-input-libinput.c as an input SOURCE
+  orthogonal to backends — udev seat mode + $XW_INPUT_DEVICES path
+  mode; -I/--input auto|libinput|none; AUTO never grabs devices
+  (tests + nested stay deterministic); translation in white-box
+  handlers (clamping, sub-pixel acc, abs→layout, v120 wheels); libinput
+  logging routed into xw_log. In-container libinput runtime deps
+  fetched rootlessly into the sysroot.
+- **Key repeat, protocol-correct**: wl_keyboard.repeat_info after the
+  keymap (clients repeat — was missing entirely, so NO client had key
+  repeat); server-side repeat only for interactive keyboard
+  move/resize; X11 backend filters detectable-autorepeat presses of
+  held keys (xw_x11_key_filter) so clients never double-repeat.
+  Config: keyboard.conf [keyboard] + $XW_REPEAT_* env; 500ms/30Hz
+  XFCE defaults.
+- **Power backend**: xw-power.c shared by xw-session and xw-exit —
+  loginctl liveness (run it, don't check PATH: the container HAS
+  loginctl with no daemon and must read as unavailable),
+  /sys/power/state probing ($XW_POWER_STATE_PATH override), reasons
+  for every unavailable action, fork+execvp with fixed argv (no shell;
+  replaces system()), stderr captured into error replies. ctl
+  `power-status`; exit dialog greys unavailable actions with their
+  reason and refuses activation; xw-session now passes the user config
+  dir to the compositor (INI config finally effective in sessions).
+  Process tests: session 1 forced-unavailable environment (the suite
+  can never suspend a dev machine), session 1b fake-loginctl success
+  path incl. captured-stderr failure.
+- **Bugs found by the new tests and FIXED**:
+  1. xwc_drain never flushed the client's outgoing request buffer —
+     a request stuck in the socket buffer stalled the whole handshake
+     (first seen as a missing keymap event). Fixed with an explicit
+     wl_display_flush; regression: repeat-info tests.
+  2. Releases of keys consumed by interactive move/resize leaked to
+     clients as stray releases (same class as shortcut suppression);
+     fixed via the consumed-keys bitmap; regression: wm-key-repeat.
+  3. Shortcuts: Shift+Tab produces ISO_Left_Tab and Alt+Print produces
+     Sys_Req — the keysym matcher compared literally, so
+     <Alt><Shift>Tab (cycle back) and <Alt>Print (screenshot) could
+     NEVER fire. canonical_keysym() on both binding and event sides
+     (xfwm4 matches by keycode; a keysym matcher must canonicalize).
+     Found by the new table-driven all-defaults test (38→47/47).
+  4. Test harness had wrong evdev codes for F11/F12 (69/70 are
+     NumLock/ScrollLock) — latent, nothing had injected F11/F12.
+- **Tests**: 31→32 in-process (repeat-info, repeat-info-config,
+  wm-key-repeat, client-no-double-repeat, input-lifecycle, input-auto-
+  off, input-motion-pipeline, input-key-pipeline, x11-repeat-filter,
+  shortcut-all-defaults), 47→61 process checks, TESTING.md rewritten
+  around the explicit 3-level strategy (unit / nested-process /
+  real-hardware) with honest statements of what each level cannot
+  cover. Full ASan/UBSan/LSan pass. -O1-only format-truncation
+  warnings fixed by enlarging buffers (worklog lesson from session 2
+  held: fix, don't suppress).
+- Docs: BUILDING.md rewritten as the distro-agnostic guide (requirements
+  categories, knobs, profiles, zero-root section, DM/TTY session
+  integration with honest status table, distro package EXAMPLES incl.
+  a generic "not listed" procedure, troubleshooting keyed to the build
+  system's own error messages); DEPENDENCIES.md is now the full matrix
+  (why/min-version/license/mode/copyleft per entry, rejected list,
+  addition bar); README/ARCHITECTURE/ROADMAP/TODO updated to match
+  reality.
+
+### Next
+DRM/KMS backend (Phase 4 output half): libdrm device discovery,
+connectors/CRTCs/planes, dumb-buffer scanout first, atomic modesetting
+after; logind session takeover for DRM master without root; multi-
+monitor + hotplug on top. Also queued: session restart (re-exec)
+automated test, notification daemon skeleton, xdg geometry offsets
+(CSD shadows).

@@ -1,7 +1,52 @@
 # Testing
 
-The suite is deterministic, automated, and GPU-free: everything runs
-against the **headless backend** with the pixman software renderer.
+The suite is deterministic, automated, and GPU-free: everything that
+runs in CI or on a developer machine runs against the **headless
+backend** with the pixman software renderer, or against a **nested
+backend** inside a disposable Xvfb/parent session. Real hardware
+(DRM/KMS, physical input devices) is a separate, explicitly-labeled
+verification level that is never silently claimed.
+
+## The three test levels
+
+Development environments rarely provide DRM hardware or physical
+input devices — and tests must never touch a developer's real session
+or suspend a dev machine. The project therefore maintains three
+strictly separated levels, and every coverage claim states which level
+verified it:
+
+```text
+Level 1 — Unit / in-process integration (make tests)
+    The compositor library runs inside the test binary; real Wayland
+    clients connect over the socket; input arrives through the same
+    seat/shortcut pipeline real input uses. Deterministic, fast,
+    ASan-clean. Runs anywhere (no X, no devices, no root).
+
+Level 2 — Process / nested integration (make check)
+    Real binaries as real processes: xw-session supervising
+    xw-compositor, clients as separate processes, the X11 backend
+    under Xvfb (pixel round-trips + XTEST-synthesized input), the
+    nested Wayland backend across two real compositor processes, the
+    power backend against a fake loginctl. No root, no real devices,
+    no real power state changes (a forced-unavailable environment
+    keeps the suite safe on every host).
+
+Level 3 — Real hardware / DRM-KMS (manual, documented procedure)
+    Physical displays through the DRM/KMS backend and physical input
+    devices through libinput. Requires hardware; nothing at this level
+    is claimed as verified by Levels 1-2. Currently covers: real-input
+    pipeline smoke runs via XW_INPUT_DEVICES on machines with readable
+    evdev nodes. The DRM/KMS backend itself is not implemented yet
+    (ROADMAP Phase 4), so Level 3 display coverage is pending by
+    definition.
+```
+
+What Level 1 *cannot* cover is stated honestly: the thin
+libinput_event decoder and the X server's autorepeat emission need
+devices or uinput (root) — the pure logic around them
+(translation handlers, repeat filtering, X11 filter) is tested at
+Level 1, and the module refuses to start when its prerequisites are
+absent rather than half-working.
 
 ## Layout
 
@@ -16,32 +61,40 @@ against the **headless backend** with the pixman software renderer.
 - `tests/suite/test_protocols.c` — desktop-integration protocol suite
   (layer-shell, popups, clipboard, foreign-toplevel, activation); raw
   Wayland objects are driven directly next to white-box assertions.
+- `tests/suite/test_input.c` — **Level 1 input coverage**: key repeat
+  (protocol values default + configured, client-side single delivery,
+  server-side WM move repeat with paced real-time waits), the libinput
+  translation pipeline (clamping, sub-pixel accumulation, abs→layout
+  mapping, button/axis delivery) through the real handlers with
+  path-mode contexts (no devices — deterministic everywhere).
 - `tests/suite/test_session.c` — the graphical exit dialog as a real
   child process against the in-process compositor.
-- `tests/suite/test_panel.c` — panel coverage (see above).
+- `tests/suite/test_panel.c` — panel coverage (see below).
 - `tests/suite/test_backends.c` — nested backend coverage: a real
   compositor (B, nested) running inside another real compositor (A,
   headless) in one process. Asserts topology, the present pipeline
   (B's framebuffer content visible in A's pixels), clients of B
-  rendering through B into A, and input routing (keys injected into A
-  reach B's shortcut engine when B's window is focused — and parent
-  shortcuts must not shadow the child desktop).
+  rendering through B into A, input routing (keys injected into A
+  reach B's shortcut engine when B's window is focused — parent
+  shortcuts must not shadow the child desktop), and the X11
+  synthetic-repeat filter logic.
 - `tests/x11probe.c` + `build/tests/x11probe` — X11-backend process
   probe: finds the compositor window in a live X server, reads back
   its pixels (XGetImage) and injects XTEST keyboard input.
-- `scripts/test-session.sh` — process-level session integration test
-  (real `xw-session` + `xw-compositor` children, ctl socket, autostart
-  filtering, runtime spawns, panel autostart, clean logout, the X11
-  backend under Xvfb with synthesized input, `xw-session --nested`,
-  and the nested Wayland backend across two real processes).
+- `scripts/test-session.sh` — **Level 2**: process-level session
+  integration (real `xw-session` + `xw-compositor` children, ctl
+  socket, autostart filtering, runtime spawns, panel autostart, clean
+  logout, the power backend with a fake loginctl, the X11 backend
+  under Xvfb with synthesized input, `xw-session --nested`, and the
+  nested Wayland backend across two real processes).
 - `scripts/run-asan.sh` — full sanitizer regression pass (ASan + UBSan
   + LeakSanitizer) including the process-level test; restores the
   release build afterwards.
 
 ## Running
 
-    make tests        # builds and runs the in-process suite
-    make check        # in-process suite + process-level session test
+    make tests        # Level 1: builds and runs the in-process suite
+    make check        # Level 1 + Level 2 (process-level session test)
     make asan         # full sanitizer pass (rebuilds, tests, restores)
 
 Filtering tests (triage):
@@ -49,7 +102,28 @@ Filtering tests (triage):
     XWT_FILTER=popup build/tests/run-tests    # name substring
     XWT_PREINSTANCES=0 ...                    # debug-layer only
 
-## What is covered today (22 in-process tests + 47 process checks)
+### Level 3 procedure (real input devices, no DRM needed)
+
+On a machine where you may read your input devices (many distros grant
+the logged-in user read access, or you are in an `input`-capable
+group):
+
+```sh
+ls /dev/input/event*                 # pick a keyboard/mouse node
+XW_INPUT_DEVICES=/dev/input/event3 \
+    build/bin/xw-compositor -B headless
+# in another terminal: connect a client to the printed socket and
+# type/move — real events flow through the full pipeline
+```
+
+This exercises the udev-free path mode (device open, event decode,
+translation). The udev seat mode (discovery + hotplug) additionally
+requires a running udev instance; run
+`build/bin/xw-compositor -I libinput` in such an environment. Record
+what was verified (device, kernel, distro) in WORKLOG.md — that is
+what keeps "verified at Level 3" honest.
+
+## What is covered today (31 Level-1 tests + 61 Level-2 checks)
 
 - compositor bootstrap + clean shutdown; socket lifecycle
 - output creation, geometry, scale; multi-output
@@ -59,6 +133,16 @@ Filtering tests (triage):
 - shortcut engine: default table dispatch, consume-vs-forward
   suppression, show-desktop
 - focus: click-to-focus + activation, pointer hit-testing
+- **key repeat: repeat_info delivery (default + configured values),
+  exactly one press per keypress to clients (no server-side double
+  repeat), server-side repeat of interactive move/resize keys, repeat
+  stops on release**
+- **libinput pipeline (Level 1, path mode): lifecycle with zero
+  devices, AUTO never touches devices, relative motion clamped to the
+  layout, sub-pixel accumulation, absolute motion mapped to the
+  layout, linux button codes verbatim, wheel units preserved**
+- **X11 backend: synthetic autorepeat presses filtered (pure logic
+  test; real X autorepeat is Level 2-adjacent via Xvfb typing)**
 - layer-shell: panel geometry, exclusive zone shrinking the usable
   area, set_size/set_layer requests, exclusive keyboard interactivity
   and focus release on teardown, overlay rendering
@@ -73,7 +157,8 @@ Filtering tests (triage):
 - xdg-activation: token issuance, focus handover, single-use policy
   (replayed tokens rejected)
 - session exit: the exit dialog maps a modal overlay (pixel-verified),
-  takes keyboard, Escape cancels with exit code 0
+  takes keyboard, Escape cancels with exit code 0; unavailable power
+  actions render dim with reasons and cannot be activated
 - panel (in-process, client library): tasklist announce/title/state
   tracking, activate focuses (+ un-minimizes), close reaches the
   window as an xdg close event, closed tasks disappear; workspace
@@ -83,16 +168,20 @@ Filtering tests (triage):
   clicks switch workspaces end-to-end, exit button sends the ctl
   `exit-dialog` line (fake session manager accepts it), panel survives
   the action
-- process-level: session manager supervises the compositor child, ctl
-  protocol (ping/status/logout/run/exit-dialog), honest power failure
-  without logind, XDG autostart filtering (OnlyShowIn/NotShowIn/Hidden),
-  panel autostart, runtime spawns are supervised (killed + reaped at
-  logout), clean logout (exit code 0, sockets removed, no leftover
-  processes)
+- process-level (Level 2): session manager supervises the compositor
+  child, ctl protocol (ping/status/power-status/logout/run/
+  exit-dialog), honest power failure without logind, **power backend
+  success path with a fake loginctl (capability report, suspend
+  round-trip, failure carrying the backend's stderr message)**, XDG
+  autostart filtering (OnlyShowIn/NotShowIn/Hidden), panel autostart,
+  runtime spawns are supervised (killed + reaped at logout), clean
+  logout (exit code 0, sockets removed, no leftover processes)
 
 Not yet covered (honest gaps): drag-and-drop flows, popup grabs,
-key repeat, multi-seat, D-Bus-free restart path, power actions against
-a real logind (no logind exists in the build container).
+multi-seat, session restart (re-exec), power actions against a *real*
+logind (no logind exists in the build container — the fake-loginctl
+coverage is Level 2 by definition), libinput's udev seat mode and the
+libinput_event decoder (Level 3), touch/gestures/tablets (unimplemented).
 
 ## Regression policy
 
@@ -120,6 +209,12 @@ Highlights (each verifiable by reverting the fix):
   rewrite) stopped flushing requests that wl_display_dispatch had
   flushed implicitly — the exit dialog never mapped its buffer
   (`exit-dialog-rendered`)
+- **xwc_drain never flushed the client's outgoing request buffer — a
+  request stuck in the socket buffer silently stalled the whole
+  handshake (first seen as a missing wl_keyboard keymap event in the
+  input tests; fixed with an explicit flush; `repeat-info`)**
+- **releases of keys consumed by interactive keyboard move/resize
+  leaked to clients as stray release events (`wm-key-repeat`)**
 - activation token double-free / premature server-side destroy
   (`foreign-toplevel-activation`)
 - NULL-source selection fabricated an empty offer to clients
