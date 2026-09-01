@@ -50,12 +50,22 @@ for status and what remains, and [BUILDING.md](BUILDING.md) to build it.
 ## Quick start (development)
 
 ```sh
-. scripts/env.sh        # pick up local sysroot (no root needed)
-make                    # build everything
-make check              # in-process suite + process-level session tests
-make asan               # full sanitizer regression pass
+make                    # build everything (no system font needed; the
+                        # build-time font is bundled in assets/fonts/)
+make check              # full suite: unit + process + build regressions
+./scripts/dev-session.sh --logout   # headless dev session (refuses to run
+                                    # unless the build succeeded)
+```
+
+`. scripts/env.sh` is optional — it only picks up a local
+`.toolchain/sysroot` for locked-down containers; normal distributions
+don't need it. Fail-fast everywhere: `make` stops at the first missing
+dependency with an actionable message, `dev-session.sh` never launches
+binaries that were not built, and all scripts run clean under zsh,
+bash and dash.
+
+```sh
 make install prefix=$HOME/.local   # user-local install (no root)
-./scripts/dev-session.sh --logout  # headless dev session, clean logout
 ```
 
 See [BUILDING.md](BUILDING.md) for the full distribution-agnostic
@@ -92,14 +102,16 @@ shortcut engine (protocol-correct key repeat, full default-table
 coverage), real-input backend (libinput: udev seat + explicit device
 modes), session manager with honest logind/elogind power reporting,
 graphical exit dialog (unavailable actions show their reason), and
-the desktop panel exist and pass an automated suite (32 in-process
-tests + 61 process-level checks, ASAN/UBSAN/LSAN-clean, incl. the
-forked panel and dialog children). Nested Wayland and nested X11
-backends run the desktop inside an existing session (Phase 2 of the
-roadmap). The DRM/KMS backend for direct hardware output is the
-current phase (input groundwork landed; scanout pending). The
-[ROADMAP](ROADMAP.md) tracks remaining XFCE feature parity honestly
-— incomplete features are listed, never silently omitted.
+the desktop panel exist and pass an automated suite (33 in-process
+tests + 71 process-level checks + 38 build-system regression checks,
+ASAN/UBSAN/LSAN-clean, incl. the forked panel and dialog children;
+the build is verified on font-less systems and under zsh). Nested
+Wayland and nested X11 backends run the desktop inside an existing
+session (Phase 2 of the roadmap). The DRM/KMS backend for direct
+hardware output is the current phase (input groundwork landed; scanout
+pending). The [ROADMAP](ROADMAP.md) tracks remaining XFCE feature
+parity honestly — incomplete features are listed, never silently
+omitted.
 
 ## License
 

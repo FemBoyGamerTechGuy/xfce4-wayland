@@ -45,7 +45,7 @@ invokes a package manager and never requires root: see
 | wayland-protocols | >= 1.36 (uses xdg-shell, xdg-activation, ext-workspace, single-pixel-buffer; 1.44+ recommended) |
 | libxkbcommon dev | >= 1.0 (keymap compilation, modifiers, shortcut keysyms) |
 | pixman-1 dev | >= 0.42 (software renderer: compositing, damage regions) |
-| python3 + Pillow | **build time only** — rasterizes the bitmap font (`tools/genfont.py`); no runtime font stack exists |
+| python3 + Pillow | **build time only** — rasterizes the bitmap font (`tools/genfont.py`). **No system font is needed**: the font ships in the repository (`assets/fonts/DejaVuSans-ascii.ttf`, a licensed subset of DejaVu Sans — see [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md)); the generated table is identical on every distribution |
 
 ### Recommended
 
@@ -88,9 +88,15 @@ Runtime only        : xkeyboard-config, loginctl (or elogind's),
 git clone https://github.com/FemBoyGamerTechGuy/xfce4-wayland
 cd xfce4-wayland
 make                 # build everything (compositor, session, panel, tests)
-make check           # in-process suite + process-level session checks
+make check           # in-process suite + process-level session checks + build regressions
 ./scripts/dev-session.sh --logout   # headless dev session, clean logout
 ```
+
+Every step is fail-fast: `make` stops at the first missing dependency
+with an actionable message, and `dev-session.sh` refuses to launch any
+binary that was not successfully built (it checks before starting
+anything — a failed build can never cascade into confusing launch
+errors). The whole flow also runs clean under zsh, bash and dash.
 
 Binaries land in `build/bin/` (`xw-compositor`, `xw-session`,
 `xw-session-ctl`, `xw-exit`, `xw-panel`), libraries in `build/lib/`.
@@ -126,6 +132,7 @@ the configurable install prefix.
 | `prefix` | path (default `/usr/local`) | installation prefix |
 | `DESTDIR` | path | staged install root (packagers) |
 | `XW_SYSROOT` | path | local sysroot with dev files (auto-detects `.toolchain/sysroot`); usually set by [scripts/env.sh](#sysroot-bootstrap-for-locked-down-containers) |
+| `XW_FONT` | path | override the build-time font source (default: the bundled `assets/fonts` asset; the override must exist, otherwise the build stops with an error) |
 | `bindir`, `datadir`, `docdir`, `SESSIONS_DIR`, `sysconfdir` | paths | install layout overrides (derived from `prefix` by default) |
 
 ### Runtime environment variables (input/repeat)
@@ -518,7 +525,9 @@ What you need, in package-manager-agnostic terms:
 4. the **wayland-protocols data package** (XML files under
    `/usr/share/wayland-protocols`);
 5. optional development files for `libinput` and `x11`;
-6. `python3` with **Pillow** for the build-time font generator.
+6. `python3` with **Pillow** for the build-time font generator. No
+   font package is required — the rasterized font is bundled in
+   `assets/fonts/` (licensed subset of DejaVu Sans).
 
 Verify a dependency is visible after installing: `pkg-config
 --modversion wayland-server` (and similarly for the others) must print
@@ -561,7 +570,29 @@ a usable one; any systemd/elogind system provides it already.
 `make check` runs the x11 backend under Xvfb; install Xvfb (plus libXtst
 and libXi development files — the sysroot bootstrap includes them).
 
-**`python3` / Pillow errors during build**
-The bitmap font generator needs Pillow at build time (`pip install
---user Pillow` works without root, or install your distribution's
-python-pil package).
+**`the Pillow python module is required at build time ...`**
+The build-time font rasterizer is missing its Pillow module. Install
+your distribution's package (`python3-pil` / `python-pillow` /
+`python3-pillow`) or run `python3 -m pip install --user pillow`
+(no root needed).
+
+**`the bundled font asset assets/fonts/DejaVuSans-ascii.ttf is missing`**
+The checkout is damaged (the font ships in the repository and no
+system font is ever searched). Restore it with
+`git checkout -- assets/fonts` or re-extract the release archive.
+
+**`dev-session: .../build/bin/... does not exist or is not executable`**
+The build did not complete. `dev-session.sh` refuses to launch
+binaries that were not built — run `make` and fix the underlying
+build error first (this is deliberate: a failed build must never
+cascade into half-started sessions).
+
+**A message like `zsh: number expected` before anything else runs**
+Not produced by this repository: all shipped scripts run clean under
+zsh 5.9 (verified by `make check`'s shell-compatibility section:
+syntax, sourcing and full session execution under zsh). A `number
+expected` message from zsh comes from builtin option parsing
+(`read -u`-style) in whatever shell function or plugin was active in
+your interactive session — reproduce with `zsh -f` (clean mode) to
+isolate it from your configuration, and file a report here if a repo
+script still misbehaves in clean-mode zsh.

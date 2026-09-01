@@ -29,7 +29,11 @@ Level 2 — Process / nested integration (make check)
     nested Wayland backend across two real compositor processes, the
     power backend against a fake loginctl. No root, no real devices,
     no real power state changes (a forced-unavailable environment
-    keeps the suite safe on every host).
+    keeps the suite safe on every host). Includes the build-system
+    regression suite (see scripts/test-build-regressions.sh): clean
+    builds on font-less systems (mount namespace), build-failure
+    propagation, fail-fast dev-session behavior, and zsh/bash/dash
+    execution of every entry script.
 
 Level 3 — Real hardware / DRM-KMS (manual, documented procedure)
     Physical displays through the DRM/KMS backend and physical input
@@ -87,6 +91,15 @@ absent rather than half-working.
   logout, the power backend with a fake loginctl, the X11 backend
   under Xvfb with synthesized input, `xw-session --nested`, and the
   nested Wayland backend across two real processes).
+- `scripts/test-build-regressions.sh` — **Level 2 (build system)**:
+  regression suite for the distro-agnostic build: font generation from
+  the bundled asset (determinism, stripped environment, precise
+  failure diagnostics), `make` failure propagation on broken sources,
+  the quick-start flow after a partial/failed build (dev-session must
+  refuse), a **clean build with every system font hidden** inside an
+  unprivileged mount namespace (the exact "clean distro, documented
+  deps, still fails" class), and shell compatibility: syntax +
+  sourcing + full session runs under zsh, bash and dash.
 - `scripts/run-asan.sh` — full sanitizer regression pass (ASan + UBSan
   + LeakSanitizer) including the process-level test; restores the
   release build afterwards.
@@ -94,7 +107,7 @@ absent rather than half-working.
 ## Running
 
     make tests        # Level 1: builds and runs the in-process suite
-    make check        # Level 1 + Level 2 (process-level session test)
+    make check        # Level 1 + Level 2 (session test + build regressions)
     make asan         # full sanitizer pass (rebuilds, tests, restores)
 
 Filtering tests (triage):
@@ -123,7 +136,7 @@ requires a running udev instance; run
 what was verified (device, kernel, distro) in WORKLOG.md — that is
 what keeps "verified at Level 3" honest.
 
-## What is covered today (33 Level-1 tests + 71 Level-2 checks)
+## What is covered today (33 Level-1 tests + 71 Level-2 checks + 38 build-regression checks)
 
 - compositor bootstrap + clean shutdown; socket lifecycle
 - output creation, geometry, scale; multi-output

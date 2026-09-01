@@ -97,6 +97,11 @@ INCLUDES  = -Isrc -Isrc/libxw -Isrc/libxwcl -Itests/harness -Ibuild/gen
 LDLIBS_M  = -lm
 
 export PKG_CONFIG_PATH := $(if $(XW_SYSROOT),$(XW_SYSROOT)/usr/lib/x86_64-linux-gnu/pkgconfig:,$(PKG_CONFIG_PATH))
+# Runtime library resolution for make-spawned test binaries
+# (sysroot libinput pulls transitive deps from the sysroot).
+# No effect without a local sysroot; env.sh does the same for
+# interactive shells.
+export LD_LIBRARY_PATH := $(if $(XW_SYSROOT),$(XW_SYSROOT)/usr/lib/x86_64-linux-gnu$(if $(LD_LIBRARY_PATH),:$(LD_LIBRARY_PATH)),$(LD_LIBRARY_PATH))
 
 WAYLAND_SCANNER := $(firstword $(wildcard $(XW_SYSROOT)/usr/bin/wayland-scanner) $(shell command -v wayland-scanner 2>/dev/null))
 WP_DIR   := $(firstword $(wildcard $(XW_SYSROOT)/usr/share/wayland-protocols) /usr/share/wayland-protocols)
@@ -403,6 +408,7 @@ tests: all
 
 check: tests
 	sh scripts/test-session.sh
+	sh scripts/test-build-regressions.sh
 
 asan:
 	sh scripts/run-asan.sh

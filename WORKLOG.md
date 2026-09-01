@@ -443,3 +443,120 @@ automated test, notification daemon skeleton, xdg geometry offsets
   re-execs with the original argv. New session 1c process checks:
   socket teardown + reappearance, same pid, fresh compositor,
   restarts=0, flags preserved, clean logout.
+
+---
+Task ID: artix-build-fix
+Agent: chief-autonomous-developer
+Task: Fix the clean-distro quick-start failure reported on Artix/XLibre:
+genfont "no usable system TTF font found", dev-session.sh continuing
+past a failed build, and an earlier "zsh: number expected".
+
+Work Log:
+- Investigated: reproduced the font failure exactly (mount-namespace
+  hiding /usr/share/fonts; root cause = 3 hardcoded Debian-layout font
+  paths in tools/genfont.py — Arch-family uses /usr/share/fonts/TTF/...).
+  Confirmed the dev-session cascade (backgrounded launch of missing
+  binaries, silent 5s socket timeout, confusing output, rc=127 late).
+  Audited "zsh: number expected": zsh 5.9 contains exactly 4 such
+  message variants, all from builtin option parsing (read -u/-t/-k
+  style) — none used anywhere in the repo; could NOT be reproduced
+  from any repo script under zsh (script / sourced / bin-sh modes).
+  Most likely origin: the reporter's interactive zsh environment.
+  Response: hardened everything anyway + real zsh test coverage.
+- Bundled font: subset DejaVu Sans 2.37 to ASCII U+0020-007E with
+  pyftsubset (759,720 -> 43,932 bytes; name table incl. embedded
+  license, layout features, hinting preserved). Verified rendering
+  bit-identical to the full font (metrics, advances, anti-aliased
+  pixel strips at sizes 12/16/20/24) — scripts/verify-font-subset.py.
+  License audited: Bitstream Vera + Arev + public-domain DejaVu
+  changes; redistribution permitted with license text; retained name
+  "DejaVu Sans" satisfies the rename condition. assets/fonts/ now
+  carries the subset + LICENSE-DejaVuSans.txt + provenance README;
+  THIRD-PARTY-LICENSES.md updated (font is now redistributed, was
+  "not redistributed" before).
+- genfont.py rewritten: default source = bundled asset (always
+  present, deterministic, distro-agnostic); --font PATH override for
+  packagers; NO system font search at all; precise multi-line
+  diagnostics for missing asset / missing Pillow / bad font file;
+  glyph-count sanity check. Output provenance recorded in the header.
+- Makefile: dependency validation now checks python3 presence, Pillow
+  importability and the bundled asset (actionable $(error) messages,
+  skipped for clean/dist/config as before); XW_FONT knob (rule gains a
+  real dependency on the actual font source); `make config` reports
+  the font source. Patches via byte-precise scripts
+  (scripts/wire-font-asset-mk.py) per the established Makefile lesson.
+- dev-session.sh rewritten fail-fast: preflight existence checks for
+  all 5 binaries (refuses with instructions before launching
+  anything), early-crash detection with foreground-debug hints, socket
+  timeout diagnostic instead of silent continue, correct exit codes,
+  self-sources env.sh (the old script only worked when the parent
+  shell had sourced it — sysroot runtime libs). Found + fixed a REAL
+  zsh incompatibility in the process: zsh does not word-split
+  unquoted expansions, so `for b in $NEEDED` broke the preflight under
+  zsh (literal list now). bootstrap-sysroot.sh had the same class of
+  bug (apt-get download $PKGS) — fixed with a literal list.
+- make check self-containment: the Makefile now exports
+  LD_LIBRARY_PATH when a sysroot is active (symmetric with its
+  PKG_CONFIG_PATH export) — make-spawned test binaries resolve
+  transitive sysroot deps (libinput -> libmtdev) without the parent
+  shell having sourced env.sh. test-session.sh + test-build-regressions
+  self-source env.sh likewise.
+- scripts/test-build-regressions.sh (38 checks, wired into
+  `make check`): R1 font generation (success, determinism, stripped
+  env, 95 glyphs, precise missing-asset/--font diagnostics); R2 build
+  failure propagation (broken xw-panel.c -> make fails, no binary for
+  the failed target, quick-start after PARTIAL build refuses); R3 the
+  Artix regression itself — clean build + full session run with every
+  system font hidden via unprivileged mount namespace (skips honestly
+  where userns is unavailable); R4 dev-session failure modes (unbuilt
+  tree, early-crashing session manager, no leaked processes); R5 shell
+  compatibility: sh/bash/zsh syntax checks, env.sh sourcing under zsh,
+  dev-session refusal + FULL session run under zsh, and a grep guard
+  for the zsh error family ("number expected", "unknown condition",
+  "no matches found", "bad math"). zsh detection falls back to a
+  rootless-extracted .toolchain/zsh-root (zsh 5.9 verified here).
+- Docs: BUILDING.md (quick-start fail-fast notes, bundled-font
+  requirement row, XW_FONT knob, troubleshooting entries for the new
+  diagnostics incl. an honest zsh section), README.md quick-start +
+  status counts (33 + 71 + 38), DEPENDENCIES.md (no font package
+  needed), TESTING.md (new suite + counts), THIRD-PARTY-LICENSES.md
+  (redistribution record).
+- Audited C code for system()/popen: none. execvp with explicit argv
+  for compositor/power; /bin/sh -c only for XDG autostart Exec strings
+  (spec-required, XW_SHELL-overridable) — unchanged, documented.
+- Full verification on the final tree, clean environment (unset
+  LD_LIBRARY_PATH/PKG_CONFIG_PATH/XDG_RUNTIME_DIR): make check =
+  33/33 in-process + 71/71 process-level + 38/38 build regressions,
+  0 skipped; make asan = PASS (ASan+UBSan+LSan, all suites, release
+  restored); dev-session.sh --logout full round trip rc=0; nested X11
+  session under Xvfb: backend auto-selection (DISPLAY, no
+  WAYLAND_DISPLAY -> x11), compositor --backend x11, panel
+  autostarted, x11probe reads back rendered pixels, clean logout rc=0.
+- Honest backend status (verified by running, not by claim): plain
+  `make` + dev-session.sh = HEADLESS backend (real compositor+WM+
+  panel over a real Wayland socket, pixman software rendering, no
+  visible output surface). On X11/XLibre with $DISPLAY:
+  `build/bin/xw-session --nested` = nested x11 backend — the whole
+  desktop as a window inside the X session (verified under Xvfb via
+  the standard X11 protocol XLibre also implements; XTEST input
+  verified). Nested Wayland backend works inside a Wayland parent.
+  Direct DRM/KMS hardware output: NOT implemented (ROADMAP Phase 4).
+
+Stage Summary:
+- The Artix quick-start failure class is eliminated: no system font is
+  ever searched; the build is distro-agnostic and deterministic.
+- dev-session.sh and `make check` are self-contained (no dependence on
+  the parent shell having sourced env.sh) and fail fast with precise
+  diagnostics; a failed or partial build can no longer cascade into
+  half-started sessions.
+- All entry scripts verified under zsh 5.9 (full session runs), bash,
+  dash; the one real zsh hazard found (word-splitting) is fixed and
+  regression-guarded; the reported "zsh: number expected" is provably
+  not producible by repo scripts (documented in BUILDING.md
+  troubleshooting with the reproduction hint `zsh -f`).
+- New artifacts: assets/fonts/{DejaVuSans-ascii.ttf,LICENSE-
+  DejaVuSans.txt,README.md}, scripts/{test-build-regressions.sh,
+  verify-font-subset.py,wire-font-asset-mk.py,wire-check-target-mk.py,
+  wire-sysroot-ldlib-mk.py}, .toolchain/zsh-root (gitignored, local).
+- Suite totals: 33 in-process, 71 process-level, 38 build regressions,
+  sanitizer-clean.

@@ -15,6 +15,11 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/build/bin"
 
+# Pick up the optional local sysroot (runtime library paths included)
+# so sysroot-built binaries resolve their dependencies. No-op on normal
+# distributions.
+. "$ROOT/scripts/env.sh" >/dev/null 2>&1 || true
+
 if [ ! -x "$BIN/xw-session" ] || [ ! -x "$BIN/xw-compositor" ] ||
    [ ! -x "$BIN/xw-session-ctl" ]; then
     echo "test-session: build first (make all)" >&2

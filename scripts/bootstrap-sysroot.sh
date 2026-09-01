@@ -21,9 +21,6 @@ TC="$XW_ROOT/.toolchain"
 DL="$TC/dl"
 SYS="$TC/sysroot"
 
-PKGS="libwayland-dev libwayland-bin wayland-protocols libxkbcommon-dev \
-libinput-dev libinput10 libudev-dev libxtst-dev libxtst6 libxi-dev libxi6 libevdev2 libwacom9"
-
 command -v apt-get >/dev/null 2>&1 || {
     echo "bootstrap: apt-get not found — this helper is Debian-family only." >&2
     echo "bootstrap: install the equivalent development packages with your" >&2
@@ -33,7 +30,14 @@ command -v apt-get >/dev/null 2>&1 || {
 
 mkdir -p "$DL" "$SYS"
 echo "bootstrap: downloading packages (no root, no system changes)"
-(cd "$DL" && apt-get download $PKGS)
+
+# Literal package list: zsh does not word-split unquoted parameter
+# expansions, so `apt-get download $PKGS` would pass one giant argument
+# when this script runs under zsh.
+(cd "$DL" && apt-get download \
+    libwayland-dev libwayland-bin wayland-protocols libxkbcommon-dev \
+    libinput-dev libinput10 libudev-dev libxtst-dev libxtst6 \
+    libxi-dev libxi6 libevdev2 libwacom9)
 
 echo "bootstrap: extracting into $SYS"
 for deb in "$DL"/*.deb; do
