@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=XFCE4-Wayland
+Comment=This session starts the xfce4-wayland desktop environment
+Comment[de]=Diese Sitzung startet die xfce4-wayland-Arbeitsumgebung
+Exec=xw-session
+Type=Application
+DesktopNames=XFCE

@@ -11,17 +11,17 @@ cd "$ROOT"
 
 . "$(dirname "$0")/env.sh" >/dev/null 2>&1 || true
 
-ASAN_CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
-ASAN_LDFLAGS="-fsanitize=address,undefined"
+# Sanitizers are driven by `make PROFILE=asan` (single switch, guarded
+# build tree); the runtime options below stay in this script.
 export ASAN_OPTIONS="detect_leaks=1:abort_on_error=1"
 export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"
 
 status=0
 LOGDIR="${TMPDIR:-/tmp}"
 
-echo "== asan: building with sanitizers =="
+echo "== asan: building with sanitizers (PROFILE=asan) =="
 make clean >/dev/null
-if ! make all CFLAGS="$ASAN_CFLAGS" LDFLAGS="$ASAN_LDFLAGS" \
+if ! make all PROFILE=asan \
         >"$LOGDIR/xw-asan-build.log" 2>&1; then
     rg -v '^(cc|ar|mkdir|/home/.*/wayland-scanner|python3) ' \
         "$LOGDIR/xw-asan-build.log" | head -20
@@ -30,7 +30,7 @@ if ! make all CFLAGS="$ASAN_CFLAGS" LDFLAGS="$ASAN_LDFLAGS" \
 fi
 
 echo "== asan: in-process test suite =="
-if ! make tests CFLAGS="$ASAN_CFLAGS" LDFLAGS="$ASAN_LDFLAGS" \
+if ! make tests PROFILE=asan \
         >"$LOGDIR/xw-asan-tests.log" 2>&1; then
     status=1
 fi
