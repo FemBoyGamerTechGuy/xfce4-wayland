@@ -181,10 +181,67 @@ struct xw_backend *xw_backend_nested_create(struct xw_compositor *c,
                                              const struct xw_compositor_config *cfg);
 struct xw_backend *xw_backend_x11_create(struct xw_compositor *c,
                                           const struct xw_compositor_config *cfg);
+#ifdef XW_HAVE_DRM_BACKEND
+struct xw_backend *xw_backend_drm_create(struct xw_compositor *c,
+                                         const struct xw_compositor_config *cfg);
+#endif
+
+/* DRM planning helpers (xw-backend-drm.c, DRM-independent section):
+ * pure functions over plain structs, testable without hardware. */
+struct xw_drm_mode {
+    int hdisplay, vdisplay;
+    int vrefresh;
+    uint32_t type;
+};
+const struct xw_drm_mode *xw_drm_pick_mode(const struct xw_drm_mode *modes,
+                                           int count);
+const char *xw_drm_connector_type_name(uint32_t drm_connector_type);
+void xw_drm_connector_name(uint32_t drm_connector_type, uint32_t type_id,
+                           char *buf, size_t len);
+int xw_drm_plan_crtc(int conn_enc, int enc_crtc, uint32_t enc_possible,
+                     const int *crtc_ids, int n_crtcs, bool *crtc_taken);
 /* generic teardown (ops->destroy) */
 void xw_backend_destroy(struct xw_backend *b);
 /* destroys all outputs of the compositor (shared by backend destroys) */
 void xw_backend_destroy_outputs(struct xw_compositor *c);
+
+/* ------------------------------------------------------- seat providers */
+/* Seat/session acquisition for backends that own real hardware
+ * (xw-session-seat.c). Provider-agnostic: libseat (external, optional),
+ * a built-in seatd wire-protocol client, or a direct VT session.
+ * Nested/headless backends do not create a seat. */
+struct xw_seat_session;
+
+struct xw_seat_events {
+    /* session is becoming inactive: release scanout resources (DRM
+     * master, pending page flips) NOW, then xw_seat_session_ack_disable() */
+    void (*disable)(void *ud);
+    /* session is active again: re-acquire and repaint */
+    void (*enable)(void *ud);
+};
+
+struct xw_seat_impl {
+    int (*open_device)(struct xw_seat_session *s, const char *path,
+                       int *fd_out); /* returns device id >= 0 */
+    int (*close_device)(struct xw_seat_session *s, int device_id);
+    int (*switch_vt)(struct xw_seat_session *s, int vt);
+    int (*ack_disable)(struct xw_seat_session *s);
+    void (*destroy)(struct xw_seat_session *s);
+};
+
+struct xw_seat_session *xw_seat_session_open(struct xw_compositor *c, int provider,
+                                     const char *seat_name);
+void xw_seat_session_set_events(struct xw_seat_session *s,
+                        const struct xw_seat_events *ev, void *ud);
+int xw_seat_session_open_device(struct xw_seat_session *s, const char *path,
+                        int *fd_out);
+int xw_seat_session_close_device(struct xw_seat_session *s, int device_id);
+int xw_seat_session_switch_vt(struct xw_seat_session *s, int vt);
+int xw_seat_session_ack_disable(struct xw_seat_session *s);
+void xw_seat_session_destroy(struct xw_seat_session *s);
+const char *xw_seat_session_name(const struct xw_seat_session *s);
+const char *xw_seat_session_desc(const struct xw_seat_session *s);
+bool xw_seat_session_active(const struct xw_seat_session *s);
 
 /* X11 synthetic key-repeat filter (libxw/xw-backend-x11.c; exposed for
  * white-box tests — no X server needed to exercise the logic).
@@ -203,6 +260,11 @@ bool xw_x11_key_filter(uint32_t *pressed_words, uint32_t linux_keycode,
 struct xw_input_libinput;
 struct xw_input_libinput *xw_input_libinput_create(struct xw_compositor *c);
 void xw_input_libinput_destroy(struct xw_input_libinput *in);
+/* session lifecycle: stop/start reading devices while the session is
+ * inactive (VT switched away) — libinput_suspend drops the devices,
+ * libinput_resume re-opens them through the seat provider. */
+void xw_input_libinput_suspend(struct xw_input_libinput *in);
+int xw_input_libinput_resume(struct xw_input_libinput *in);
 
 /* Event handlers: the real translation pipeline used by the libinput
  * event loop, callable directly (white-box tests, no hardware).
@@ -594,6 +656,11 @@ struct xw_compositor {
     int n_children;
 
     struct xw_backend *backend;
+
+    /* seat/session provider for hardware-owning backends (DRM); NULL
+     * for nested/headless. Created before the backend, destroyed after
+     * it: the backend's teardown releases devices through it. */
+    struct xw_seat_session *seat;
 
     /* real-input source (libinput; NULL when absent or disabled) */
     struct xw_input_libinput *input;

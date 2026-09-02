@@ -17,6 +17,10 @@
 # Knobs (make VAR=value, or config.local.mk):
 #   XW_X11=auto|1|0        nested X11 backend (libX11)
 #   XW_LIBINPUT=auto|1|0   real-input backend (libinput)
+#   XW_DRM=auto|1|0        real DRM/KMS backend (libdrm + libudev)
+#   XW_LIBSEAT=auto|1|0    external libseat seat provider (libseat;
+#                          the built-in seatd-client and direct-VT
+#                          providers need no library)
 #   PROFILE=release|debug|asan   build profile (switching needs
 #                          `make clean`; the guard enforces it)
 #   prefix=DIR             installation prefix ($HOME/.local works)
@@ -26,6 +30,12 @@
 
 # Optional local overrides (sysroot, CC, extra flags).
 -include config.local.mk
+
+# Optional feature knobs for the real-session components.
+XW_X11      ?= auto
+XW_LIBINPUT ?= auto
+XW_DRM      ?= auto
+XW_LIBSEAT  ?= auto
 
 # Optional local sysroot holding wayland dev files (headers, scanner,
 # protocol XML); never committed. If unset we auto-detect
@@ -244,16 +254,96 @@ endif
 ifeq ($(LIBINPUT_ON),y)
 CFLAGS_LIBINPUT := $(shell pkg-config --cflags libinput 2>/dev/null)
 LDLIBS_LIBINPUT := $(shell pkg-config --libs libinput 2>/dev/null)
-CFLAGS_LIBUDEV  := $(shell pkg-config --cflags libudev 2>/dev/null)
-LDLIBS_LIBUDEV  := $(shell pkg-config --libs libudev 2>/dev/null)
 HAVE_LIBINPUT   := -DXW_HAVE_LIBINPUT
 else
 CFLAGS_LIBINPUT :=
 LDLIBS_LIBINPUT :=
-CFLAGS_LIBUDEV  :=
-LDLIBS_LIBUDEV  :=
 HAVE_LIBINPUT   :=
 endif
+
+
+# DRM/KMS backend — XW_DRM = auto|1|0. Needs libdrm AND libudev dev
+# files: the backend includes <xf86drm.h>/<xf86drmMode.h> directly and
+# runs its own udev hotplug monitor, so libudev is a direct link
+# dependency (same reasoning as the libinput block above). Without it
+# the compositor still builds and runs headless/nested; the DRM
+# planning helpers stay compiled (they are libdrm-free) and their tests
+# keep running.
+DRM_FOUND      := $(shell pkg-config --libs libdrm >/dev/null 2>&1 && echo y)
+LIBUDEV_FOUND2 := $(shell pkg-config --exists libudev 2>/dev/null && echo y)
+ifeq ($(XW_DRM),1)
+  ifneq ($(DRM_FOUND),y)
+    $(error DRM backend requested (XW_DRM=1) but the libdrm development files were not found. The DRM backend drives physical display hardware for real TTY sessions; the compositor, nested backends and all tests build and run without it. Install your distribution's libdrm development package (BUILDING.md), or build with XW_DRM=auto/0.)
+  endif
+  ifneq ($(LIBUDEV_FOUND2),y)
+    $(error DRM backend requested (XW_DRM=1) but the libudev development files were not found (pkg-config module 'libudev'). The DRM backend runs its own udev monitor for display hotplug, which makes libudev a direct link dependency. Install your distribution's libudev development package (BUILDING.md), or build with XW_DRM=auto/0.)
+  endif
+  DRM_ON := y
+else ifeq ($(XW_DRM),0)
+  DRM_ON :=
+else
+  ifeq ($(DRM_FOUND)$(LIBUDEV_FOUND2),yy)
+    DRM_ON := y
+  else
+    DRM_ON :=
+    $(info drm: libdrm/libudev development files not found — the DRM/KMS backend will not be built (headless, nested X11/Wayland and the seat logic are unaffected).)
+    $(info drm: install the libdrm and libudev development packages (BUILDING.md) to enable real display hardware, or set XW_DRM=0 to silence this note.)
+  endif
+endif
+
+ifeq ($(DRM_ON),y)
+CFLAGS_DRM   := $(shell pkg-config --cflags libdrm 2>/dev/null)
+LDLIBS_DRM   := $(shell pkg-config --libs libdrm 2>/dev/null)
+HAVE_DRM     := -DXW_HAVE_DRM_BACKEND
+else
+CFLAGS_DRM   :=
+LDLIBS_DRM   :=
+HAVE_DRM     :=
+endif
+
+# External libseat seat provider — XW_LIBSEAT = auto|1|0. Optional by
+# design: the compositor has its own seatd wire-protocol client and a
+# direct-VT provider, so no functionality is lost without libseat —
+# it adds the logind/elogind backends through libseat's own runtime
+# selection where the system provides them.
+LIBSEAT_FOUND := $(shell pkg-config --libs libseat >/dev/null 2>&1 && echo y)
+LIBSEAT_VER   := $(shell pkg-config --modversion libseat 2>/dev/null)
+ifeq ($(XW_LIBSEAT),1)
+  ifneq ($(LIBSEAT_FOUND),y)
+    $(error libseat provider requested (XW_LIBSEAT=1) but the libseat development files were not found. The seatd-client and direct-VT providers cover the same ground without it; install your distribution's libseat development package (BUILDING.md) if you want libseat's logind/elogind backends, or build with XW_LIBSEAT=auto/0.)
+  endif
+  LIBSEAT_ON := y
+else ifeq ($(XW_LIBSEAT),0)
+  LIBSEAT_ON :=
+else
+  LIBSEAT_ON := $(LIBSEAT_FOUND)
+  ifneq ($(LIBSEAT_FOUND),y)
+    $(info libseat: development files not found — the external libseat provider will not be built (the built-in seatd client and direct-VT providers are unaffected and remain available).)
+    $(info libseat: install the libseat development package (BUILDING.md) to also support logind/elogind through libseat, or set XW_LIBSEAT=0 to silence this note.)
+  endif
+endif
+
+ifeq ($(LIBSEAT_ON),y)
+CFLAGS_LIBSEAT := $(shell pkg-config --cflags libseat 2>/dev/null)
+LDLIBS_LIBSEAT := $(shell pkg-config --libs libseat 2>/dev/null)
+HAVE_LIBSEAT   := -DXW_HAVE_LIBSEAT
+else
+CFLAGS_LIBSEAT :=
+LDLIBS_LIBSEAT :=
+HAVE_LIBSEAT   :=
+endif
+
+# libudev is a DIRECT link dependency when EITHER the libinput backend
+# or the DRM backend is built (both create their own udev objects), so
+# it resolves independently of which one pulled it in.
+ifneq ($(LIBINPUT_ON)$(DRM_ON),)
+CFLAGS_LIBUDEV := $(shell pkg-config --cflags libudev 2>/dev/null)
+LDLIBS_LIBUDEV := $(shell pkg-config --libs libudev 2>/dev/null)
+else
+CFLAGS_LIBUDEV :=
+LDLIBS_LIBUDEV :=
+endif
+
 
 
 # Resolved-feature stamp guard: like the PROFILE guard, this
@@ -269,14 +359,14 @@ ifeq ($(XW_PROFILE_GUARD),skip)
 XW_FEATURE_GUARD := skip
 endif
 XW_TREE_FEATURES := $(shell cat build/.features 2>/dev/null)
-XW_FEATURES_NOW  := x11=$(if $(X11_ON),y,n) libinput=$(if $(LIBINPUT_ON),y,n)
+XW_FEATURES_NOW  := x11=$(if $(X11_ON),y,n) libinput=$(if $(LIBINPUT_ON),y,n) drm=$(if $(DRM_ON),y,n) libseat=$(if $(LIBSEAT_ON),y,n)
 ifneq ($(XW_FEATURE_GUARD),skip)
 ifneq ($(XW_TREE_FEATURES),$(XW_FEATURES_NOW))
 ifneq ($(wildcard build/obj),)
 ifeq ($(XW_TREE_FEATURES),)
 $(error build tree holds objects but no build/.features stamp (built before feature tracking existed, or by a file-target-only build). Run `make clean` once so the tree records its feature set.)
 else
-$(error build tree holds objects for features '$(XW_TREE_FEATURES)' but the current configuration resolves to '$(XW_FEATURES_NOW)'. Switching XW_X11/XW_LIBINPUT across a resolved-state change needs a clean tree: run `make clean` first.)
+$(error build tree holds objects for features '$(XW_TREE_FEATURES)' but the current configuration resolves to '$(XW_FEATURES_NOW)'. Switching XW_X11/XW_LIBINPUT/XW_DRM/XW_LIBSEAT across a resolved-state change needs a clean tree: run `make clean` first.)
 endif
 endif
 endif
@@ -349,7 +439,7 @@ build/lib/libxw.a: $(LIBXW_OBJ) $(GEN_PROTO_OBJ) | build/lib
 	$(AR) rcs $@ $(LIBXW_OBJ) $(GEN_PROTO_OBJ)
 
 $(OBJ)/libxw/%.o: src/libxw/%.c $(LIBXW_DEPS) $(GEN_HEADERS) | $(OBJ)/libxw
-	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_XKB) $(CFLAGS_PIX) $(HAVE_X11) $(HAVE_LIBINPUT) -c $< -o $@
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_XKB) $(CFLAGS_PIX) $(HAVE_X11) $(HAVE_LIBINPUT) $(HAVE_DRM) $(HAVE_LIBSEAT) -c $< -o $@
 
 # backend files with mixed includes: nested needs wayland-client
 # (loop integration via client-core); x11 needs X11 headers
@@ -358,6 +448,18 @@ $(OBJ)/libxw/xw-backend-nested.o: src/libxw/xw-backend-nested.c $(LIBXW_DEPS) sr
 
 $(OBJ)/libxw/xw-backend-x11.o: src/libxw/xw-backend-x11.c $(LIBXW_DEPS) $(GEN_HEADERS) | $(OBJ)/libxw
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_X11) $(CFLAGS_XKB) $(CFLAGS_PIX) $(HAVE_X11) $(HAVE_LIBINPUT) -c $< -o $@
+
+# DRM backend: the pure planning section needs no libdrm, so the file
+# is ALWAYS compiled (its tests run everywhere); the KMS half is
+# compiled only with libdrm + libudev present
+$(OBJ)/libxw/xw-backend-drm.o: src/libxw/xw-backend-drm.c $(LIBXW_DEPS) $(GEN_HEADERS) | $(OBJ)/libxw
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_DRM) $(CFLAGS_LIBUDEV) $(CFLAGS_XKB) $(CFLAGS_PIX) $(HAVE_DRM) $(HAVE_LIBINPUT) -c $< -o $@
+
+# seat providers: libseat is optional (the built-in seatd client and
+# the direct-VT provider are plain libc); the file is always compiled
+$(OBJ)/libxw/xw-session-seat.o: src/libxw/xw-session-seat.c $(LIBXW_DEPS) $(GEN_HEADERS) | $(OBJ)/libxw
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_LIBSEAT) $(CFLAGS_XKB) $(CFLAGS_PIX) $(HAVE_LIBSEAT) $(HAVE_DRM) -c $< -o $@
+
 
 # libinput backend: needs libinput AND libudev headers — the
 # backend creates the udev context itself (udev seat mode), so
@@ -392,7 +494,7 @@ $(OBJ)/libxwcl/%.o: src/libxwcl/%.c src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/libx
 
 # ---------------------------------------------------------------- server bins
 build/bin/xw-compositor: $(OBJ)/compositor/xw-compositor.o build/lib/libxw.a build/lib/libxwcl.a | build/bin
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/compositor/xw-compositor.o build/lib/libxw.a build/lib/libxwcl.a $(LDLIBS_WLS) $(LDLIBS_WLC) $(LDLIBS_X11) $(LDLIBS_LIBINPUT) $(LDLIBS_LIBUDEV) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/compositor/xw-compositor.o build/lib/libxw.a build/lib/libxwcl.a $(LDLIBS_WLS) $(LDLIBS_WLC) $(LDLIBS_X11) $(LDLIBS_LIBINPUT) $(LDLIBS_LIBUDEV) $(LDLIBS_DRM) $(LDLIBS_LIBSEAT) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
 
 $(OBJ)/compositor/%.o: src/compositor/%.c $(LIBXW_DEPS) $(GEN_HEADERS) | $(OBJ)/compositor
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_XKB) $(CFLAGS_PIX) -c $< -o $@
@@ -426,10 +528,10 @@ $(OBJ)/clients/%.o: src/clients/%.c src/clients/*.h src/libxwcl/*.h $(GEN_HEADER
 # ---------------------------------------------------------------- tests
 TEST_SRC := $(wildcard tests/suite/*.c)
 build/tests/run-tests: $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a | build/tests
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_WLC) $(LDLIBS_X11) $(LDLIBS_LIBINPUT) $(LDLIBS_LIBUDEV) $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_WLC) $(LDLIBS_X11) $(LDLIBS_LIBINPUT) $(LDLIBS_LIBUDEV) $(LDLIBS_DRM) $(LDLIBS_LIBSEAT) $(LDLIBS_M)
 
 $(OBJ)/tests/%.o: tests/suite/%.c tests/harness/xwtest.h $(LIBXW_DEPS) src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/tests
-	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_WLC) $(CFLAGS_PIX) $(CFLAGS_XKB) $(HAVE_X11) $(HAVE_LIBINPUT) -c $< -o $@
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_WLC) $(CFLAGS_PIX) $(CFLAGS_XKB) $(HAVE_X11) $(HAVE_LIBINPUT) $(HAVE_LIBSEAT) $(HAVE_DRM) -c $< -o $@
 
 $(OBJ)/tests/harness.o: tests/harness/harness.c tests/harness/xwtest.h $(LIBXW_DEPS) src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/tests
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_XKB) $(CFLAGS_PIX) -c $< -o $@
@@ -454,6 +556,10 @@ build/tests/miniwm: $(OBJ)/tests/miniwm.o | build/tests
 build/tests/fdtest2: $(OBJ)/tests/fdtest2.o | build/tests
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/fdtest2.o $(LDLIBS_WLS) $(LDLIBS_X11) -lm
 
+# mock seatd server (process-level seat-provider tests; plain libc)
+build/tests/mockseatd: $(OBJ)/tests/mockseatd.o | build/tests
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/mockseatd.o $(LDLIBS_M)
+
 # XTEST probe: xtst dev files live in the optional sysroot (the
 # runtime lib may be there too), so use explicit paths with rpath
 ifeq ($(X11_ON)$(XW_SYSROOT),y$(XW_SYSROOT))
@@ -471,6 +577,11 @@ $(OBJ)/tests/panelprobe.o: tests/panelprobe.c | $(OBJ)/tests
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(CFLAGS_X11) $(CFLAGS_XTST) -c $< -o $@
 
 $(OBJ)/tests/miniwm.o: tests/miniwm.c | $(OBJ)/tests
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(CFLAGS_X11) -c $< -o $@
+
+$(OBJ)/tests/mockseatd.o: tests/mockseatd.c | $(OBJ)/tests
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) -c $< -o $@
+
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(CFLAGS_X11) -c $< -o $@
 
 $(OBJ)/tests/fdtest2.o: tests/fdtest2.c | $(OBJ)/tests
@@ -491,6 +602,7 @@ ifeq ($(X11_ON),y)
 all: build/tests/x11probe build/tests/panelprobe build/tests/miniwm \
 	build/tests/fdtest2
 endif
+all: build/tests/mockseatd
 
 # profile stamp consulted by the PROFILE guard near the top
 build/.profile:
@@ -500,7 +612,7 @@ build/.profile:
 # resolved-feature stamp consulted by the feature guard above
 build/.features:
 	@mkdir -p $(@D)
-	@printf 'x11=%s libinput=%s\n' '$(if $(X11_ON),y,n)' '$(if $(LIBINPUT_ON),y,n)' > $@
+	@printf 'x11=%s libinput=%s drm=%s libseat=%s\n' '$(if $(X11_ON),y,n)' '$(if $(LIBINPUT_ON),y,n)' '$(if $(DRM_ON),y,n)' '$(if $(LIBSEAT_ON),y,n)' > $@
 
 tests: all
 	build/tests/run-tests
@@ -568,5 +680,7 @@ config:
 	@echo "  pixman         $(shell pkg-config --modversion pixman-1 2>/dev/null || echo missing)"
 	@echo "  X11 backend    $(if $(X11_ON),yes (libX11 $(shell pkg-config --modversion x11 2>/dev/null)),no)"
 	@echo "  libinput       $(if $(LIBINPUT_ON),yes (libinput $(LIBINPUT_VER) + libudev $(LIBUDEV_VER)),no)"
+	@echo "  DRM backend    $(if $(DRM_ON),yes (libdrm $(shell pkg-config --modversion libdrm 2>/dev/null) + libudev $(LIBUDEV_VER)),no)"
+	@echo "  libseat        $(if $(LIBSEAT_ON),yes (libseat $(LIBSEAT_VER)),no - built-in seatd client + direct VT provider always available)"
 	@echo "  font source    $(if $(XW_FONT),$(XW_FONT) (XW_FONT override),bundled asset assets/fonts/DejaVuSans-ascii.ttf)"
 	@echo "  install prefix $(prefix)"

@@ -87,11 +87,28 @@ struct xw_output_spec {
 
 /* Backend selection. headless renders into memory (tests/CI/DRM-less
  * development); nested runs as a window inside a parent Wayland
- * compositor; x11 runs as a window inside an X11/XLibre server. */
+ * compositor; x11 runs as a window inside an X11/XLibre server; drm
+ * drives physical display hardware through the kernel's KMS interface
+ * (real TTY sessions; requires a seat/session provider, see
+ * xw_seat_provider below). */
 enum xw_backend_type {
     XW_BACKEND_HEADLESS = 0,
     XW_BACKEND_NESTED,
     XW_BACKEND_X11,
+    XW_BACKEND_DRM,
+};
+
+/* Seat/session provider for the DRM backend. The compositor never
+ * assumes a particular seat manager: libseat (external library that
+ * itself wraps logind/elogind/seatd), a built-in seatd wire-protocol
+ * client, or a direct VT session (classic TTY login with device
+ * ACLs/group permissions). AUTO probes in that order. */
+enum xw_seat_provider {
+    XW_SEAT_PROVIDER_NONE = 0,  /* nested/headless: no seat at all */
+    XW_SEAT_PROVIDER_AUTO,      /* capability detection at runtime */
+    XW_SEAT_PROVIDER_LIBSEAT,
+    XW_SEAT_PROVIDER_SEATD,
+    XW_SEAT_PROVIDER_DIRECT,
 };
 
 /* Real-input source selection (libinput; build-time optional, see
@@ -120,6 +137,9 @@ struct xw_compositor_config {
     int log_level;
     int backend;               /* enum xw_backend_type; 0 = headless */
     int input_mode;            /* enum xw_input_mode; 0 = auto */
+    int seat_provider;         /* enum xw_seat_provider; 0 = none.
+                                 * Ignored unless backend == drm, where
+                                 * 0 means AUTO. */
     /* parent display for nested backends: a WAYLAND_DISPLAY name for
      * XW_BACKEND_NESTED (NULL = inherit $WAYLAND_DISPLAY) or an X
      * display string for XW_BACKEND_X11 (NULL = inherit $DISPLAY) */

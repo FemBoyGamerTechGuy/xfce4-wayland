@@ -47,21 +47,56 @@ struct xw_input_libinput {
     /* sub-pixel pointer accumulation (touchpads move < 1px per event) */
     double acc_x, acc_y;
     /* touch: last absolute position for relative deltas (unused yet) */
+    /* seat-provider device bookkeeping: libinput hands us only the fd
+     * in close_restricted, so map fd -> seat device id here */
+    struct {
+        int fd;
+        int dev_id;
+    } seat_devs[16];
+    int n_seat_devs;
+    bool path_mode; /* XW_INPUT_DEVICES set: device list is fixed */
 };
 
 /* ------------------------------------------------------- open/close glue */
 
+/* Devices are opened through the compositor's seat/session provider
+ * when one exists (real DRM sessions): the seat manager owns device
+ * access, and libinput's open_restricted is exactly the hook it uses.
+ * Without a seat (headless + XW_INPUT_DEVICES debugging) this is a
+ * plain privileged-free open(). */
 static int open_restricted(const char *path, int flags, void *ud) {
-    (void)ud;
-    int fd = open(path, flags | O_CLOEXEC | O_NONBLOCK);
-    if (fd < 0)
-        xw_log(XW_LOG_WARN, "input: cannot open device %s: %s", path,
-               strerror(errno));
+    struct xw_input_libinput *in = ud;
+    int fd = -1;
+    if (in->comp->seat) {
+        int dev_id = xw_seat_session_open_device(in->comp->seat, path, &fd);
+        if (dev_id < 0)
+            return -1;
+        if (in->n_seat_devs < 16) {
+            in->seat_devs[in->n_seat_devs].fd = fd;
+            in->seat_devs[in->n_seat_devs].dev_id = dev_id;
+            in->n_seat_devs++;
+        }
+    } else {
+        fd = open(path, flags | O_CLOEXEC | O_NONBLOCK);
+        if (fd < 0)
+            xw_log(XW_LOG_WARN, "input: cannot open device %s: %s", path,
+                   strerror(errno));
+    }
     return fd;
 }
 
 static void close_restricted(int fd, void *ud) {
-    (void)ud;
+    struct xw_input_libinput *in = ud;
+    if (in->comp->seat) {
+        for (int i = 0; i < in->n_seat_devs; i++) {
+            if (in->seat_devs[i].fd == fd) {
+                xw_seat_session_close_device(in->comp->seat,
+                                     in->seat_devs[i].dev_id);
+                in->seat_devs[i] = in->seat_devs[--in->n_seat_devs];
+                return; /* the seat manager closed the fd */
+            }
+        }
+    }
     close(fd);
 }
 
@@ -341,6 +376,7 @@ struct xw_input_libinput *xw_input_libinput_create(struct xw_compositor *c) {
 
     if (devlist && *devlist) {
         /* path mode: explicit devices, no hotplug, no udev dependency */
+        in->path_mode = true;
         in->li = libinput_path_create_context(&input_iface, in);
         if (!in->li) {
             xw_log(XW_LOG_ERROR, "input: libinput path context failed");
@@ -361,7 +397,10 @@ struct xw_input_libinput *xw_input_libinput_create(struct xw_compositor *c) {
         xw_log(XW_LOG_INFO, "input: libinput path mode: %d device(s) listed, "
                             "%d opened", n, opened);
     } else {
-        /* udev seat mode: real sessions; discovery + hotplug via udev */
+        /* udev seat mode: real sessions; discovery + hotplug via udev.
+         * Device opens still go through the seat provider (see
+         * open_restricted): libinput calls it for every device it
+         * enumerates. */
         in->udev = udev_new();
         if (!in->udev) {
             xw_log(XW_LOG_ERROR, "input: udev unavailable (%s) — no device "
@@ -386,7 +425,8 @@ struct xw_input_libinput *xw_input_libinput_create(struct xw_compositor *c) {
             free(in);
             return NULL;
         }
-        xw_log(XW_LOG_INFO, "input: libinput udev mode, seat '%s'", in->seat);
+        xw_log(XW_LOG_INFO, "input: libinput udev mode, seat '%s'%s", in->seat,
+               c->seat ? " (devices opened through the seat provider)" : "");
     }
 
     int fd = libinput_get_fd(in->li);
@@ -424,4 +464,29 @@ void xw_input_libinput_destroy(struct xw_input_libinput *in) {
     if (in->udev)
         udev_unref(in->udev);
     free(in);
+}
+
+/* ------------------------------------------------------ session lifecycle */
+
+/* VT switch away: stop reading input devices. libinput_suspend closes
+ * them (through close_restricted, i.e. through the seat provider) so
+ * another session's compositor can read them. */
+void xw_input_libinput_suspend(struct xw_input_libinput *in) {
+    if (!in)
+        return;
+    xw_log(XW_LOG_INFO, "input: suspending (session inactive)");
+    libinput_suspend(in->li);
+}
+
+/* VT switch back: re-open the devices (udev mode re-attaches the seat;
+ * path mode re-adds each listed device) */
+int xw_input_libinput_resume(struct xw_input_libinput *in) {
+    if (!in)
+        return 0;
+    xw_log(XW_LOG_INFO, "input: resuming (session active)");
+    if (libinput_resume(in->li) == 0)
+        return 0;
+    xw_log(XW_LOG_ERROR, "input: libinput resume failed: %s",
+           strerror(errno));
+    return -1;
 }

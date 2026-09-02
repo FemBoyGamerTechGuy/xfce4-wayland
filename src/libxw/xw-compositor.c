@@ -299,7 +299,9 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
             c->conf.repeat_rate_hz = atoi(e);
     }
 
-    /* backend + outputs */
+    /* backend + outputs. The DRM backend needs a seat/session provider
+     * FIRST (device fds come from it), so the order is: seat, then
+     * backend (which registers its session-event hooks), then the rest. */
     switch (cfg->backend) {
     case XW_BACKEND_NESTED:
         c->backend = xw_backend_nested_create(c, cfg);
@@ -310,6 +312,22 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
 #else
         xw_log(XW_LOG_ERROR, "x11 backend not compiled in (no libX11 at "
                             "build time)");
+        c->backend = NULL;
+#endif
+        break;
+    case XW_BACKEND_DRM:
+#ifdef XW_HAVE_DRM_BACKEND
+        c->seat = xw_seat_session_open(c,
+                               cfg->seat_provider ? cfg->seat_provider
+                                                  : XW_SEAT_PROVIDER_AUTO,
+                               cfg->seat_name);
+        if (!c->seat)
+            goto fail; /* honest diagnostics were logged by the seat */
+        c->backend = xw_backend_drm_create(c, cfg);
+#else
+        xw_log(XW_LOG_ERROR,
+               "drm backend not compiled in (libdrm development files "
+               "were absent at build time) — headless/nested still work");
         c->backend = NULL;
 #endif
         break;
@@ -349,7 +367,8 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
 
     /* real-input source (libinput). AUTO keeps tests and nested
      * sessions off system devices; only an explicit XW_INPUT_DEVICES
-     * list, XW_INPUT_LIBINPUT or (later) a DRM backend opts in. */
+     * list, XW_INPUT_LIBINPUT, or the DRM backend (a real session
+     * needs real input) opt in. */
 #ifdef XW_HAVE_LIBINPUT
     {
         bool want_input = false;
@@ -362,9 +381,10 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
             break;
         default: {
             const char *devs = getenv("XW_INPUT_DEVICES");
-            want_input = devs && *devs &&
-                         cfg->backend != XW_BACKEND_NESTED &&
-                         cfg->backend != XW_BACKEND_X11;
+            want_input = (devs && *devs &&
+                          cfg->backend != XW_BACKEND_NESTED &&
+                          cfg->backend != XW_BACKEND_X11) ||
+                         cfg->backend == XW_BACKEND_DRM;
             break;
         }
         }
@@ -442,6 +462,13 @@ void xw_compositor_destroy(struct xw_compositor *c) {
 
     xw_backend_destroy(c->backend);
     c->backend = NULL;
+
+    /* the seat provider outlives the backend: the backend's destroy
+     * released its devices through it */
+    if (c->seat) {
+        xw_seat_session_destroy(c->seat);
+        c->seat = NULL;
+    }
 
     xw_layer_shell_fin(c);
     xw_session_lock_fin(c);

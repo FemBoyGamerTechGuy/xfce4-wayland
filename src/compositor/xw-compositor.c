@@ -21,19 +21,31 @@ static void usage(const char *prog) {
            "  headless   no display hardware; deterministic tests/CI (default)\n"
            "  nested     a window inside a parent Wayland session ($WAYLAND_DISPLAY)\n"
            "  x11        a window inside an X11/XLibre session ($DISPLAY)\n"
+           "  drm        physical display hardware (KMS; needs a seat manager)\n"
+           "\n"
+           "Seat providers (drm backend only):\n"
+           "  auto       try libseat, then the seatd socket, then a direct\n"
+           "             VT session (default)\n"
+           "  libseat    the external libseat library (wraps logind/elogind/\n"
+           "             seatd as configured by the system)\n"
+           "  seatd      the built-in seatd wire-protocol client\n"
+           "  direct     take over the controlling tty directly\n"
            "\n"
            "Options:\n"
-           "  -B, --backend NAME     headless | nested | x11\n"
-           "  -I, --input MODE       auto | libinput | none (real input;\n"
-           "                            auto only with $XW_INPUT_DEVICES)\n"
-           "  -c, --config-dir DIR   configuration directory (INI files)\n"
-           "  -s, --socket NAME      wayland socket name (default: auto)\n"
-           "  -o, --output SPEC      output spec WxH (repeatable, e.g. -o 1280x720)\n"
-           "  -D, --parent-display NAME  parent display of the nested backend\n"
-           "                            (WAYLAND_DISPLAY name or X display string)\n"
-           "  -q, --quiet            warnings only\n"
-           "  -v, --verbose          debug logging\n"
-           "  -h, --help             this help\n",
+           "  -B, --backend NAME        headless | nested | x11 | drm\n"
+           "  -P, --seat-provider NAME  auto | libseat | seatd | direct\n"
+           "  -I, --input MODE          auto | libinput | none (real input;\n"
+           "                               auto only with $XW_INPUT_DEVICES or\n"
+           "                               the drm backend)\n"
+           "  -c, --config-dir DIR      configuration directory (INI files)\n"
+           "  -s, --socket NAME         wayland socket name (default: auto)\n"
+           "  -t, --seat NAME           seat name (default: seat0)\n"
+           "  -o, --output SPEC         output spec WxH (repeatable; headless)\n"
+           "  -D, --parent-display NAME parent display of the nested backend\n"
+           "                               (WAYLAND_DISPLAY name or X display)\n"
+           "  -q, --quiet               warnings only\n"
+           "  -v, --verbose             debug logging\n"
+           "  -h, --help                this help\n",
            prog);
 }
 
@@ -44,6 +56,21 @@ static int parse_backend(const char *name) {
         return XW_BACKEND_NESTED;
     if (strcmp(name, "x11") == 0 || strcmp(name, "X11") == 0)
         return XW_BACKEND_X11;
+    if (strcmp(name, "drm") == 0 || strcmp(name, "DRM") == 0 ||
+        strcmp(name, "kms") == 0)
+        return XW_BACKEND_DRM;
+    return -1;
+}
+
+static int parse_seat_provider(const char *name) {
+    if (!name || strcmp(name, "auto") == 0)
+        return XW_SEAT_PROVIDER_AUTO;
+    if (strcmp(name, "libseat") == 0)
+        return XW_SEAT_PROVIDER_LIBSEAT;
+    if (strcmp(name, "seatd") == 0)
+        return XW_SEAT_PROVIDER_SEATD;
+    if (strcmp(name, "direct") == 0)
+        return XW_SEAT_PROVIDER_DIRECT;
     return -1;
 }
 
@@ -65,9 +92,11 @@ int main(int argc, char **argv) {
 
     static const struct option longopts[] = {
         {"backend", required_argument, NULL, 'B'},
+        {"seat-provider", required_argument, NULL, 'P'},
         {"input", required_argument, NULL, 'I'},
         {"config-dir", required_argument, NULL, 'c'},
         {"socket", required_argument, NULL, 's'},
+        {"seat", required_argument, NULL, 't'},
         {"output", required_argument, NULL, 'o'},
         {"parent-display", required_argument, NULL, 'D'},
         {"quiet", no_argument, NULL, 'q'},
@@ -77,12 +106,24 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "B:I:c:s:o:D:qvh", longopts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "B:P:I:c:s:t:o:D:qvh", longopts,
+                              NULL)) != -1) {
         switch (opt) {
         case 'B':
             backend = parse_backend(optarg);
             if (backend < 0) {
-                fprintf(stderr, "unknown backend '%s' (headless|nested|x11)\n",
+                fprintf(stderr,
+                        "unknown backend '%s' (headless|nested|x11|drm)\n",
+                        optarg);
+                return 1;
+            }
+            break;
+        case 'P':
+            cfg.seat_provider = parse_seat_provider(optarg);
+            if (cfg.seat_provider < 0) {
+                fprintf(stderr,
+                        "unknown seat provider '%s' "
+                        "(auto|libseat|seatd|direct)\n",
                         optarg);
                 return 1;
             }
@@ -90,7 +131,8 @@ int main(int argc, char **argv) {
         case 'I':
             cfg.input_mode = parse_input(optarg);
             if (cfg.input_mode < 0) {
-                fprintf(stderr, "unknown input mode '%s' (auto|libinput|none)\n",
+                fprintf(stderr,
+                        "unknown input mode '%s' (auto|libinput|none)\n",
                         optarg);
                 return 1;
             }
@@ -100,6 +142,9 @@ int main(int argc, char **argv) {
             break;
         case 's':
             cfg.socket_name = optarg;
+            break;
+        case 't':
+            cfg.seat_name = optarg;
             break;
         case 'D':
             cfg.parent_display = optarg;
@@ -141,6 +186,21 @@ int main(int argc, char **argv) {
     if (cfg.log_level == 0)
         cfg.log_level = XW_LOG_INFO;
     cfg.backend = backend;
+    /* $XW_SEAT_PROVIDER overrides the build default (auto) unless the
+     * flag was given explicitly */
+    if (!cfg.seat_provider) {
+        const char *env = getenv("XW_SEAT_PROVIDER");
+        if (env && *env) {
+            int p = parse_seat_provider(env);
+            if (p > 0)
+                cfg.seat_provider = p;
+            else
+                fprintf(stderr,
+                        "ignoring unknown $XW_SEAT_PROVIDER '%s'\n", env);
+        }
+    }
+    if (backend == XW_BACKEND_DRM && !cfg.seat_provider)
+        cfg.seat_provider = XW_SEAT_PROVIDER_AUTO;
     if (n_outputs > 0) {
         cfg.outputs = outputs;
         cfg.n_outputs = n_outputs;

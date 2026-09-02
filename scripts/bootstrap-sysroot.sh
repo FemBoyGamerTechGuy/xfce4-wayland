@@ -34,10 +34,16 @@ echo "bootstrap: downloading packages (no root, no system changes)"
 # Literal package list: zsh does not word-split unquoted parameter
 # expansions, so `apt-get download $PKGS` would pass one giant argument
 # when this script runs under zsh.
+#
+# libdrm-dev / libseat-dev / seatd: DRM/KMS + seat-provider development
+# files for the real TTY session (Phase 4). Their runtimes: libdrm2 is
+# installed system-wide here; libseat1 is not, so it is extracted and
+# rpath'd like libinput (see below).
 (cd "$DL" && apt-get download \
     libwayland-dev libwayland-bin wayland-protocols libxkbcommon-dev \
     libinput-dev libinput10 libudev-dev libxtst-dev libxtst6 \
-    libxi-dev libxi6 libevdev2 libwacom9 libmtdev1t64 libgudev-1.0-0)
+    libxi-dev libxi6 libevdev2 libwacom9 libmtdev1t64 libgudev-1.0-0 \
+    libdrm-dev libdrm2 libseat-dev libseat1 seatd)
 
 echo "bootstrap: extracting into $SYS"
 for deb in "$DL"/*.deb; do
@@ -61,7 +67,8 @@ echo "bootstrap: linking dev .so symlinks to matching system runtime libs"
 # copy so binaries run without rpath gymnastics.
 for soname in \
     libwayland-client.so.0 libwayland-server.so.0 libwayland-cursor.so.0 \
-    libwayland-egl.so.0 libxkbcommon.so.0 libudev.so.1
+    libwayland-egl.so.0 libxkbcommon.so.0 libudev.so.1 libdrm.so.2 \
+    libseat.so.1
 do
     base="${soname%.so.*}"
     if [ -e "/lib/x86_64-linux-gnu/$soname" ]; then
@@ -72,16 +79,24 @@ done
 # libinput runtime is NOT installed system-wide here: keep the sysroot
 # copy, link the dev name to it, and record the rpath in libinput.pc
 # (upstream's Requires: libudev is preserved so -ludev resolves too).
+# libseat runtime likewise: rpath it, but link the dev .so to the SYSTEM
+# copy of libsystemd (its logind backend's dependency) is unnecessary —
+# libsystemd.so.0 is installed system-wide and libseat.so.1 resolves it
+# at load time through DT_NEEDED, not through our link line.
 # libmtdev + libgudev are libinput's/libwacom's own runtime deps: they
 # must be extracted too, or the final link fails with "DSO missing"/
 # undefined references (g_udev_*, mtdev_*) — apt-get download does not
 # resolve dependency closures, so they are listed explicitly above.
-if [ -e "$LIB/libinput.so.10" ]; then
-    ln -sf libinput.so.10 "$LIB/libinput.so"
-    sed -i "s|^Libs:.*|Libs: -L\${libdir} -Wl,-rpath,\${libdir} -linput|" "$PC/libinput.pc"
-    grep -q "^Requires: libudev" "$PC/libinput.pc" ||
-        sed -i "s|^Libs:|Requires: libudev\nLibs:|" "$PC/libinput.pc"
-fi
+for libname in libinput libseat; do
+    soname="${libname}$( [ "$libname" = libinput ] && echo .so.10 || echo .so.1 )"
+    if [ -e "$LIB/$soname" ]; then
+        ln -sf "$soname" "$LIB/$libname.so"
+        sed -i "s|^Libs:.*|Libs: -L\${libdir} -Wl,-rpath,\${libdir} -l${libname#lib}|" \
+            "$PC/$libname.pc"
+    fi
+done
+grep -q "^Requires: libudev" "$PC/libinput.pc" ||
+    sed -i "s|^Libs:|Requires: libudev\nLibs:|" "$PC/libinput.pc"
 
 echo "bootstrap: verifying wayland-scanner"
 "$SYS/usr/bin/wayland-scanner" --version
