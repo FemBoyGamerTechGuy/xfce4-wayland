@@ -1556,3 +1556,54 @@ Stage Summary:
   moves the mouse in the two live windows, and sends back the
   xw-seat-repair-*.log (or the pacman output if the manual install
   still refuses).
+
+---
+Task ID: success-round (2026-09-02)
+Agent: main
+Task: user sent the xw-tty-capture-20260902-184653 log after
+running the manual repair commands — verify the fix end to end.
+
+Work Log:
+- Read upload/Pasted Content_1788364132864.txt (490 lines).
+  The repair WORKED and the whole stack is now healthy:
+  [1] pkg-config libseat 0.9.3 exit 0; pacman -Qi seatd fully
+  populated (Desc, 110.79 KiB, install date TODAY 18:39:42,
+  signature-validated — the manual 3-command recipe from the
+  conflict-round reply); ldd shows libseat.so.1 resolved.
+  [2] build/.features = x11=y libinput=y drm=y libseat=y; binaries
+  rebuilt 18:43 (fresh). CHECK lines all positive.
+  [4] bare compositor window: Seat opened with backend 'logind',
+  session active, DRM card1 via libseat, HDMI-A-1 1920x1080@144,
+  ALL 18 /dev/input nodes opened THROUGH the seat provider
+  (fds 22-39), 8 devices acquired (7 keyboard, 3 pointer incl.
+  "Gaming Mouse"), clean SIGTERM exit. No EACCES anywhere.
+  [5] full session window: session dbus up, compositor ready,
+  xw-panel mapped as a 1920x28 layer-shell bar, pipewire/
+  wireplumber/xfce4-power-manager/polkit/xfsettingsd started,
+  session ready, ordered teardown at timeout. Compositor itself
+  logged ZERO errors.
+- Remaining log noise is all unrelated/pre-existing: pipewire
+  RTKit ServiceUnknown (no rtkit daemon on Artix; graceful
+  fallback), xfce4-power-manager wanting wlr-output-power-
+  management (roadmap), xfsettingsd wanting wlr-output-management
+  (roadmap), libcamera SPA plugin notice. None affect input.
+- The seatd daemon is not running (/run/seatd.sock absent) and
+  does not need to be — the logind/elogind route through libseat
+  is the active provider; the built-in seatd wire client remains
+  a dormant backup route.
+- User's tree: HEAD c6ff91a with local modifications to both xw
+  scripts (their edits, untouched). The a977985/4eaae95 commits
+  (repair-script hardening + worklogs) remain local-only in this
+  workspace — nothing on the user's machine needs them; origin
+  already has everything they use.
+
+Stage Summary:
+- THE FROZEN-MOUSE SAGA IS CLOSED: corrupted seatd package ->
+  zero-byte libseat -> no broker -> EACCES on /dev/input was the
+  entire cause; deterministic repair applied; input acquisition
+  verified working through libseat's logind backend.
+- Next steps if the user continues: roadmap items surfaced by
+  the session log (wlr-output-power-management for DPMS,
+  wlr-output-management for display settings), plus general
+  hardening/testing. The 119-package system update they aborted
+  with the failed -Syu should still be run (sudo pacman -Syu).
