@@ -1013,3 +1013,29 @@ Stage Summary:
 - Honest gaps: physical DRM verification (needs a real machine;
   checklist written), live modeset of newly plugged monitors,
   atomic modesetting, hardware cursor planes, GL/EGL rendering.
+
+---
+Task ID: 2026-09-02-phase4-push
+Agent: main (Super Z)
+Task: push the Phase 4 commits
+
+Work Log:
+- Push attempted: `git push origin main` fails — the container came
+  back bare and ~/.git-credentials (configured in the previous
+  session with the user's PAT) was wiped with it. The credential
+  helper is still `store`; only the token is missing.
+- The four Phase 4 commits are complete and verified locally at HEAD
+  (22b4331): 461d43c seat+drm, a405b26 session backend selection,
+  4bbda32 tests, 22b4331 docs. Full suite green on the committed
+  tree: 63/63 in-process, 103/103 process-level, 50/50 build
+  regressions, `make asan` PASS.
+
+Stage Summary:
+- Push is blocked on credentials only. Re-provision the PAT (never
+  echo it, never commit it) with:
+    git config --global credential.helper store
+    printf 'https://<TOKEN>@github.com\n' > ~/.git-credentials
+    chmod 600 ~/.git-credentials
+    git push origin main
+- Until then the work is safe locally on main ahead of origin by 4
+  commits.
