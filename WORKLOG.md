@@ -1074,3 +1074,60 @@ Stage Summary:
   verification (manual checklist in TESTING.md), live modeset of
   newly plugged monitors, atomic modesetting, hardware cursor
   planes, GL/EGL rendering.
+
+---
+Task ID: 2026-09-02-input-path-instrumentation
+Agent: main (Super Z)
+Task: Instrument the physical input path end to end per the real-TTY
+bug contract (cursor visible, mouse dead), fix the first confirmed
+defects found during the audit, and make the panel chain independently
+traceable.
+
+Work Log:
+- Recovered an unverified auto-checkpoint commit (UUID message) that
+  contained the planned instrumentation; found it did not build
+  (missing <errno.h> in test_input.c) — fixed, rebuilt clean.
+- Audited the full input wiring: compositor creates the seat session
+  BEFORE xw_input_libinput_create (open_restricted can go through the
+  provider); the libinput fd IS wired via wl_event_loop_add_fd;
+  on_libinput_fd -> libinput_dispatch -> drain loop verified.
+- CONFIRMED DEFECT #1: drain_libinput() never called
+  libinput_event_destroy() — the libinput contract's destroy step was
+  missing; every event object leaked in real sessions (CI drives the
+  translation handlers directly, so tests never saw it). Fixed.
+- CONFIRMED DEFECT #2 (robustness): xwc_layer_create dereferenced a
+  NULL zwlr layer_shell global when the panel connected to a
+  compositor without layer-shell (wrong WAYLAND_DISPLAY) — now a
+  clean error.
+- Added per the contract: structured input-acquisition failure report
+  (provider/seat/session state/backend/node counts/last error/
+  legitimate fixes — never root/chmod); device-open logs with fd +
+  seat device id proving the compositor consumes the seat-granted fd;
+  three-level pointer trace + KEY/BUTTON/AXIS event logs; seat
+  environment report (libseat/seatd socket/logind/elogind/dbus);
+  libseat's own backend logs surfaced.
+- Panel track: XW_PANEL_TRACE chain trace (auto-on with
+  xw-session --verbose), compositor-side layer map log with stored
+  namespace, panel launched as a first-class session component
+  (--no-panel / XW_PANEL_CMD=none).
+- Verified in-container: headless+panel smoke run shows the complete
+  chain in order; missing-device run shows the acquisition report.
+- Full battery: 64/64 in-process (+1 new acquisition-report test),
+  103/103 process-level, 50/50 build regressions, make asan PASS.
+- BUILDING.md: per-provider input-permission table + diagnostic
+  contract (the most likely real-machine fix: `input` group for
+  direct VT sessions — /dev/input/event* is root:input 0660 on bare
+  TTY logins).
+
+Stage Summary:
+- Commit f5c7324 "input: full physical-input path instrumentation +
+  event-destroy fix" (amended from the broken checkpoint).
+- The code path is now fully observable: a single real-TTY run of
+  `xw-session --backend=drm --verbose` will pinpoint the exact step
+  where physical input dies (seat open? device open? events? motion?
+  damage?) and the panel's exact broken step.
+- Awaiting the user's hardware run: most probable cause given
+  symptoms (DRM scanout OK + input EACCES + no seat daemon on a bare
+  TTY) is direct-provider EACCES on /dev/input/event* — the report
+  will name it with the legitimate fix (usermod -aG input + re-login,
+  or run seatd and join the seat group).
