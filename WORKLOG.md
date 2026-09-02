@@ -1279,3 +1279,32 @@ Stage Summary:
   first" then "/dev/input/eventN opened through seat provider ... (fd
   N)" with keyboard + pointer counts > 0 - the frozen-mouse root
   cause (build without libseat) is then fully closed.
+
+---
+Task ID: push round (2026-09-02)
+Agent: main
+Task: user supplied a fine-grained GitHub PAT in chat; push the
+commits stranded locally (push blocked since the credential store
+was wiped)
+
+Work Log:
+- Token handled with zero persistence: command-scoped XW_PUSH_TOKEN
+  env var + GIT_ASKPASS scripts/git-askpass-env.sh (helper contains
+  no secret, echoes the env var); git run with `-c credential.helper=`
+  because a repo/global `credential.helper store` IS configured and
+  would otherwise auto-save the token to ~/.git-credentials. Token
+  never written to any file, log or worklog entry.
+- Pushed 01f4b4b..bc997d2 (3b1d2fa session d-bus, d376786 + bc997d2
+  worklogs, e354474 Arch package-name fix) plus this round's
+  checkpoint commit (askpass helper + this entry).
+- Recommended the user rotate/revoke the PAT after confirming the
+  push (it transited a plaintext chat).
+
+Stage Summary:
+- origin/main restored to full sync; nothing stranded locally.
+- Real-machine sequence to close the frozen-mouse issue for good:
+  git pull; sudo pacman -S seatd; pkg-config --modversion libseat
+  (expect 0.9.x); make clean && make; cat build/.features ->
+  libseat=y; relaunch xw-session --backend=drm --verbose from the
+  TTY login (no sudo) and expect "opened through seat provider" per
+  input device.
