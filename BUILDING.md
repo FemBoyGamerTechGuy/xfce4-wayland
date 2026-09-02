@@ -131,7 +131,7 @@ the configurable install prefix.
 | `XW_X11` | `auto` (default) / `1` / `0` | nested X11 backend. `auto` builds it when libX11 dev files are found and prints an actionable note otherwise; `1` requires it (hard error with instructions); `0` never builds it |
 | `XW_LIBINPUT` | `auto` (default) / `1` / `0` | real-input backend (needs the libinput **and** libudev dev sets — see the requirement row above). `auto` builds it when both are found, printing an actionable note naming the missing one otherwise; `1` requires both (hard error naming whichever is missing); `0` never builds it. Switching the backend on/off over a populated build tree requires `make clean` (the build refuses to mix feature sets, exactly like PROFILE switching) |
 | `XW_DRM` | `auto` (default) / `1` / `0` | DRM/KMS backend for real TTY sessions (needs the libdrm **and** libudev dev sets). `auto` builds it when both are found; `1` requires both (hard error); `0` never builds it — headless/nested and all their tests keep working. Switching over a populated tree needs `make clean` |
-| `XW_LIBSEAT` | `auto` (default) / `1` / `0` | external libseat seat provider. Optional by design (the built-in seatd client and direct-VT provider need nothing); `1` requires the libseat dev files, `auto` builds the provider when found |
+| `XW_LIBSEAT` | `auto` (default) / `1` / `0` | external libseat seat provider — **the elogind/logind path on real TTYs needs it**. `auto` builds it when the dev files are found and prints a warning naming the real-TTY consequence when not (no keyboard/mouse on logind systems); `1` requires the libseat dev files (hard error with instructions); `0` builds without and silences the warning. Switching over a populated tree needs `make clean` |
 | `PROFILE` | `release` (default) / `debug` / `asan` | compiler/linker preset, see [profiles](#build-profiles) |
 | `prefix` | path (default `/usr/local`) | installation prefix |
 | `DESTDIR` | path | staged install root (packagers) |
@@ -146,9 +146,10 @@ the configurable install prefix.
 | `XW_INPUT_DEVICES` | colon-separated evdev nodes for the input source's path mode (`/dev/input/event3:/dev/input/event5`); deterministic, no udev needed. Setting it is the explicit opt-in that lets AUTO mode touch real devices |
 | `XW_REPEAT_DELAY_MS`, `XW_REPEAT_RATE_HZ` | override the key-repeat parameters for debugging/testing (defaults 500 ms / 30 Hz) |
 | `XW_BACKEND`, `XW_COMPOSITOR` | used by `xw-session` (see `xw-session --help`) |
-| `XW_SEAT_PROVIDER` | force the seat provider for the DRM backend (`auto` / `libseat` / `seatd` / `direct`); the compositor's `--seat-provider` flag wins over it |
+| `XW_SEAT_PROVIDER` | force the seat provider for the DRM backend (`auto` / `elogind` (`logind` alias) / `seatd` / `direct` / `libseat`); the compositor's `--seat-provider` flag wins over it |
 | `SEATD_SOCK` | seatd socket path for the built-in seatd client (default `/run/seatd.sock`); also honored by libseat itself |
 | `LIBSEAT_BACKEND` | when using the libseat provider: force libseat's own backend (`seatd` / `logind`) instead of its auto-probing |
+| `XW_SESSION_DBUS` | `xw-session` starts a session dbus-daemon on `$XDG_RUNTIME_DIR/bus` (and exports `$DBUS_SESSION_BUS_ADDRESS` to all session children) when no bus is reachable — pipewire, wireplumber, xfsettingsd, polkit agents and portals need one, and a TTY login provides none. Set `0` to opt out (e.g. when wrapping the session in `dbus-run-session` or relying on a distro user-bus service); a live bus at that path or in `$DBUS_SESSION_BUS_ADDRESS` is reused, a stale address is replaced, never silently trusted |
 | `XW_LOCK_TIMEOUT_MS` | session-lock grace period before the `locked` event is forced with a blank frame when the lock client has not committed surfaces (default 1000 ms) |
 | `XW_LOCK_PASSPHRASE_FILE` | passphrase file for `xw-lock` (default: `~/.config/xfce4-wayland/lock-pass`, first line, `chmod 600` it; see `xw-lock --help`) |
 
@@ -438,6 +439,66 @@ sessions with elogind (missing `pam_elogind`/`pam_systemd`) — that is
 the machine configuration to fix, or use seatd / the `input` group
 instead.
 
+### The most common real-TTY failure: libseat missing at build time
+
+If the desktop renders (cursor visible, panel drawn) but the keyboard
+and mouse are dead, and the `--verbose` log shows this signature:
+
+```
+[xw-info] seat: environment: libseat not compiled into this build; ...
+[xw-info] seat: elogind/logind is present, but this build has
+           no libseat support — the logind path is unavailable
+[xw-warn] seat: direct: cannot open /dev/input/event9: Permission denied
+[xw-error] input: 0 device(s) acquired through direct (vt 1)
+           (0 keyboard, 0 pointer; 18 /dev/input event node(s) present)
+```
+
+...then the machine is *correctly configured* and the compositor
+behaved *correctly* — the session manager could not grant what the
+build cannot ask for. Line by line:
+
+* DRM scanout worked because `/dev/dri/cardN` carries udev `uaccess`
+  ACLs for the active login — that is why the desktop renders.
+* Keyboards and mice are **not** granted through file ACLs. By design
+  they are handed out only by a seat manager: logind/elogind's
+  `org.freedesktop.login1` TakeDevice, or the seatd daemon. The
+  compositor's elogind provider speaks that API **through libseat**,
+  and this build has libseat compiled out — so the elogind step is
+  skipped, there is no seatd socket, and the direct-VT fallback is
+  left with the login's own permissions.
+* `Permission denied` on every `/dev/input/event*` node is that
+  fallback being honest. The compositor will not run as root, not
+  chmod devices, and not fake input — the missing piece is a build
+  dependency, and `make` already warned about it at build time.
+
+The fix is one package plus a rebuild:
+
+| Distribution | Install |
+|---|---|
+| Debian / Ubuntu | `sudo apt install libseat-dev` |
+| Arch / Artix | `sudo pacman -S libseat` |
+| Fedora | `sudo dnf install libseat-devel` |
+| Void | `sudo xbps-install libseat-devel` |
+| Alpine | `sudo apk add libseat-dev` |
+| Gentoo | `sudo emerge gui-libs/libseat` |
+
+```sh
+make clean && make    # feature switches over a built tree need the clean
+xw-session --backend=drm --verbose
+```
+
+The log then shows `seat: elogind/logind detected … trying libseat's
+logind backend first`, and every input device is granted by the
+session manager (`/dev/input/eventN opened through seat provider …
+(fd N)`) — no group membership, no root, no chmod.
+
+If libseat is genuinely unavailable for the distribution, the two
+legitimate alternatives are the [seatd service](#setting-up-seatd-examples-by-init-system)
+(a daemon plus the `seat` group) or, on direct-VT-only machines, the
+`input` group — see the table above for what each grants. Building
+`XW_LIBSEAT=0` on purpose silences the build warning (headless/
+nested development boxes).
+
 ### What is hardware-dependent (honest status)
 
 * Implemented and exercised by tests in this repository: seat provider
@@ -722,6 +783,13 @@ a version. If a package installed but pkg-config cannot see it, set
 The build system's dependency checks print actionable messages that
 name the missing component, what stops working without it, and where to
 read more. They never call a package manager. Common cases:
+
+**the desktop renders on the TTY but keyboard and mouse are dead**
+The `--verbose` log will name the cause. The signature
+`libseat not compiled into this build` + `Permission denied` on every
+`/dev/input/event*` node means the elogind/logind seat path is compiled
+out — one missing development package, not a machine misconfiguration.
+See [The most common real-TTY failure](#the-most-common-real-tty-failure-libseat-missing-at-build-time).
 
 **the nested session window appears but the panel does not**
 First check the session log: the session manager reports every

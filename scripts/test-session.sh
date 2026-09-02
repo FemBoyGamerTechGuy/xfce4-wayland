@@ -6,6 +6,9 @@
 #   * control socket protocol (ping / status / logout)
 #   * honest power-action failure when logind/elogind is unavailable
 #   * XDG autostart filtering (OnlyShowIn=XFCE runs, NotShowIn= skipped)
+#   * session d-bus: started when a TTY login has none, exported to
+#     children, live foreign bus reused (never killed), stale address
+#     replaced, teardown stops only the daemon the session started
 #   * clean logout: exit code 0, sockets removed, no leftover children
 #
 # Run from the repository root after `make all` (or via `make check`).
@@ -669,6 +672,119 @@ check "drm+elogind: failure is the logind diagnostic, not a fallback" \
 check "drm+elogind: exit code 1" '[ "$RC8E" -eq 1 ]'
 check "drm+elogind: never fell back to seatd/direct silently" \
     '! rg -q "opened through seatd|direct VT session on" "$LOG8E" 2>/dev/null'
+
+# --- session 9: the session d-bus (a TTY login provides no bus; the
+# session manager must start one, export it to children, reuse a live
+# bus, replace a stale address, and stop only its own daemon) ---
+
+echo
+echo "== session 9: session d-bus (start, export, reuse, stale, teardown) =="
+
+if ! command -v dbus-daemon >/dev/null 2>&1; then
+    echo "SKIP session 9 (dbus-daemon not available)"
+else
+    # a bus address leaking in from the host session would flip the
+    # test into the reuse path; a leftover socket from an earlier
+    # session would be adopted — both must be neutralized
+    unset DBUS_SESSION_BUS_ADDRESS
+    rm -f "$RTD/bus" "$RTD/foreign-bus"
+
+    # an autostart child proves the address is EXPORTED (not just
+    # started): its environment must carry the exact bus address
+    cat >"$FAKE_HOME/.config/autostart/xw-dbus-probe.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Bus probe
+Exec=printenv DBUS_SESSION_BUS_ADDRESS > $RTD/dbus-probe
+OnlyShowIn=XFCE;
+EOF
+
+    LOG9="$RTD/session9.log"
+    "$BIN/xw-session" >"$LOG9" 2>&1 &
+    SESS_PID=$!
+
+    check "session d-bus: daemon started as a session child" \
+        'wait_for "rg -q \"session d-bus: started dbus-daemon\" \"$LOG9\""'
+    check "session d-bus: socket at \$XDG_RUNTIME_DIR/bus" \
+        '[ -S "$RTD/bus" ]'
+
+    if command -v dbus-send >/dev/null 2>&1; then
+        check "session d-bus: the bus answers a real round trip" \
+            'DBUS_SESSION_BUS_ADDRESS="unix:path=$RTD/bus" dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ListNames 2>/dev/null | rg -q "org.freedesktop.DBus"'
+    else
+        echo "SKIP session d-bus: round trip (dbus-send not available)"
+    fi
+
+    check "session d-bus: autostart children inherit the address" \
+        'wait_for "[ -s \"$RTD/dbus-probe\" ]" && [ "$(cat $RTD/dbus-probe)" = "unix:path=$RTD/bus" ]'
+
+    DPID9="$(rg -o "started dbus-daemon \(pid [0-9]+\)" "$LOG9" | rg -o "[0-9]+" | head -1)"
+
+    # the ctl socket only exists once the session reports ready —
+    # logging out earlier races the session startup and fails silently
+    check "session d-bus: session reports ready" \
+        'wait_for "rg -q \"session ready\" \"$LOG9\""'
+
+    "$BIN/xw-session-ctl" logout >/dev/null 2>&1
+    check "session d-bus: logout stops the session cleanly" \
+        'wait_pid_exit "$SESS_PID"'
+    wait "$SESS_PID"
+    check "session d-bus: exit code 0" '[ "$?" -eq 0 ]'
+    check "session d-bus: teardown stopped the daemon it started" \
+        'rg -q "stopping the session d-bus daemon" "$LOG9"'
+    check "session d-bus: no orphaned dbus-daemon" \
+        '[ -z "$DPID9" ] || ! kill -0 "$DPID9" 2>/dev/null'
+    check "session d-bus: no unexpected errors in log" \
+        '! rg "\[xw-session error\]" "$LOG9" 2>/dev/null'
+
+    # --- reuse: a live foreign bus is adopted, never killed ---
+    rm -f "$RTD/bus"
+    dbus-daemon --session --nofork --nopidfile \
+        --address="unix:path=$RTD/foreign-bus" &
+    FOREIGN_PID=$!
+    sleep 0.5
+
+    LOG9R="$RTD/session9-reuse.log"
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$RTD/foreign-bus" \
+        "$BIN/xw-session" -n >"$LOG9R" 2>&1 &
+    SESS_PID=$!
+    check "session d-bus: live foreign bus reused" \
+        'wait_for "rg -q \"session d-bus: reusing the session bus\" \"$LOG9R\""'
+    check "session d-bus: reused-bus session reports ready" \
+        'wait_for "rg -q \"session ready\" \"$LOG9R\""'
+    "$BIN/xw-session-ctl" logout >/dev/null 2>&1
+    check "session d-bus: reused-bus session exits cleanly" \
+        'wait_pid_exit "$SESS_PID"'
+    wait "$SESS_PID"
+    check "session d-bus: a reused bus is never killed by teardown" \
+        'kill -0 "$FOREIGN_PID" 2>/dev/null'
+    check "session d-bus: reused session started no second daemon" \
+        '! rg -q "started dbus-daemon" "$LOG9R"'
+
+    kill "$FOREIGN_PID" 2>/dev/null
+    wait "$FOREIGN_PID" 2>/dev/null
+
+    # --- stale: an exported address that does not answer is replaced ---
+    unset DBUS_SESSION_BUS_ADDRESS
+    rm -f "$RTD/bus"
+    LOG9S="$RTD/session9-stale.log"
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$RTD/never-existed-bus" \
+        "$BIN/xw-session" -n >"$LOG9S" 2>&1 &
+    SESS_PID=$!
+    check "session d-bus: stale address named, not silently trusted" \
+        'wait_for "rg -q \"replacing it with a fresh bus\" \"$LOG9S\""'
+    check "session d-bus: fresh bus started at the standard path" \
+        'wait_for "rg -q \"session d-bus: started dbus-daemon\" \"$LOG9S\""'
+    check "session d-bus: fresh bus socket at \$XDG_RUNTIME_DIR/bus" \
+        '[ -S "$RTD/bus" ]'
+    check "session d-bus: stale-address session reports ready" \
+        'wait_for "rg -q \"session ready\" \"$LOG9S\""'
+    "$BIN/xw-session-ctl" logout >/dev/null 2>&1
+    check "session d-bus: stale-address session exits cleanly" \
+        'wait_pid_exit "$SESS_PID"'
+    wait "$SESS_PID"
+    rm -f "$RTD/dbus-probe" "$FAKE_HOME/.config/autostart/xw-dbus-probe.desktop"
+fi
 
 echo
 echo "test-session: $pass passed, $fail failed"

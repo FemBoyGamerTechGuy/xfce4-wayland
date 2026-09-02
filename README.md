@@ -41,7 +41,7 @@ for status and what remains, and [BUILDING.md](BUILDING.md) to build it.
 | Component | Binary | Role |
 |-----------|--------|------|
 | Compositor core + WM | `xw-compositor` | Display server, window manager, workspaces, input, shortcuts |
-| Session manager | `xw-session` | Session lifecycle, autostart, supervision, power actions |
+| Session manager | `xw-session` | Session lifecycle, autostart, supervision, session d-bus, power actions |
 | Session control CLI | `xw-session-ctl` | Scriptable session commands (logout/restart/shutdown/...) |
 | Exit dialog | `xw-exit` | Graphical session-exit dialog |
 | Demo client | `xw-demo` | Minimal xdg-shell window (tests the desktop: tasklist, stacking, exclusive zone) |
@@ -98,7 +98,11 @@ session (libseat pinned to its logind backend; elogind speaks the same
 D-Bus API), the built-in seatd wire-protocol client (zero libraries),
 or a direct VT takeover — then drives the
 monitor (connector/mode enumeration, dumb-buffer scanout, page
-flips) and reads real keyboards/mice through the same seat. No
+flips) and reads real keyboards/mice through the same seat. A TTY
+login has no session d-bus, so `xw-session` also starts one
+dbus-daemon as a supervised child (reusing a live bus when there
+already is one) — pipewire, wireplumber, xfsettingsd, polkit agents
+and portals are bus-activated and quietly die without it. No
 systemd, elogind, seatd or display-manager assumptions; no root
 compositor, ever:
 

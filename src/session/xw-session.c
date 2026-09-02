@@ -10,7 +10,13 @@
  * as an unprivileged user call; if that is unavailable the request
  * fails with an honest error instead of pretending.
  *
- * No D-Bus, no GLib, no daemons of convenience: libc + fork/exec only.
+ * The manager itself speaks no D-Bus (libc + fork/exec only), but a
+ * TTY login ships no session bus and half of a real desktop is
+ * D-Bus-activated (pipewire, xfsettingsd, polkit agents, portals),
+ * so it starts one dbus-daemon as a supervised child on the standard
+ * $XDG_RUNTIME_DIR/bus path — reusing a bus that is already
+ * reachable instead of starting a second one (XW_SESSION_DBUS=0
+ * opts out; see start_session_dbus()).
  */
 #include <dirent.h>
 #include <errno.h>
@@ -86,6 +92,8 @@ struct session {
     bool fatal_backend;       /* explicit drm: a compositor exit is fatal,
                                * never a restart loop */
     char comp_backend[16];    /* resolved backend name passed to -B */
+    pid_t dbus_pid;           /* session dbus-daemon we started (-1 when
+                               * reused/absent); supervised like the rest */
     struct {
         pid_t pid;
         int64_t started_ms;
@@ -607,6 +615,248 @@ static void run_autostart(void) {
     autostart_scan_dir("/etc/xdg/autostart", user_dir[0] ? user_dir : NULL);
 }
 
+/* --------------------------------------------------------- session d-bus */
+
+/* defined below (runtime-spawn section) — needed by the bus startup */
+static bool search_path(const char *name, char *out, size_t outn);
+
+/* Is something accepting connections at this unix socket path? A
+ * connect() probe is the only honest test: a leftover socket file
+ * without a listener is the classic stale-bus situation. */
+static bool bus_socket_alive(const char *path) {
+    if (strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path))
+        return false;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+        return false;
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", path);
+    bool alive = connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0;
+    close(fd);
+    return alive;
+}
+
+/* If the address is a probeable filesystem unix socket, copy its path
+ * to out and return true. "unix:abstract=..." / tcp / autolaunch
+ * addresses return false: they are foreign setups we must respect. */
+static bool unix_address_path(const char *addr, char *out, size_t outn) {
+    if (strncmp(addr, "unix:path=", 10) != 0)
+        return false;
+    snprintf(out, outn, "%s", addr + 10);
+    return out[0] == '/';
+}
+
+/* Start (or reuse) the session message bus and export
+ * $DBUS_SESSION_BUS_ADDRESS in this process — every fork()ed session
+ * child (compositor, panel, autostarts, runtime spawns) inherits it.
+ *
+ *   1. an exported address that answers is reused untouched
+ *      (dbus-run-session, a distro user-bus service, a parent
+ *      desktop session);
+ *   2. a stale exported address (crashed parent session, our own
+ *      session restart) is replaced, never silently trusted;
+ *   3. a live listener on the standard $XDG_RUNTIME_DIR/bus path is
+ *      adopted and exported;
+ *   4. otherwise one dbus-daemon is started as a supervised child on
+ *      that path, with a readiness probe before anyone inherits the
+ *      address.
+ *
+ * Fail-open: a bus that will not come up degrades the session
+ * (dbus-activated components log their own errors) but never kills
+ * it — same rule as the panel. */
+static void start_session_dbus(void) {
+    S.dbus_pid = -1;
+
+    const char *opt = getenv("XW_SESSION_DBUS");
+    if (opt && strcmp(opt, "0") == 0) {
+        log_msg("info", "session d-bus: disabled via $XW_SESSION_DBUS=0");
+        return;
+    }
+
+    char sock[560];
+    snprintf(sock, sizeof(sock), "%s/bus", S.runtime_dir);
+    char addr[620];
+    snprintf(addr, sizeof(addr), "unix:path=%s", sock);
+
+    const char *cur = getenv("DBUS_SESSION_BUS_ADDRESS");
+    if (cur && *cur) {
+        char curpath[560];
+        if (!unix_address_path(cur, curpath, sizeof(curpath))) {
+            log_msg("info", "session d-bus: $DBUS_SESSION_BUS_ADDRESS is "
+                            "set (%s) — trusting the caller's bus", cur);
+            return;
+        }
+        if (bus_socket_alive(curpath)) {
+            log_msg("info", "session d-bus: reusing the session bus at %s",
+                    curpath);
+            return;
+        }
+        log_msg("warn", "session d-bus: $DBUS_SESSION_BUS_ADDRESS points "
+                        "at %s, which does not answer — replacing it with "
+                        "a fresh bus", curpath);
+        unsetenv("DBUS_SESSION_BUS_ADDRESS");
+    } else if (bus_socket_alive(sock)) {
+        setenv("DBUS_SESSION_BUS_ADDRESS", addr, 1);
+        log_msg("info", "session d-bus: a bus is already listening at %s "
+                        "— reusing it", sock);
+        return;
+    }
+
+    if (strlen(sock) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        log_msg("warn", "session d-bus: %s exceeds the unix-socket path "
+                        "limit — starting without a session bus", sock);
+        return;
+    }
+
+    char daemon[256];
+    if (!search_path("dbus-daemon", daemon, sizeof(daemon))) {
+        log_msg("warn", "session d-bus: no dbus-daemon on PATH — session "
+                        "components that need a bus (pipewire, "
+                        "xfsettingsd, polkit agents, portals) will be "
+                        "degraded; install the dbus package");
+        return;
+    }
+
+    /* a socket file left by an unclean earlier exit would make the
+     * daemon fail to bind — remove it (this is our own runtime dir) */
+    unlink(sock);
+
+    char argaddr[660];
+    snprintf(argaddr, sizeof(argaddr), "--address=%s", addr);
+    pid_t pid = fork();
+    if (pid < 0) {
+        log_msg("warn", "session d-bus: fork failed: %s", strerror(errno));
+        return;
+    }
+    if (pid == 0) {
+        setenv("XDG_RUNTIME_DIR", S.runtime_dir, 1);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO); /* echoes the address; we chose it */
+            if (devnull != STDOUT_FILENO)
+                close(devnull);
+        }
+        const char *args[] = {daemon, "--session", "--nofork",
+                              "--nopidfile", argaddr, NULL};
+        execv(daemon, (char *const *)args);
+        _exit(127);
+    }
+
+    /* readiness: the bus must answer before any child inherits the
+     * address (3s; a slow cold start is fine, a hung one is not) */
+    bool up = false;
+    for (int i = 0; i < 30; i++) {
+        if (bus_socket_alive(sock)) {
+            up = true;
+            break;
+        }
+        int st = 0;
+        if (waitpid(pid, &st, WNOHANG) == pid) {
+            log_msg("warn", "session d-bus: dbus-daemon exited during "
+                            "startup (%s) — continuing without a session "
+                            "bus", wait_desc(st));
+            return;
+        }
+        usleep(100000);
+    }
+    if (!up) {
+        log_msg("warn", "session d-bus: dbus-daemon did not answer within "
+                        "3s — stopping it and continuing without a bus");
+        kill(pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+        return;
+    }
+
+    S.dbus_pid = pid;
+    setenv("DBUS_SESSION_BUS_ADDRESS", addr, 1);
+    log_msg("info", "session d-bus: started dbus-daemon (pid %d) on %s — "
+                    "$DBUS_SESSION_BUS_ADDRESS exported to session children",
+            (int)pid, sock);
+}
+
+/* SIGTERM the daemon we started (a reused bus is never ours to kill).
+ * Also on session restart: the re-exec inherits the exported address,
+ * start_session_dbus() detects it dead and starts a fresh bus — no
+ * orphaned daemons outlive the session that way. */
+static void stop_session_dbus(void) {
+    if (S.dbus_pid <= 0)
+        return;
+    pid_t pid = S.dbus_pid;
+    S.dbus_pid = -1; /* its exit during teardown is expected, not news */
+    log_msg("info", "stopping the session d-bus daemon (pid %d)", (int)pid);
+    kill(pid, SIGTERM);
+    for (int i = 0; i < 20; i++) { /* 2s grace, then force */
+        if (waitpid(pid, NULL, WNOHANG) == pid)
+            return;
+        usleep(100000);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+}
+
+/* Push the Wayland session variables into the bus activation
+ * environment so D-Bus-activated services (portals and friends) see
+ * the display they must connect to. Best-effort by design: the helper
+ * is optional tooling and advisory — its failure is logged, never
+ * fatal. */
+static void update_activation_env(void) {
+    if (!getenv("DBUS_SESSION_BUS_ADDRESS"))
+        return;
+    char prog[256];
+    if (!search_path("dbus-update-activation-environment", prog,
+                     sizeof(prog)))
+        return; /* absent on minimal installs; nothing exported */
+
+    bool real = strcmp(S.comp_backend, "drm") == 0;
+    pid_t pid = fork();
+    if (pid < 0)
+        return;
+    if (pid == 0) {
+        setenv("XDG_RUNTIME_DIR", S.runtime_dir, 1);
+        setenv("WAYLAND_DISPLAY", S.socket_name, 1);
+        if (real) {
+            setenv("XDG_SESSION_TYPE", "wayland", 1);
+            setenv("XDG_CURRENT_DESKTOP", "XFCE", 1);
+            setenv("XDG_SESSION_DESKTOP", "xfce", 1);
+        }
+        const char *args[8];
+        int n = 0;
+        args[n++] = prog;
+        args[n++] = "WAYLAND_DISPLAY";
+        args[n++] = "XDG_RUNTIME_DIR";
+        if (real) {
+            args[n++] = "XDG_SESSION_TYPE";
+            args[n++] = "XDG_CURRENT_DESKTOP";
+            args[n++] = "XDG_SESSION_DESKTOP";
+        }
+        args[n] = NULL;
+        execv(prog, (char *const *)args);
+        _exit(127);
+    }
+    /* bounded wait: this is a local bus round trip, not a job */
+    for (int i = 0; i < 10; i++) {
+        int st = 0;
+        if (waitpid(pid, &st, WNOHANG) == pid) {
+            if (WIFEXITED(st) && WEXITSTATUS(st) == 0)
+                log_msg("info", "session d-bus: activation environment "
+                                "updated (dbus-activated services will see "
+                                "WAYLAND_DISPLAY)");
+            else
+                log_msg("info", "session d-bus: activation environment "
+                                "update failed (%s) — dbus-activated "
+                                "services may miss WAYLAND_DISPLAY",
+                        wait_desc(st));
+            return;
+        }
+        usleep(50000);
+    }
+    /* still running: leave it — the SIGCHLD loop reaps it silently */
+    log_msg("info", "session d-bus: activation environment update is "
+                    "still running; leaving it to finish");
+}
+
 /* --------------------------------------------------------- runtime spawns */
 
 static pid_t spawn_runtime(const char *exec, const char *name);
@@ -754,6 +1004,8 @@ static void session_shutdown(bool restart) {
     log_msg("info", "session %s", restart ? "restarting" : "ending");
     stop_autostart_apps();
     stop_compositor();
+    /* the bus dies last: children closing down may still talk to it */
+    stop_session_dbus();
     usleep(100000); /* let clients notice the compositor died */
     reap_all();
 }
@@ -1070,27 +1322,39 @@ int main(int argc, char **argv) {
     signal(SIGCHLD, on_signal);
     signal(SIGPIPE, SIG_IGN);
 
-    /* 1. compositor */
+    /* 1. session d-bus — before the compositor, so every session child
+     *    (compositor included) inherits $DBUS_SESSION_BUS_ADDRESS. A
+     *    TTY login has no bus of its own, and pipewire/xfsettingsd/
+     *    polkit/portal components are bus-activated. Reuses an
+     *    existing bus, starts one when none is reachable, never
+     *    blocks the session on failure. */
+    start_session_dbus();
+
+    /* 2. compositor */
     if (start_compositor() < 0) {
         log_msg("error", "cannot start the compositor");
+        /* the bus we started in step 1 must not outlive the session */
+        session_shutdown(false);
+        cleanup_sockets();
         return 1;
     }
+    update_activation_env();
 
-    /* 2. control socket */
+    /* 3. control socket */
     int ctl_fd = ctl_listen();
     if (ctl_fd < 0)
         goto out;
 
-    /* 3. the panel: a session component (like xfce4-panel inside
+    /* 4. the panel: a session component (like xfce4-panel inside
      * xfce4-session), not an autostart app — a build-tree session
      * with no ~/.config/autostart still gets a panel */
     start_panel();
 
-    /* 4. autostart applications */
+    /* 5. autostart applications */
     if (autostart)
         run_autostart();
 
-    /* 5. main loop: ctl requests + child supervision */
+    /* 6. main loop: ctl requests + child supervision */
     log_msg("info", "session ready (ctl %s)", S.ctl_path);
     while (!g_terminate) {
         struct pollfd pfd = {.fd = ctl_fd, .events = POLLIN};
@@ -1145,6 +1409,14 @@ int main(int argc, char **argv) {
                         g_exit_code = 1;
                     }
                 } else {
+                    if (pid == S.dbus_pid) {
+                        S.dbus_pid = -1;
+                        log_msg("warn",
+                                "session d-bus: the session bus daemon "
+                                "exited (%s) — dbus-activated services "
+                                "stop responding until the next login",
+                                wait_desc(status));
+                    }
                     /* autostart or runtime-spawned child exited: report
                      * it — a silently dead panel must never look like a
                      * working one (an autostart that dies instantly is
