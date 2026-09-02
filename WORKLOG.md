@@ -1243,3 +1243,39 @@ Stage Summary:
   is fixed in code by the session d-bus.
 - The "Edit tool expands Makefile TABs" failure mode is recorded here
   for future rounds: edit Makefiles via scripted string replacement.
+
+---
+Task ID: e354474 round (2026-09-02)
+Agent: main
+Task: user hit "error: target not found: libseat" (pacman) trying to
+install the fix the previous round prescribed
+
+Work Log:
+- Cause: our own instructions named a nonexistent Arch package. On
+  Arch/Artix there is no 'libseat' split: the seatd package ships the
+  daemon AND the library (libseat.so, libseat.pc, seat.h). The user
+  followed BUILDING.md's fix table and the Makefile warning box
+  verbatim; pacman was right to refuse.
+- Makefile warning box: 'Arch/Artix: pacman -S libseat' -> 'pacman -S
+  seatd' via scripted replacement; tab-recipe count verified
+  unchanged (99 = 99); make -j parses the whole tree ("Nothing to be
+  done", exit 0).
+- BUILDING.md: Arch/Artix row now 'sudo pacman -S seatd' + note (no
+  libseat package; seatd ships libseat; verify via pkg-config
+  --modversion libseat); Alpine row aligned with the quickstart
+  ('apk add seatd seatd-dev' - the two sections disagreed); Arch
+  quickstart comment fixed (libseat does not come "from the AUR").
+- No code paths touched; no test rerun needed beyond the parse check.
+
+Stage Summary:
+- Commit e354474 (fix) + this worklog commit on main, now 4 ahead of
+  origin/main: push still blocked (credential store wiped).
+- User-facing sequence on Arch: sudo pacman -S seatd; pkg-config
+  --modversion libseat (expect 0.9.x); make clean && make (feature
+  guard requires the clean when XW_LIBSEAT flips on); cat
+  build/.features must show libseat=y; rerun xw-session
+  --backend=drm --verbose from the TTY login (no sudo). Expected:
+  "seat: elogind/logind detected ... trying libseat's logind backend
+  first" then "/dev/input/eventN opened through seat provider ... (fd
+  N)" with keyboard + pointer counts > 0 - the frozen-mouse root
+  cause (build without libseat) is then fully closed.
