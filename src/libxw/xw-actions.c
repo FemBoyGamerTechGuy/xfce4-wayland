@@ -10,9 +10,75 @@
  */
 #include "xw-internal.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+/* directory of this binary (xw-compositor): our own client tools
+ * (xw-exit, xw-lock, ...) live next to it in a build tree
+ * (build/bin) where they are NOT on PATH — sibling resolution makes
+ * Ctrl+Alt+Del / lock work without installation, mirroring the
+ * session manager's find_panel()/exit_dialog_command() rules. */
+static char g_self_dir[PATH_MAX];
+
+static void capture_self_dir(void) {
+    ssize_t n = readlink("/proc/self/exe", g_self_dir, sizeof(g_self_dir) - 1);
+    if (n <= 0) {
+        g_self_dir[0] = 0;
+        return;
+    }
+    g_self_dir[n] = 0;
+    char *slash = strrchr(g_self_dir, '/');
+    if (slash)
+        *slash = 0; /* dirname */
+}
+
+/* absolute path of our own <name> binary when it sits next to the
+ * compositor executable; NULL otherwise (caller falls back to PATH) */
+static const char *own_binary(const char *name, char *buf, size_t n) {
+    if (!g_self_dir[0])
+        return NULL;
+    if (snprintf(buf, n, "%s/%s", g_self_dir, name) >= (int)n)
+        return NULL;
+    return access(buf, X_OK) == 0 ? buf : NULL;
+}
+
+/* first executable of a common terminal set on PATH. x-terminal-emulator
+ * is a Debian-ism absent on Arch/Artix/Fedora: a bare default made
+ * the panel launcher and the terminal shortcut silently spawn 127.
+ * $XW_TERMINAL (or actions.conf) still wins unconditionally. */
+static const char *fallback_terminal(void) {
+    static const char *const candidates[] = {
+        "xfce4-terminal", "konsole",    "gnome-terminal", "kitty",
+        "alacritty",      "foot",      "wezterm",        "lxterminal",
+        "terminology",    "st",        "xterm",          "x-terminal-emulator",
+    };
+    const char *path = getenv("PATH");
+    if (!path || !*path)
+        return NULL;
+    static char found[PATH_MAX];
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]);
+         i++) {
+        const char *p = path;
+        while (*p) {
+            const char *colon = strchr(p, ':');
+            size_t len = colon ? (size_t)(colon - p) : strlen(p);
+            if (len > 0 &&
+                len + strlen(candidates[i]) + 2 <= sizeof(found)) {
+                snprintf(found, sizeof(found), "%.*s/%s", (int)len, p,
+                         candidates[i]);
+                if (access(found, X_OK) == 0)
+                    return found;
+            }
+            if (!colon)
+                break;
+            p = colon + 1;
+        }
+    }
+    return NULL;
+}
 
 static void load_commands(struct xw_compositor *c) {
     if (!c->conf.config_dir)
@@ -45,15 +111,36 @@ static void load_commands(struct xw_compositor *c) {
 }
 
 void xw_actions_init(struct xw_compositor *c) {
-    /* defaults name our own binaries; $XW_TERMINAL overrides the terminal */
+    capture_self_dir();
+    /* defaults name our own binaries; $XW_TERMINAL overrides the terminal
+     * (resolved to an existing binary when possible — see
+     * fallback_terminal) */
     const char *t = getenv("XW_TERMINAL");
-    snprintf(c->cmd_terminal, sizeof(c->cmd_terminal), "%s",
+    snprintf(c->cmd_terminal, sizeof(c->cmd_terminal), "%.240s",
              t && *t ? t : "x-terminal-emulator");
+    if (!t || !*t) {
+        const char *fb = fallback_terminal();
+        if (fb)
+            snprintf(c->cmd_terminal, sizeof(c->cmd_terminal), "%.240s", fb);
+        else
+            xw_log(XW_LOG_WARN,
+                   "actions: no known terminal on PATH (set $XW_TERMINAL "
+                   "or actions.conf [commands] terminal) — the terminal "
+                   "shortcut and the panel launcher will fail");
+    }
+    char buf[PATH_MAX];
+    const char *own;
+    own = own_binary("xw-exit", buf, sizeof(buf));
+    snprintf(c->cmd_exit, sizeof(c->cmd_exit), "%.240s",
+             own ? own : "xw-exit");
+    own = own_binary("xw-lock", buf, sizeof(buf));
+    snprintf(c->cmd_lock, sizeof(c->cmd_lock), "%.240s",
+             own ? own : "xw-lock");
     snprintf(c->cmd_appfinder, sizeof(c->cmd_appfinder), "xw-appfinder");
-    snprintf(c->cmd_exit, sizeof(c->cmd_exit), "xw-exit");
-    snprintf(c->cmd_lock, sizeof(c->cmd_lock), "xw-lock");
     snprintf(c->cmd_screenshot, sizeof(c->cmd_screenshot), "xw-screenshot");
     load_commands(c);
+    xw_log(XW_LOG_INFO, "actions: terminal='%s' exit-dialog='%s' lock='%s'",
+           c->cmd_terminal, c->cmd_exit, c->cmd_lock);
 }
 
 static void run(struct xw_compositor *c, const char *cmd, const char *extra) {

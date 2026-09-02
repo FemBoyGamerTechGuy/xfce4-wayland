@@ -30,8 +30,65 @@
 #include <time.h>
 #include <unistd.h>
 #include <stdarg.h>
+#include <limits.h>
 
 #include "wlr-layer-shell-unstable-v1.h"
+
+/* ------------------------------------------------------------------ */
+/* Terminal resolution — deliberately a local copy of the compositor's
+ * logic (src/libxw/xw-actions.c): the panel is an independent client
+ * and MUST NOT link compositor code. The candidate list is a fact
+ * about the terminal ecosystem, not shared behavior. */
+
+static bool path_has_binary(const char *name) {
+    if (strchr(name, '/'))
+        return access(name, X_OK) == 0; /* already a path */
+    const char *path = getenv("PATH");
+    if (!path || !*path)
+        return false;
+    char probe[PATH_MAX];
+    const char *p = path;
+    while (*p) {
+        const char *colon = strchr(p, ':');
+        size_t len = colon ? (size_t)(colon - p) : strlen(p);
+        if (len > sizeof(probe) - 64)
+            len = sizeof(probe) - 64; /* clamp dir for the join below */
+        if (len > 0) {
+            snprintf(probe, sizeof(probe), "%.*s/%.32s", (int)len, p,
+                     name);
+            if (access(probe, X_OK) == 0)
+                return true;
+        }
+        if (!colon)
+            break;
+        p = colon + 1;
+    }
+    return false;
+}
+
+/* $XW_TERMINAL wins if it exists; else the first common terminal on
+ * PATH. x-terminal-emulator alone is a Debian-ism — on Arch/Artix it
+ * made the launcher spawn sh -c -> 127 with no visible effect. */
+static void resolve_terminal(char *out, size_t n) {
+    const char *env = getenv("XW_TERMINAL");
+    if (env && *env) {
+        snprintf(out, n, "%.240s", env);
+        return;
+    }
+    static const char *const candidates[] = {
+        "xfce4-terminal", "konsole",    "gnome-terminal", "kitty",
+        "alacritty",      "foot",      "wezterm",        "lxterminal",
+        "terminology",    "st",        "xterm",          "x-terminal-emulator",
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]);
+         i++) {
+        if (path_has_binary(candidates[i])) {
+            snprintf(out, n, "%s", candidates[i]);
+            return;
+        }
+    }
+    snprintf(out, n, "%s", "x-terminal-emulator"); /* last resort */
+}
 
 /* ---------------------------------------------------------------- look */
 
@@ -310,8 +367,20 @@ static struct btn *btn_at(struct panel *p, int x, int y) {
 #define BTN_MIDDLE 0x112
 #define BTN_RIGHT 0x111
 
+static const char *btn_kind_name(int kind) {
+    switch (kind) {
+    case BTN_LAUNCHER: return "menu/launcher";
+    case BTN_WS: return "workspace";
+    case BTN_TASK: return "task";
+    case BTN_CLOCK: return "clock";
+    case BTN_EXIT: return "exit";
+    default: return "(none)";
+    }
+}
+
 static void do_exit_button(struct panel *p) {
     (void)p;
+    trace("activate action=exit (ctl exit-dialog)");
     char reply[256];
     if (!xw_ctl_send("exit-dialog", reply, sizeof(reply)))
         fprintf(stderr, "xw-panel: exit dialog: %s\n", reply);
@@ -319,7 +388,13 @@ static void do_exit_button(struct panel *p) {
 
 static void do_launcher(struct panel *p) {
     char cmd[320], reply[256];
+    /* p->terminal_cmd was resolved at startup from the fallback list;
+     * still, a stale cache or a removed binary must not silently kill
+     * the action — re-resolve so a terminal installed after the panel
+     * started works too */
+    resolve_terminal(p->terminal_cmd, sizeof(p->terminal_cmd));
     snprintf(cmd, sizeof(cmd), "run %s", p->terminal_cmd);
+    trace("activate action=menu (ctl '%s')", cmd);
     if (!xw_ctl_send(cmd, reply, sizeof(reply)))
         fprintf(stderr, "xw-panel: launcher: %s\n", reply);
 }
@@ -332,16 +407,24 @@ static void on_button(struct xwc_win *win, uint32_t button, bool down, int x,
     if (!down)
         return;
     struct btn *b = btn_at(p, x, y);
-    if (!b)
+    trace("button %u %s at %d,%d -> widget=%s", button,
+          down ? "press" : "release", x, y,
+          b ? btn_kind_name(b->kind) : "(miss)");
+    if (!b) {
+        trace("button landed on no widget (bar background) — ignored");
         return;
+    }
     switch (b->kind) {
     case BTN_LAUNCHER:
         if (button == BTN_LEFT)
             do_launcher(p);
         break;
     case BTN_WS:
-        if (button == BTN_LEFT)
+        if (button == BTN_LEFT) {
+            trace("activate action=workspace index=%d",
+                  (int)(intptr_t)b->data);
             xwc_wspaces_activate(p->wsp, (int)(intptr_t)b->data);
+        }
         break;
     case BTN_TASK:
         if (button == BTN_MIDDLE || button == BTN_RIGHT)
@@ -353,7 +436,10 @@ static void on_button(struct xwc_win *win, uint32_t button, bool down, int x,
         if (button == BTN_LEFT)
             do_exit_button(p);
         break;
-    default: /* clock */
+    default:
+        /* BTN_CLOCK: v0 clock is display-only (no popup) — a documented
+         * deviation from xfce4-panel's clock plugin, see ROADMAP.md */
+        trace("activate action=clock — display-only in v0 (no popup)");
         break;
     }
 }
@@ -369,6 +455,9 @@ static void on_motion(struct xwc_win *win, int x, int y, void *ud) {
         if (p->btns[i].hover != want) {
             p->btns[i].hover = want;
             changed = true;
+            if (want)
+                trace("pointer motion over widget=%s at %d,%d",
+                      btn_kind_name(p->btns[i].kind), x, y);
         }
     }
     if (changed)
@@ -418,9 +507,10 @@ int main(int argc, char **argv) {
     trace("starting: WAYLAND_DISPLAY=%s socket=%s", wd ? wd : "(unset)",
           socket_name ? socket_name : "(default)");
     clock_read(p.clock, sizeof(p.clock));
-    const char *term = getenv("XW_TERMINAL");
-    snprintf(p.terminal_cmd, sizeof(p.terminal_cmd), "%s",
-             term && *term ? term : "x-terminal-emulator");
+    /* resolve the terminal ONCE at startup (re-resolved on every click
+     * in do_launcher); the env var always wins */
+    resolve_terminal(p.terminal_cmd, sizeof(p.terminal_cmd));
+    trace("launcher terminal resolved: '%s'", p.terminal_cmd);
     p.bar_h = BAR_H;
 
     signal(SIGTERM, on_sigterm);

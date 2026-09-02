@@ -986,12 +986,30 @@ static pid_t spawn_runtime(const char *exec, const char *name) {
 
 /* the exit dialog: same binary the compositor's XW_ACTION_EXIT_DIALOG
  * spawns (actions.conf [commands] exit-dialog, default "xw-exit");
- * $XW_EXIT_CMD overrides for testing/development */
+ * $XW_EXIT_CMD overrides for testing/development. Resolution mirrors
+ * find_panel(): sibling of this binary first (build-tree layout —
+ * build/bin is NOT on the user's PATH, which used to make the exit
+ * button spawn sh -c xw-exit -> 127 -> 'ok spawned' but no dialog),
+ * then /usr/local/bin, then PATH. */
 static const char *exit_dialog_command(void) {
     const char *env = getenv("XW_EXIT_CMD");
     if (env && *env)
         return env;
-    return "xw-exit";
+    static char path[1024];
+    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 32);
+    if (n > 0) {
+        path[n] = 0;
+        char *slash = strrchr(path, '/');
+        if (slash) {
+            snprintf(slash + 1, sizeof(path) - (slash + 1 - path),
+                     "xw-exit");
+            if (access(path, X_OK) == 0)
+                return path;
+        }
+    }
+    if (access("/usr/local/bin/xw-exit", X_OK) == 0)
+        return "/usr/local/bin/xw-exit";
+    return "xw-exit"; /* PATH fallback */
 }
 
 /* ------------------------------------------------------------ control */
@@ -1104,7 +1122,8 @@ static void handle_ctl_line(int fd, char *line) {
             send_line(fd, "error no compositor");
             return;
         }
-        pid_t pid = spawn_runtime(exit_dialog_command(), "xw-exit");
+        const char *cmd = exit_dialog_command();
+        pid_t pid = spawn_runtime(cmd, "xw-exit");
         if (pid > 0)
             send_line(fd, "ok exit dialog spawned");
         else
