@@ -8,6 +8,14 @@
 #   * therefore every "reinstall" was cosmetic and the seatd daemon
 #     could never start (its binary is an empty file).
 #
+#   Confirmed 2026-09-02 from a user-supplied `pacman -Syu seatd`
+#   transcript: the transaction aborts at the file-conflict check —
+#   "eșec la efectuarea tranzacției (fișiere în conflict)" — listing
+#   exactly the ten zero-byte orphan files below. The empty DB entry
+#   owns nothing, so pacman treats those files as unowned and refuses
+#   to overwrite them; the WHOLE transaction dies before installing
+#   a single package.
+#
 # What this script does (every step logged to ONE file you hand back):
 #   [1] disk space — a full / or /usr is the classic cause of exactly
 #       this corruption; the script STOPS if a partition is >= 99%
@@ -107,8 +115,9 @@ command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libseat 2>/dev/null
 ldd build/bin/xw-compositor 2>/dev/null | grep -q libseat && LINKED=y
 r pacman -Qi seatd
 rp "pacman -Ql seatd | wc -l"
-r ls -l /usr/bin/seatd /usr/lib/libseat.so /usr/lib/libseat.so.1 /usr/lib/pkgconfig/libseat.pc /usr/include/seat.h
+r ls -l /usr/bin/seatd /usr/lib/libseat.so /usr/lib/libseat.so.1 /usr/lib/pkgconfig/libseat.pc /usr/include/libseat.h
 rp "wc -c /usr/bin/seatd 2>/dev/null"
+rp "wc -c /etc/runit/sv/seatd/run 2>/dev/null"
 r cat build/.features
 [ -n "$LINKED" ] && say "CHECK: xw-compositor IS linked with libseat" \
                    || say "CHECK: xw-compositor is NOT linked with libseat"
@@ -134,23 +143,35 @@ if [ -z "$PC_OK" ] && [ -n "$HAVE_PACMAN" ]; then
             say " removing the database directory directly instead)"
             sudo_log rm -rf /var/lib/pacman/local/seatd-*
         fi
-        # b) delete the zero-byte leftovers by hand (they are unowned
-        #    now; leaving them would make the fresh install conflict)
+        # b) delete the zero-byte leftovers by hand — they are unowned
+        #    now, and pacman refuses to overwrite unowned files, which is
+        #    exactly the "files in conflict" abort in the user's own
+        #    pacman output. This is the complete 10-file set the repo
+        #    package installs (the header is libseat.h, not seat.h)
         sudo_log rm -f /usr/bin/seatd /usr/bin/seatd-launch \
+                        /usr/include/libseat.h \
                         /usr/lib/libseat.so /usr/lib/libseat.so.1 \
-                        /usr/lib/pkgconfig/libseat.pc /usr/include/seat.h
-        sudo_log rm -rf /etc/runit/sv/seatd
-        # c) fresh install (the service symlink in /run/runit/service
-        #    stays and picks the new binary up on its own)
+                        /usr/lib/pkgconfig/libseat.pc \
+                        /usr/lib/sysusers.d/seatd.conf \
+                        /usr/share/licenses/seatd/LICENSE \
+                        /usr/share/man/man1/seatd.1.gz \
+                        /usr/share/man/man1/seatd-launch.1.gz
+        # the runit service dir: keep an intact one (the daemon route
+        # stays available), remove only a corrupt zero-byte one
+        if [ -f /etc/runit/sv/seatd/run ] && [ ! -s /etc/runit/sv/seatd/run ]; then
+            sudo_log rm -rf /etc/runit/sv/seatd
+        fi
+        # c) fresh install (with the orphans gone no overwrite trickery
+        #    is needed; the retry below stays as a safety net)
         if ! sudo_log pacman -S --noconfirm seatd; then
             say "(plain install failed — one retry: refresh the sync"
             say " databases and overwrite any straggling paths)"
             sudo_log pacman -Syy --noconfirm --overwrite 'usr/*' --overwrite 'etc/runit/*' seatd
         fi
-        # d) verify: REAL files this time
+        # e) verify: REAL files this time
         r pacman -Qi seatd
         rp "pacman -Ql seatd | wc -l"
-        r ls -l /usr/bin/seatd /usr/lib/libseat.so /usr/lib/libseat.so.1 /usr/lib/pkgconfig/libseat.pc /usr/include/seat.h
+        r ls -l /usr/bin/seatd /usr/lib/libseat.so /usr/lib/libseat.so.1 /usr/lib/pkgconfig/libseat.pc /usr/include/libseat.h
         if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libseat 2>/dev/null; then
             PC_OK=y
             r pkg-config --modversion libseat
