@@ -1761,3 +1761,44 @@ Stage Summary:
   next code fix is a fallback open path); comp motion>0 & screen
   still frozen -> flip path (the watchdog WARN + drm stats will show
   it, and the watchdog already self-heals it).
+
+---
+Task ID: push-round (2026-09-03)
+Agent: main
+Task: user supplied a GitHub PAT (pasted in chat) — push the 7
+locally stranded commits (c6ff91a..e469b98) to origin/main.
+
+Work Log:
+- Token handled per the one-shot askpass design
+  (scripts/git-askpass-env.sh): lives only in XW_PUSH_TOKEN env
+  of the single git invocation, `credential.helper=` disabled
+  for that call, push output scrubbed — the secret was NOT
+  written to .git/config, ~/.git-credentials, or any repo file.
+- Push succeeded: c6ff91a..e469b98 main -> main — the hardened
+  seat repair, the bisect script, the worklog rounds, and the
+  nvidia-bisect instrumentation round. Branch in sync,
+  `git status` clean.
+- Post-push QA: `make` is a no-op (build current for e469b98;
+  -Werror clean and 64/64 tests passed at this commit in the
+  previous session).
+- The download/ patch + file-copy fallback from last session is
+  now SUPERSEDED: `git pull` is the primary path.
+  `git pull --rebase --autostash` absorbs any local script edits
+  on the user's clone.
+- Advised the user to rotate/revoke the PAT once the saga is
+  done (a token pasted into a chat should be treated as
+  exposed).
+
+Stage Summary:
+- origin/main now carries BOTH candidate fixes for the frozen
+  cursor: (a) the input half — default-log-level event counters,
+  first-event markers, 2s stats with live cursor coords, and a
+  raw-evdev kernel fallback in the bisect script; (b) the render
+  half — the NVIDIA legacy page-flip watchdog. If (b) was the
+  cause, the cursor simply starts moving on the first run of
+  the new build, no diagnosis needed.
+- User sequence on the Artix box: git pull --rebase --autostash
+  origin main && make -j$(nproc); optional `sudo pacman -S
+  libinput` to restore the CLI (bisect works without it); then
+  ./scripts/xw-input-bisect.sh from a TTY, mouse moving in every
+  window — the [4] verdict picks the next move.
