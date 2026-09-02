@@ -1802,3 +1802,87 @@ Stage Summary:
   libinput` to restore the CLI (bisect works without it); then
   ./scripts/xw-input-bisect.sh from a TTY, mouse moving in every
   window — the [4] verdict picks the next move.
+
+---
+Task ID: panel-interact-round (2026-09-03)
+Agent: main
+Task: the DRM session renders and the cursor moves (NVIDIA flip fix
+held) but the panel is completely non-interactive — trace the whole
+click chain, fix the first broken boundaries, reorganize the desktop
+components as independent subprojects, test, document.
+
+Work Log:
+- Fresh workspace: bootstrap-sysroot + full build + 64/64 green at
+  b69fd42 before touching anything.
+- Traced the complete chain statically, layer by layer:
+  libinput drain -> inject_* -> seat motion/button -> surface_at ->
+  set_ptr_focus (enter/leave/serials/frames) -> panel client binding
+  (seat bound with listener attached at bind time; layer + callbacks
+  registered in the client owner map) -> btn_at widget dispatch ->
+  ctl actions. Every layer is correct; the existing panel-clicks test
+  (real forked binary, real socket) already proves the chain in the
+  harness. The breakage decomposed into eight real holes instead:
+- (1) UAF-class: xw_surface_resource_destroyed never cleared
+  seat->ptr_focus/drag refs — any surface dying under the cursor left
+  a dangling focus that poisoned later focus decisions ("panel
+  visible, cursor moves, nothing reacts" decay). xw_seat_forget_surface
+  now runs from the surface destroy path.
+- (2) seat_get_pointer never replayed enter to a late wl_pointer
+  (keyboard did since forever — asymmetric). Fixed + tested with a
+  raw late pointer.
+- (3) focus never re-evaluated when surfaces map/unmap under a
+  stationary cursor (cursor starts at 0,0 = inside a top panel).
+  xw_seat_repointer on layer/window map+unmap.
+- (4) layer-shell get_layer_surface silently DROPPED the request with
+  no outputs (unbound object id = protocol kill for the client).
+  Surfaces are now held unconfigured and adopted by
+  xw_layer_output_added; xw_layer_output_removed re-anchors or closes.
+- (5) layer stacking was tail-inserted with inverted topmost
+  semantics (oldest layer surface stayed above newer ones forever).
+  Head-insert, render/hit-test consistent, comments now true.
+- (6) launcher dead on Arch: 'x-terminal-emulator' Debian-ism -> 127.
+  Terminal fallback list in the panel (client) AND the compositor
+  (action) — deliberately duplicated, documented.
+- (7) exit button dead in a build tree: session + compositor spawned
+  'xw-exit' by PATH; build/bin is not on PATH. Sibling-of-binary
+  resolution in exit_dialog_command + xw_actions_init.
+- (8) boundary instrumentation: focus/enter/leave/button lines with
+  surface identity (role + namespace/title), first-enter INFO marker;
+  panel XW_PANEL_TRACE prints the interaction chain end to end.
+- subprojects/panel: git mv + README + dependency contract
+  (subprojects/README.md); Makefile targets compositor/panel/session/
+  clients, all profile-stamped. make panel compiles ZERO libxw
+  objects (verified from a clean tree); make compositor builds alone.
+  The interactive Edit tool normalized Makefile recipe TABs to spaces
+  and broke make — recovered via scripts/apply-makefile-panel.py
+  (persisted; the Makefile is tab-sensitive, never re-indent it).
+- 6 new tests (focus lifecycle + hover + UAF survival, late-pointer
+  enter replay, launcher ctl line, clock v0 no-op, layer-before-
+  outputs, compositor-without-panel). Debugging them surfaced:
+  xwt_pump_server looped FOREVER on a dead client connection (a
+  protocol error used to wedge the whole suite — fixed with
+  client_dead); the connect roundtrip can return with binds still
+  queued server-side (the layer test now pumps before destroying the
+  output — WAYLAND_DEBUG traced the exact wire race); the hover check
+  must look clear of the software cursor (it sits exactly on the
+  pointer); UBSan caught a NULL-focus deref in my own test 51 (raw
+  xwc_win_create never commits -> never maps; fixed with a solid-
+  configure helper).
+- Final: 70/70 release, 70/70 ASan+UBSan+LSan (zero reports), session
+  process tests 128/128, build regressions 50/50 (1 skipped), DRM
+  mode/planning tests all green, NVIDIA watchdog untouched.
+
+Stage Summary:
+- The pointer protocol chain was already correct end-to-end (the
+  harness proves it with the real binary); the panel's dead buttons
+  decompose into the ptr_focus UAF + protocol-correctness holes (all
+  fixed, ASan-proven) and two ACTION-side failures that make the
+  launcher/exit buttons dead on the user's real box regardless of
+  input (terminal fallback + sibling resolution, both fixed).
+- The clock is intentionally display-only in v0 (documented in
+  ROADMAP + subprojects/panel/README + its test asserts the no-op).
+- Remaining hardware-only verification: one DRM session run on the
+  user's NVIDIA box — the instrumentation now answers every boundary
+  from a default-level log (first pointer event, first enter
+  delivered, focus transitions with surface identity, panel button
+  hits and activated actions).
