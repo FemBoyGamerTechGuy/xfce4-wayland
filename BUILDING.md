@@ -94,6 +94,18 @@ make check           # in-process suite + process-level session checks + build r
 ./scripts/dev-session.sh --logout   # headless dev session, clean logout
 ```
 
+Per-component builds (see [subprojects/README.md](subprojects/README.md)
+for the component map and the dependency contract):
+
+```sh
+make compositor      # the compositor only — no panel, session or clients
+make panel           # the panel only, from the client stack alone: it
+                     # links libxwcl + xw-ctl and compiles ZERO compositor
+                     # objects (verified by the build-regression suite)
+make session         # the session manager only
+make clients         # xw-exit, xw-lock, xw-demo
+```
+
 Every step is fail-fast: `make` stops at the first missing dependency
 with an actionable message, and `dev-session.sh` refuses to launch any
 binary that was not successfully built (it checks before starting

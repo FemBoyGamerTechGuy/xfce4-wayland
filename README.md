@@ -45,7 +45,7 @@ for status and what remains, and [BUILDING.md](BUILDING.md) to build it.
 | Session control CLI | `xw-session-ctl` | Scriptable session commands (logout/restart/shutdown/...) |
 | Exit dialog | `xw-exit` | Graphical session-exit dialog |
 | Demo client | `xw-demo` | Minimal xdg-shell window (tests the desktop: tasklist, stacking, exclusive zone) |
-| Panel | `xw-panel` | Layer-shell desktop bar: workspace switcher, tasklist, launcher, clock, exit button |
+| Panel | `xw-panel` | Layer-shell desktop bar (own subproject, `subprojects/panel/`): workspace switcher, tasklist, launcher, clock, exit button |
 | Screen lock | `xw-lock` | ext-session-lock client: passphrase lock screen, auto-lock on idle (Ctrl+Alt+L) |
 
 ## Quick start (development)
@@ -53,6 +53,11 @@ for status and what remains, and [BUILDING.md](BUILDING.md) to build it.
 ```sh
 make                    # build everything (no system font needed; the
                         # build-time font is bundled in assets/fonts/)
+make compositor         # only the compositor (no panel/session/clients)
+make panel              # only the panel — from the client stack alone
+                        # (libxwcl; zero compositor objects compiled)
+make session            # only the session manager
+make clients            # exit dialog, lock, demo client
 make check              # full suite: unit + process + build regressions
 ./scripts/dev-session.sh --logout   # headless dev session (refuses to run
                                     # unless the build succeeded)

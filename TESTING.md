@@ -224,6 +224,18 @@ one.
   clicks switch workspaces end-to-end, exit button sends the ctl
   `exit-dialog` line (fake session manager accepts it), panel survives
   the action
+- **panel interaction lifecycle (panel-interact round): pointer
+  enter/leave transitions on the real forked bar with hover-fill
+  rendering through the full enter+motion+redraw path (checked clear
+  of the software cursor), the panel dying under pointer focus clears
+  focus and subsequent motion survives (the ptr_focus use-after-free
+  class — ASan-verified), a late-created wl_pointer gets exactly one
+  enter replay, the launcher resolves $XW_TERMINAL and delivers the
+  ctl `run <terminal>` line, the v0 clock is display-only (click =
+  no action, no crash), a layer surface created before any output is
+  held unconfigured and adopted+mapped+interactive when one appears,
+  and a bare compositor (no panel at all) still serves windows with
+  pointer focus and clicks — the component-independence guarantee**
 - **layer reconfigure on output resize: an anchored bar learns the new
   output size via a fresh configure, recommits, spans the new extent,
   and the server-side geometry follows (the nested-invisibility root

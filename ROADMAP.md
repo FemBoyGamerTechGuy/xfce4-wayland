@@ -189,7 +189,7 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
 - DONE xw-panel v0: layer-shell top bar (exclusive zone, windows never
   render under it), workspace switcher (ext-workspace, click to
   switch), tasklist (wlr-foreign-toplevel: click = activate,
-  middle/right click = close, active/minimized state), clock (HH:MM,
+  middle/right click = close, active/minimized state), clock (HH:MM, display-only v0: a click is intentionally a no-op, no popup/calendar; see subprojects/panel/README.md),
   per-minute redraw), launcher button (terminal via ctl `run`), exit
   button (session exit dialog via ctl `exit-dialog` — the same
   XW_ACTION_EXIT_DIALOG behavior as Ctrl+Alt+Del). One process, one

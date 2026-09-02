@@ -46,7 +46,49 @@
 The compositor is a library (`libxw`) plus a thin binary; the session
 manager is a separate, library-free process that supervises everything.
 Desktop components (panel, dialogs) are native Wayland clients built on
-`libxwcl`.
+`libxwcl`. The panel is its own subproject (`subprojects/panel/`); the
+component map and dependency contract live in
+[subprojects/README.md](subprojects/README.md).
+
+## Component independence (the architecture invariant)
+
+**xw-compositor is a general-purpose Wayland compositor/WM platform.**
+The XFCE desktop is one client ecosystem on top of it — never a
+compile-time dependency. The build enforces the direction:
+
+- `make compositor` succeeds with `subprojects/` and `src/clients/`
+  deleted: the binary references no panel, session or dialog.
+- `make panel` compiles **zero** `libxw` objects: the panel links
+  `libxwcl` + the tiny ctl client and talks to the compositor purely
+  through protocols (`wl_seat`, `zwlr_layer_shell_v1`,
+  `wlr-foreign-toplevel-management`, `ext-workspace`). The
+  build-regression suite audits the link lines for exactly this.
+- Cross-component *actions* (launch a terminal, open the exit dialog)
+  go through the session manager's private ctl socket — a 0700
+  unix-socket line protocol — never `system()`, never another
+  component's internals.
+- Where the compositor and a client both need the same fact (the list
+  of common terminal emulators, for the launcher and the
+  terminal shortcut), each component keeps its own copy: sharing the
+  code would create the very compositor-to-client link the boundary
+  forbids. Facts are duplicated; behavior is not.
+
+Using the platform without the XFCE desktop:
+
+- `build/bin/xw-compositor -B drm` — bare KMS session, nothing else
+  (kiosk, testing, embedding).
+- `xw-session --no-panel` — full session lifecycle, no bar.
+- `$XW_PANEL_CMD=<your-client>` — replace the panel with any
+  layer-shell client of your own; the session starts it instead.
+- The nested Wayland/X11 backends run the compositor as a window in
+  another desktop — the development loop for custom shells and
+  alternative panels.
+
+WM policy (stacking, tiling, workspaces) is compositor-side data and
+configuration (`rules.conf`, actions/shortcuts conf), not client
+business: replacing the panel never changes window management, and a
+different WM policy is a `libxw` change, reachable without touching
+any desktop component.
 
 ## Why not wlroots
 
