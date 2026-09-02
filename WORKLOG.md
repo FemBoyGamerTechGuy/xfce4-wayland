@@ -887,3 +887,129 @@ Stage Summary:
   session locked; a second locker takes over. Security properties are
   server-enforced and pixel-verified.
 - Remaining honest gaps: PAM unlock backend, multi-output lock client.
+
+---
+Task ID: 2026-09-02-phase4
+Agent: main (Super Z)
+Task: Phase 4 — real TTY/DRM/KMS sessions: seat-provider abstraction
+(libseat + built-in seatd client + direct VT), DRM backend, backend
+selection, session environment, tests, docs
+
+Work Log:
+- Rebuilt the environment from a bare container: bootstrap-sysroot.sh
+  extended with libdrm-dev/libdrm2, libseat-dev/libseat1, seatd
+  (Debian trixie ships libseat 0.9.1 — real library available for
+  cross-validation); baseline build + full suite green before changes.
+- Studied the seatd 0.9.1 wire protocol from upstream source (protocol.h
+  + libseat's seatd backend): OPEN_SEAT handshake, OPEN_DEVICE with
+  SCM_RIGHTS fds, DISABLE_SEAT -> client ack -> ENABLE_SEAT lifecycle,
+  error transport as errno values, CLOSE_SEAT.
+- src/libxw/xw-session-seat.c (new, ~1100 lines): the seat/session
+  abstraction. Three providers behind one vtable: (1) external libseat
+  (build-time optional XW_LIBSEAT, wraps logind/elogind/seatd); (2)
+  built-in seatd wire-protocol client — plain libc, blocking
+  request/response with background-event queueing (order-preserving),
+  MSG_NOSIGNAL writes (a dead seat manager must surface as EPIPE, not
+  SIGPIPE); (3) direct-VT provider — /dev/tty takeover with
+  KD_GRAPHICS + VT_PROCESS, SIGUSR1/SIGUSR2 through the event loop's
+  signal sources, VT_RELDISP acking, full termios/KD/VT-mode
+  restoration. AUTO probes libseat -> seatd -> direct with per-failure
+  DEBUG logs and one honest combined ERROR diagnostic; explicit
+  providers never fall back.
+- src/libxw/xw-backend-drm.c (new, ~950 lines): the DRM/KMS backend.
+  DRM-independent planning section (xw_drm_pick_mode: preferred ->
+  largest -> highest refresh; connector naming; xw_drm_plan_crtc:
+  firmware-pairing reuse then possible-mask fallback) tested without
+  hardware. KMS section: /dev/dri/card* enumeration (no hardcoded
+  card, prefers cards with connected monitors), drmSetMaster with
+  driver-named diagnostics, per-connector outputs at the preferred
+  mode, two dumb buffers per output (XRGB8888 = our a8r8g8b8 layout)
+  with page-flip event pacing (parked frames flip on vblank),
+  logged fallback to immediate updates on flip-rejecting drivers,
+  udev hotplug (connector removal tears outputs down honestly; new
+  connectors logged as next-start), session disable = drop master +
+  suspend input, enable = re-master + full damage, destroy = restore
+  every saved CRTC (including previously-disabled ones) + drop master
+  + release the device through the seat.
+- Compositor integration: XW_BACKEND_DRM + XW_SEAT_PROVIDER enums in
+  xw.h; xw_compositor_create opens the seat BEFORE the DRM backend,
+  destroys it after (backend teardown releases devices through it);
+  input AUTO mode now opts in for DRM (real session needs real
+  input). Compositor binary: -B drm, -P/--seat-provider, -t/--seat,
+  $XW_SEAT_PROVIDER override.
+- xw-input-libinput.c: open_restricted/close_restricted now route
+  through the seat provider (fd -> device-id map for close), plus
+  libinput_suspend/resume for the session lifecycle.
+- xw-session.c: --backend=drm|x11|wayland|headless (+ -B), --verbose
+  (compositor at INFO instead of -q), backend resolution logic
+  (explicit drm NEVER falls back and never enters the restart loop;
+  AUTO: TTY+KMS -> drm, TTY no-KMS -> headless with an explained
+  downgrade, graphical parent -> headless unless -N), real-session
+  environment for children (XDG_SESSION_TYPE=wayland,
+  XDG_CURRENT_DESKTOP=XFCE, XDG_SESSION_DESKTOP=xfce, no DISPLAY
+  leak), duplicate-service detection for autostart (scans
+  /proc cmdline basenames; duplicates are skipped with a note, not
+  treated as crashes — re-login/restart flows).
+- Makefile: XW_DRM (libdrm+libudev) and XW_LIBSEAT knobs with the
+  same auto/1/0 diagnostics pattern; feature stamp extended
+  (x11/libinput/drm/libseat); libudev decoupled from libinput (it is
+  a direct dep of EITHER libinput or DRM — caught by the
+  XW_LIBINPUT=0 clean-build regression); xw-backend-drm.c and
+  xw-session-seat.c always compiled (planning helpers + seat are
+  libdrm-free); make config shows the new features.
+- Tests: tests/suite/test_seat.c — a forked mock seatd server speaking
+  the real protocol; handshake, SCM_RIGHTS device opens, close,
+  switch, the DISABLE->ack->ENABLE dance delivered as background
+  traffic behind a blocking request, server errors, garbage,
+  hangup-at-connect, direct no-VT refusal, AUTO-all-broken refusal,
+  and a cross-check where UPSTREAM libseat (LIBSEAT_BACKEND=seatd)
+  opens a seat against our mock — proving protocol compatibility both
+  ways. tests/suite/test_drm.c — planning logic (8 tests).
+  tests/mockseatd.c + scripts/test-session.sh session 8 (19 checks):
+  backend selection matrix, honest failure taxonomy, and the
+  compositor acquiring a seat through the real protocol end-to-end
+  (mock listening, compositor logs seat-mock, then fails at the
+  DRM stage because CI has no /dev/dri — and says exactly that).
+- Two latent leaks exposed by the new coverage (heavier tests recycle
+  the stack slots LSan uses for reachability): raw-protocol lock
+  tests never destroyed their registry/bind proxies (fixed in the
+  tests), and xwc_lock_destroy skipped the lock destroy on the
+  `finished` (denied) path and left held-lock proxies allocated after
+  disconnect (fixed in libxwcl: dead locks are destroyed, held locks
+  are freed with a request-less wl_proxy_destroy — the server still
+  sees the connection die; spec-verified by the lock suite).
+- Build-system surgery note: the conversational edit tool mangled
+  Makefile recipe tabs into spaces (make: "missing separator"); the
+  Makefile changes were re-applied through scripted edits with exact
+  byte control and verified parseable before each build.
+- Docs: DEPENDENCIES.md (libdrm/libseat/seatd rows, "Seat and session
+  management" concept table + provider description), BUILDING.md
+  ("Real TTY session" section: launch, provider table, selection
+  rules, per-init seatd setup examples, honest hardware-dependent
+  status; distro package lists gained libdrm/seatd/libseat with
+  honesty notes where packaging is uncertain; XW_DRM/XW_LIBSEAT knobs;
+  seat/DRM troubleshooting entries), ARCHITECTURE.md (seat provider
+  diagram + design rules; DRM backend behavior), TESTING.md (new
+  coverage, the manual hardware checklist, three regression-policy
+  entries), ROADMAP.md/TODO.md (Phase 4 done except physical hardware
+  verification), README.md (four backends, real-session quick start,
+  updated counts).
+- Full verification on the final tree: 63/63 in-process (45 -> 63),
+  103/103 process-level (84 -> 103), 50/50 build regressions
+  (49 -> 50 + 1 env skip), make asan = PASS (ASan+UBSan+LSan clean,
+  release restored), zero warnings under -Werror.
+
+Stage Summary:
+- The compositor is now a real TTY desktop candidate: seat acquisition
+  through three interchangeable providers (no systemd/elogind/seatd/
+  display-manager assumptions, no root), DRM/KMS scanout with page
+  flips, real input through the seat, honest backend selection with
+  fatal explicit-DRM semantics, and a real-session environment for
+  children.
+- Everything testable without hardware is tested — including the
+  seatd wire protocol against upstream libseat as an oracle — and the
+  ioctl paths are documented as the manual hardware checklist
+  (TESTING.md) instead of being faked.
+- Honest gaps: physical DRM verification (needs a real machine;
+  checklist written), live modeset of newly plugged monitors,
+  atomic modesetting, hardware cursor planes, GL/EGL rendering.

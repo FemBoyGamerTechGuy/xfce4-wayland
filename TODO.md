@@ -35,10 +35,31 @@ Persistent task list (mirrors the live development tracker). Status:
       full default-shortcut coverage test
 - [x] session passes user config dir to the compositor
 
+## Phase 4 (this session)
+- [x] seat provider abstraction: libseat (optional), built-in seatd
+      wire-protocol client, direct-VT provider; probing + honest
+      diagnostics; disable/ack/enable lifecycle
+- [x] DRM/KMS backend: discovery, connectors/modes/CRTCs, dumb-buffer
+      scanout, page flips (immediate fallback logged), hotplug
+      (removal), master lifecycle, CRTC restoration
+- [x] libinput device opens routed through the seat provider;
+      suspend/resume across session switches
+- [x] backend selection: --backend=drm|x11|wayland|headless,
+      TTY+KMS auto-detection, explicit drm never falls back
+- [x] session environment for real sessions (XDG_SESSION_TYPE,
+      XDG_CURRENT_DESKTOP, XDG_SESSION_DESKTOP, no DISPLAY leak)
+- [x] duplicate-service detection for autostart (re-login/restart
+      flows), duplicate ownership is not an error
+- [x] seat/DRM test coverage: mock seatd server (cross-validated
+      against upstream libseat), planning-logic tests, backend
+      selection process checks; manual hardware checklist documented
+- [~] physical hardware verification of the DRM ioctl paths (manual
+      checklist in TESTING.md; CI has no /dev/dri and refuses to fake)
+
 ## Backlog highlights (tracked in detail in ROADMAP.md)
 - [ ] touch input; per-seat layout switching
-- [ ] DRM/KMS backend (Phase 4): device discovery, CRTCs, planes,
-      atomic modesetting, multi-monitor, hotplug; logind DRM master
+- [ ] DRM refinements: atomic modesetting, live modeset of newly
+      plugged monitors, hardware cursor planes, GL/EGL renderer
 - [x] ext-session-lock + idle-notify (screen lock, screensaver):
       server protocol + security gates, xw-lock client, xwc_lock/xwc_idle
 - [~] PAM unlock backend (current authenticator: local passphrase file

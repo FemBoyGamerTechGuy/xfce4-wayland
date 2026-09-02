@@ -75,20 +75,35 @@ package examples, session integration).
 
 ## Backends
 
-The compositor runs on three interchangeable backends:
+The compositor runs on four interchangeable backends:
 
 | Backend | Use | Selection |
 |---------|-----|-----------|
 | headless | tests, CI, DRM-less development | default |
 | nested | the whole desktop as a window inside an existing **Wayland** session | `xw-compositor -B nested` or `xw-session --nested` with `$WAYLAND_DISPLAY` |
 | x11 | the whole desktop as a window inside an **X11/XLibre** session | `xw-compositor -B x11` or `xw-session --nested` with `$DISPLAY` |
+| drm | the physical display through kernel KMS (real TTY sessions) | `xw-session --backend=drm`, or plain `xw-session` from a TTY with KMS hardware |
 
-Nested mode is the intended development workflow before DRM/KMS is
-stable — it runs the real compositor, real WM, real panel and real
-clients, safely inside your current desktop:
+Nested mode is the development workflow inside an existing desktop —
+it runs the real compositor, real WM, real panel and real clients,
+safely inside your current session:
 
 ```sh
 build/bin/xw-session --nested      # picks wayland or x11 automatically
+```
+
+DRM mode is the real thing: from a TTY login, the session acquires a
+**seat** through whatever the machine provides — libseat (wrapping
+systemd-logind/elogind/seatd), the built-in seatd wire-protocol
+client (zero libraries), or a direct VT takeover — then drives the
+monitor (connector/mode enumeration, dumb-buffer scanout, page
+flips) and reads real keyboards/mice through the same seat. No
+systemd, elogind, seatd or display-manager assumptions; no root
+compositor, ever:
+
+```sh
+make && xw-session                # TTY + KMS -> real desktop
+xw-session --backend=drm -V       # verbose seat/device diagnostics
 ```
 
 The x11 backend is verified end to end under Xvfb with synthesized
@@ -106,7 +121,7 @@ graphical exit dialog (unavailable actions show their reason), the
 desktop panel, and a real screen locker (ext-session-lock with
 server-enforced blanking and input gating — a killed locker leaves the
 session locked) exist and pass an automated suite (45 in-process
-tests + 84 process-level checks + 49-58 build-system regression checks,
+tests + 103 process-level checks + 50-59 build-system regression checks,
 ASAN/UBSAN/LSAN-clean, incl. the forked panel and dialog children;
 the build is verified on font-less systems and under zsh). Nested
 Wayland and nested X11 backends run the desktop inside an existing

@@ -18,8 +18,12 @@
   |  .--------------.  .------------------------------------.     |
   |  | libxw core   |  | backends                           |     |
   |  | surfaces,    |  |  headless (tests, CI, dev)         |     |
-  |  | shm buffers, |  |  (future: drm/kms, wayland-nested) |     |
-  |  | damage,      |  '------------------------------------'     |
+  |  | shm buffers, |  |  nested wayland / nested x11       |     |
+  |  | damage,      |  |  drm/kms (real TTY sessions)       |     |
+  |  | outputs,     |  '------------------------------------'     |
+  |  | renderer     |  .------------------------------------.     |
+  |  | (pixman)     |  | seat providers (libseat /          |     |
+  |  '--------------'  |  seatd client / direct VT)         |     |
   |  | outputs,     |  .------------------------------------.     |
   |  | renderer     |  | renderer: pixman software          |     |
   |  | (pixman)     |  '------------------------------------'     |
@@ -247,6 +251,74 @@ never create these objects never pay for them (an eager version leaked
 5 proxies per client, caught by LSan). The panel main loop dispatches
 with a 1-second timeout ceiling: the poll timeout exists precisely so
 timer-driven redraws (the clock) can fire between server events.
+
+## Seat providers and the real DRM/KMS session
+
+The compositor core never opens a display or input device itself: the
+DRM backend and the libinput source both acquire everything through
+the seat/session abstraction in `src/libxw/xw-session-seat.c`.
+
+```
+  xw-compositor (-B drm)
+    |
+    |  xw_seat_session_open()  (capability probing, honest failures)
+    v
+  +--------------------+------------------+-----------------------+
+  | libseat (optional) | seatd client     | direct VT session     |
+  | wraps logind /     | wire protocol    | /dev/tty + KD_GRAPHICS|
+  | elogind / seatd    | over unix socket | + VT_PROCESS switching |
+  +--------------------+------------------+-----------------------+
+    | open_device() returns fds (SCM_RIGHTS / ACL-granted opens)
+    v
+  DRM backend (xw-backend-drm.c)        libinput source
+    card discovery, connectors,          udev discovery; every device
+    modes, dumb-buffer scanout,           open goes through the seat
+    page flips, hotplug, master           (open_restricted hook)
+```
+
+Design rules the module enforces:
+
+* **No provider is hard-coded.** Selection order (AUTO): libseat, the
+  built-in seatd client, the direct VT provider. Each failure is
+  logged; total failure produces one combined diagnostic. An explicit
+  `--seat-provider` never falls back.
+* **The seatd client is plain libc.** The wire protocol (seatd 0.9:
+  `OPEN_SEAT` handshake, `OPEN_DEVICE` with fds via `SCM_RIGHTS`,
+  `DISABLE_SEAT` -> client ack -> `ENABLE_SEAT` for VT switches,
+  error transport with errno values) is implemented directly, and the
+  test suite cross-validates the mock server against *upstream
+  libseat's own client* so both speak provably the same protocol.
+* **The direct provider is the classic TTY path.** It takes over the
+  controlling terminal (`KD_GRAPHICS`, `VT_PROCESS` with SIGUSR1/
+  SIGUSR2 delivered through the event loop's signal sources, so the
+  release handler runs in normal, async-signal-safe context), and
+  opens devices with the permissions the login already granted —
+  logind/elogind ACLs on the active session, or video/input groups
+  on traditional setups. It never chmods anything and never asks for
+  root.
+* **Session switching is uniform.** Whatever the provider, the
+  compositor sees `disable` (release scanout: drop DRM master,
+  suspend libinput) followed by an ack (`xw_seat_session_ack_disable`)
+  and later `enable` (re-acquire master, repaint everything). The
+  DRM backend implements the two halves; the panel and clients are
+  unaffected.
+
+The DRM backend itself follows the same pattern as the nested
+backends (one `xw_output` per connector, present() from the repaint
+path), with KMS specifics: `/dev/dri/card*` enumeration (no hardcoded
+card, prefers a card with connected monitors), CRTC planning that
+reuses the firmware's encoder/CRTC pairing, the connector's preferred
+mode, two dumb buffers per output with page-flip event pacing (a
+frame arriving while a flip is in flight is parked and flips on
+vblank), udev hotplug monitoring (connector removal tears the output
+down honestly; live modesets of newly plugged monitors are a roadmap
+item, logged as such), full CRTC restoration on every exit path —
+normal, signal, and initialization failure — and a fallback to
+immediate buffer updates on drivers that reject page flips (logged,
+not silent). Pure planning logic (mode choice, connector naming,
+CRTC assignment) lives in DRM-independent functions covered by the
+regular test suite; the ioctl paths are the manual hardware
+checklist's job (TESTING.md).
 
 ## Session lock (ext-session-lock) and idle (ext-idle-notify)
 

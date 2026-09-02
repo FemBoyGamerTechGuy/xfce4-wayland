@@ -17,10 +17,11 @@ manager (see ["If your distribution is not listed"](#if-your-distribution-is-not
 6. [Zero-root development](#zero-root-development)
 7. [Installation](#installation)
 8. [User-local installation (no root)](#user-local-installation-no-root)
-9. [Wayland session integration](#wayland-session-integration)
-10. [Sysroot bootstrap for locked-down containers](#sysroot-bootstrap-for-locked-down-containers)
-11. [Installing dependencies by distribution (examples)](#installing-dependencies-by-distribution-examples)
-12. [Troubleshooting](#troubleshooting)
+9. [Real TTY session (DRM/KMS + seat providers)](#real-tty-session-drmkms--seat-providers)
+10. [Wayland session integration](#wayland-session-integration)
+11. [Sysroot bootstrap for locked-down containers](#sysroot-bootstrap-for-locked-down-containers)
+12. [Installing dependencies by distribution (examples)](#installing-dependencies-by-distribution-examples)
+13. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -129,6 +130,8 @@ the configurable install prefix.
 |---|---|---|
 | `XW_X11` | `auto` (default) / `1` / `0` | nested X11 backend. `auto` builds it when libX11 dev files are found and prints an actionable note otherwise; `1` requires it (hard error with instructions); `0` never builds it |
 | `XW_LIBINPUT` | `auto` (default) / `1` / `0` | real-input backend (needs the libinput **and** libudev dev sets — see the requirement row above). `auto` builds it when both are found, printing an actionable note naming the missing one otherwise; `1` requires both (hard error naming whichever is missing); `0` never builds it. Switching the backend on/off over a populated build tree requires `make clean` (the build refuses to mix feature sets, exactly like PROFILE switching) |
+| `XW_DRM` | `auto` (default) / `1` / `0` | DRM/KMS backend for real TTY sessions (needs the libdrm **and** libudev dev sets). `auto` builds it when both are found; `1` requires both (hard error); `0` never builds it — headless/nested and all their tests keep working. Switching over a populated tree needs `make clean` |
+| `XW_LIBSEAT` | `auto` (default) / `1` / `0` | external libseat seat provider. Optional by design (the built-in seatd client and direct-VT provider need nothing); `1` requires the libseat dev files, `auto` builds the provider when found |
 | `PROFILE` | `release` (default) / `debug` / `asan` | compiler/linker preset, see [profiles](#build-profiles) |
 | `prefix` | path (default `/usr/local`) | installation prefix |
 | `DESTDIR` | path | staged install root (packagers) |
@@ -143,6 +146,9 @@ the configurable install prefix.
 | `XW_INPUT_DEVICES` | colon-separated evdev nodes for the input source's path mode (`/dev/input/event3:/dev/input/event5`); deterministic, no udev needed. Setting it is the explicit opt-in that lets AUTO mode touch real devices |
 | `XW_REPEAT_DELAY_MS`, `XW_REPEAT_RATE_HZ` | override the key-repeat parameters for debugging/testing (defaults 500 ms / 30 Hz) |
 | `XW_BACKEND`, `XW_COMPOSITOR` | used by `xw-session` (see `xw-session --help`) |
+| `XW_SEAT_PROVIDER` | force the seat provider for the DRM backend (`auto` / `libseat` / `seatd` / `direct`); the compositor's `--seat-provider` flag wins over it |
+| `SEATD_SOCK` | seatd socket path for the built-in seatd client (default `/run/seatd.sock`); also honored by libseat itself |
+| `LIBSEAT_BACKEND` | when using the libseat provider: force libseat's own backend (`seatd` / `logind`) instead of its auto-probing |
 | `XW_LOCK_TIMEOUT_MS` | session-lock grace period before the `locked` event is forced with a blank frame when the lock client has not committed surfaces (default 1000 ms) |
 | `XW_LOCK_PASSPHRASE_FILE` | passphrase file for `xw-lock` (default: `~/.config/xfce4-wayland/lock-pass`, first line, `chmod 600` it; see `xw-lock --help`) |
 
@@ -306,6 +312,103 @@ No `sudo`, `su` or `doas` appears anywhere in this workflow.
 
 ---
 
+## Real TTY session (DRM/KMS + seat providers)
+
+The compositor can drive the physical display: log into a text
+console (e.g. Ctrl+Alt+F3), build, and run the session manager.
+
+```sh
+make
+xw-session                 # TTY + KMS hardware -> DRM backend
+# or explicitly (never falls back to another backend on failure):
+xw-session --backend=drm
+# verbose seat/backend diagnostics:
+xw-session --backend=drm --verbose
+```
+
+What happens: `xw-session` starts `xw-compositor -B drm`, which first
+acquires a **seat** (session device access) through one of three
+providers, probed in this order unless forced with
+`--seat-provider` (or `$XW_SEAT_PROVIDER`):
+
+| Provider | Needs | Where it fits |
+|---|---|---|
+| `libseat` | the libseat library (build-time optional, `XW_LIBSEAT`) | systems where libseat is installed; it wraps logind/elogind/seatd itself |
+| `seatd` | a running seatd daemon (nothing else) | seatd systems (Artix, Void, ...): the built-in wire-protocol client, zero libraries |
+| `direct` | a TTY login + device permissions (logind/elogind ACLs of the active session, or video/input groups) | plain TTY logins without any seat daemon |
+
+Then the DRM backend enumerates `/dev/dri/card*` (no hardcoded
+card0), picks a card with connected connectors, becomes DRM master,
+modesets every connected output to its preferred mode, and scans out
+through dumb buffers with page flips (software rendering; drivers
+that reject page flips fall back to immediate updates with a logged
+warning). Input devices are opened **through the same seat provider**
+(libinput's open hook), so no device is ever opened behind the seat
+manager's back.
+
+Exit cleanly with the exit button or Ctrl+Alt+Del; Ctrl+C also exits
+safely: the session tears the compositor down, which restores the
+original CRTC state, drops DRM master and returns the terminal to
+text mode.
+
+### Backend selection rules
+
+| Command / environment | Effective backend |
+|---|---|
+| `xw-session` from a TTY, KMS hardware present | `drm` |
+| `xw-session` from a TTY, no KMS hardware | `headless` (explained in the log, not silent) |
+| `xw-session` inside a graphical session | `headless` (nesting needs explicit `-N`) |
+| `xw-session -N` / `--nested` | window under the parent (Wayland or X11, auto) |
+| `xw-session --backend=drm` | `drm` only — failure is fatal with diagnostics, **never** a fallback |
+| `xw-session --backend=x11` / `wayland` / `headless` | exactly that backend |
+| `xw-compositor -B drm -P seatd\|libseat\|direct` | force one seat provider |
+
+### Setting up seatd (examples by init system)
+
+These are *examples for the seatd project's own service*, documented
+per distribution — this project hard-codes no service-manager
+commands:
+
+```sh
+# Artix (runit):        ln -s /etc/runit/sv/seatd /run/runit/service/
+# Artix (OpenRC):       rc-update add seatd default && rc-service seatd start
+# Arch (systemd):       sudo systemctl enable --now seatd
+# Void:                 ln -s /etc/sv/seatd /var/service/
+# Debian/Ubuntu (systemd): sudo systemctl enable --now seatd
+```
+
+seatd runs as root (that is its job: it holds the devices so your
+compositor never has to), listens on `/run/seatd.sock`, and every
+user in the `seat` group may use it:
+
+```sh
+sudo usermod -aG seat $USER   # re-login afterwards
+```
+
+Alternatively skip seatd entirely: on logind/elogind systems the
+`direct` provider uses the ACLs the login already granted, and on
+traditional group-based systems add yourself to `video` and `input`
+(historical Unix permissions — your distribution's own mechanism, no
+permission hacks from this project).
+
+### What is hardware-dependent (honest status)
+
+* Implemented and exercised by tests in this repository: seat provider
+  abstraction, the seatd wire protocol (against a mock server, and
+  cross-validated against upstream libseat), libinput routing through
+  the seat, DRM planning logic (mode selection, connector naming,
+  CRTC assignment), backend selection, honest diagnostics, session
+  environment.
+* Implemented, but only runnable on physical hardware: the DRM ioctl
+  paths (modeset, dumb buffers, page flips, hotplug, VT switching,
+  master drop/re-acquire) and real keyboard/mouse input. The manual
+  checklist is in [TESTING.md](TESTING.md) ("Manual hardware
+  checklist"); CI containers have no `/dev/dri`, and the tests refuse
+  to fake it.
+* Not implemented yet: GPU/EGL rendering, hardware cursor planes,
+  multi-connector modesets of newly plugged monitors at runtime
+  (logged + available next start), atomic modesetting.
+
 ## Wayland session integration
 
 `make install` ships a `wayland-sessions/xfce4-wayland.desktop` entry:
@@ -429,6 +532,9 @@ packages from the [requirements table](#requirements) as needed.
 ```sh
 sudo pacman -S base-devel wayland wayland-protocols libxkbcommon \
                  pixman libx11 libinput systemd-libs python-pillow
+# real TTY sessions (DRM/KMS + seatd, first-class here; libseat
+# from the AUR/extra is optional):
+sudo pacman -S libdrm seatd
 # for `make check`:
 sudo pacman -S xorg-server-xvfb libxtst libxi
 ```
@@ -443,6 +549,8 @@ provides the udev library only — no systemd service. Verify with
 sudo apt install build-essential pkg-config libwayland-dev \
                    wayland-protocols libxkbcommon-dev libpixman-1-dev \
                    libx11-dev libinput-dev libudev-dev python3-pil
+# real TTY sessions (DRM/KMS + optional libseat):
+sudo apt install libdrm-dev libseat-dev seatd
 # for `make check`:
 sudo apt install xvfb libxtst-dev libxi-dev
 ```
@@ -459,6 +567,7 @@ Same package names as Debian (Ubuntu inherits them):
 sudo apt install build-essential pkg-config libwayland-dev \
                    wayland-protocols libxkbcommon-dev libpixman-1-dev \
                    libx11-dev libinput-dev libudev-dev python3-pil
+sudo apt install libdrm-dev libseat-dev seatd   # real TTY sessions
 sudo apt install xvfb libxtst-dev libxi-dev   # for make check
 ```
 
@@ -468,6 +577,11 @@ sudo apt install xvfb libxtst-dev libxi-dev   # for make check
 sudo dnf install gcc make pkgconf wayland-devel wayland-protocols-devel \
                    libxkbcommon-devel pixman-devel libX11-devel \
                    libinput-devel systemd-devel python3-pillow
+# real TTY sessions (DRM/KMS):
+sudo dnf install libdrm-devel
+# (seatd/libseat packaging on Fedora varies by release; search with
+#  `dnf search seatd` — or rely on logind through libseat, or the
+#  direct TTY provider with the session's device ACLs)
 # for `make check`:
 sudo dnf install xorg-x11-server-Xvfb libXtst-devel libXi-devel
 ```
@@ -481,6 +595,10 @@ name applies.)
 sudo zypper install gcc make pkg-config wayland-devel wayland-protocols \
                      libxkbcommon-devel pixman-devel libX11-devel \
                      libinput-devel systemd-devel python3-Pillow
+# real TTY sessions (DRM/KMS):
+sudo zypper install libdrm-devel
+# (search `zypper search seatd` for the seat manager; the direct TTY
+#  provider works with the login session's device ACLs regardless)
 # for `make check` (Xvfb lives in the xorg-x11-server package):
 sudo zypper install xorg-x11-server libXtst-devel libXi-devel
 ```
@@ -491,6 +609,8 @@ sudo zypper install xorg-x11-server libXtst-devel libXi-devel
 sudo xbps-install base-devel wayland-devel wayland-protocols \
                     libxkbcommon-devel pixman-devel libX11-devel \
                     libinput-devel libudev-devel python3-Pillow
+# real TTY sessions (DRM/KMS + seatd, first-class here):
+sudo xbps-install libdrm-devel seatd
 # for `make check`:
 sudo xbps-install xorgserver-xvfb libXtst-devel libXi-devel
 ```
@@ -501,6 +621,8 @@ sudo xbps-install xorgserver-xvfb libXtst-devel libXi-devel
 sudo apk add build-base pkgconf wayland-dev wayland-protocols \
                 libxkbcommon-dev pixman-dev libx11-dev libinput-dev \
                 udev-dev py3-pillow
+# real TTY sessions (DRM/KMS):
+sudo apk add libdrm-dev seatd seatd-dev
 # for `make check`:
 sudo apk add xvfb libxtst-dev libxi-dev
 ```
@@ -629,6 +751,39 @@ a usable one; any systemd/elogind system provides it already.
 **X11 process checks fail**
 `make check` runs the x11 backend under Xvfb; install Xvfb (plus libXtst
 and libXi development files — the sysroot bootstrap includes them).
+
+**`drm: no DRM subsystem (/dev/dri does not exist)`**
+The compositor's DRM backend starts on a machine with no KMS display
+hardware (containers, VMs without a GPU, WSL1). Expected and honest:
+use headless/nested there, or a machine with a DRM device for real
+sessions.
+
+**`seat: unable to acquire a seat`**
+Every seat provider failed on a DRM start. The message lists what was
+tried; the fixes, in order of likelihood:
+- *seatd socket unavailable*: the seatd daemon is not running (see
+  "Setting up seatd" above) or this user is not in the `seat` group
+  (`getent group seat`).
+- *libseat backends unavailable*: no logind session, no elogind, no
+  seatd — and no `$DISPLAY`-less TTY either. Install/start one of
+  them, or use `--seat-provider=direct` from a real TTY login.
+- *direct: /dev/tty is not a virtual terminal*: you launched from a
+  container, a graphical session, or a display manager without a VT.
+  A direct session needs a text-console login (Ctrl+Alt+F3) — or
+  seatd/libseat, which work in more environments.
+
+**`drm: opened ... but cannot become DRM master`**
+Another display server (an X server, another Wayland compositor)
+currently owns the output. Close it first, or start this session on
+a free VT. With seatd/libseat the seat manager itself arranges master
+rights — the message names the seat provider in use if it could not.
+
+**`xw-session: cannot start the compositor` with `--backend=drm`**
+The DRM backend failed for the reason the compositor printed above
+that line (no hardware, no seat, no master, no connector). With an
+explicit `--backend=drm` the session exits instead of falling back to
+another backend — start it in an environment that satisfies the
+reason, or drop the flag to let AUTO pick headless where appropriate.
 
 **`the Pillow python module is required at build time ...`**
 The build-time font rasterizer is missing its Pillow module. Install

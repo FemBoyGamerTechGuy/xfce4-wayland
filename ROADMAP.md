@@ -42,9 +42,27 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
   Translation pipeline (clamping, sub-pixel accumulation, abs→layout,
   v120 wheels) covered white-box at Level 1; the thin libinput_event
   decoder is Level 3 (TESTING.md).
-- TODO DRM/KMS backend (Phase 4) for physical displays; GL renderer
-  path (the libinput source is the input half of that phase).
-- TODO presentation-time feedback.
+- DONE seat/provider abstraction (Phase 4, `xw-session-seat.c`):
+  libseat (optional external), a built-in seatd wire-protocol client
+  (plain libc; cross-validated against upstream libseat in the test
+  suite), and a direct-VT provider (KD_GRAPHICS + VT_PROCESS, devices
+  via login ACLs or groups). Capability probing with honest combined
+  diagnostics; `--seat-provider`/`$XW_SEAT_PROVIDER` override; session
+  disable/ack/enable lifecycle uniform across providers.
+- DONE DRM/KMS backend (Phase 4, `xw-backend-drm.c`): device
+  discovery (no hardcoded card), connector/mode/CRTC enumeration via
+  pure testable planning functions, preferred-mode modesets,
+  double-buffered dumb scanout with page-flip event pacing (immediate
+  fallback on flip-rejecting drivers, logged), udev hotplug
+  (connector removal), DRM master drop/re-acquire across VT switches,
+  full CRTC restoration on every exit path. Input devices open
+  through the seat provider. Backend selection in xw-session
+  (--backend=drm|x11|wayland|headless, TTY+KMS auto-detection,
+  explicit drm never falls back). ioctl paths verified by the manual
+  hardware checklist (TESTING.md); GL/EGL rendering is a later
+  accelerator.
+- TODO presentation-time feedback; atomic modesetting; live modeset
+  of newly plugged monitors; hardware cursor planes.
 
 ## M2 — Shell + window management
 - DONE xdg-shell server (toplevel): configure/ack state machine,

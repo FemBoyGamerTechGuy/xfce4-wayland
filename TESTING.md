@@ -155,7 +155,7 @@ requires a running udev instance; run
 what was verified (device, kernel, distro) in WORKLOG.md — that is
 what keeps "verified at Level 3" honest.
 
-## What is covered today (45 Level-1 tests + 84 Level-2 checks + 49-58 build-regression checks)
+## What is covered today (63 Level-1 tests + 103 Level-2 checks + 50-59 build-regression checks)
 
 The nested-session regression (session 5 below) is the reason several
 of these numbers exist: an invisible panel that looked like a working
@@ -254,6 +254,68 @@ logind (no logind exists in the build container — the fake-loginctl
 coverage is Level 2 by definition), libinput's udev seat mode and the
 libinput_event decoder (Level 3), touch/gestures/tablets (unimplemented).
 
+
+## Seat providers and the DRM backend
+
+Level 1 (`tests/suite/test_seat.c`, `tests/suite/test_drm.c`):
+
+- the built-in seatd client speaks the real wire protocol against a
+  forked **mock seatd server**: handshake + seat name, device open
+  with the fd arriving through `SCM_RIGHTS`, device close, session
+  switch, the DISABLE -> ack -> ENABLE lifecycle (delivered as
+  background traffic behind a blocking request, exactly like a real
+  VT switch), server-side errors, protocol garbage, and a seat
+  manager that hangs up at connect (SIGPIPE-safety: the client writes
+  with `MSG_NOSIGNAL`)
+- **cross-validation**: the same mock server also serves *upstream
+  libseat's* seatd backend (`LIBSEAT_BACKEND=seatd`) — open, device,
+  switch, close — proving the mock (and with it every
+  built-in-client assertion above) implements the protocol the real
+  library expects
+- the direct-VT provider refuses a non-VT `/dev/tty` (containers,
+  CI); on real TTYs the test skips instead of taking the console over
+- AUTO selection with every provider deliberately broken fails (no
+  silent root fallback), matching the combined diagnostic
+- DRM planning logic without hardware: preferred/largest/highest-
+  refresh mode selection, connector naming (HDMI-A-1, DP-3, eDP-1...),
+  CRTC assignment (firmware pairing reuse, possible-mask fallback,
+  exhaustion)
+
+Level 2 (`scripts/test-session.sh`, session 8) — the backend selection
+matrix and the honest failure taxonomy:
+
+- explicit `--backend=drm` without KMS: exit 1, the compositor's
+  reason visible, no restart loop, never a fallback
+- AUTO on a TTY without KMS hardware: headless with an *explained*
+  downgrade; AUTO with KMS picks DRM (hardware-only)
+- bogus backend/seat-provider names rejected
+- **the compositor acquires a seat through the real protocol**:
+  `tests/mockseatd` (a standalone minimal seatd server) accepts the
+  compositor's connection, the compositor logs the seat from the mock
+  (`seat-mock`), then fails honestly at the DRM stage (no `/dev/dri`
+  in CI) — the full seat path runs, only the hardware part cannot
+- the direct provider's no-VT diagnostic and exit code
+
+### Manual hardware checklist (not automatable honestly)
+
+CI has no `/dev/dri`, no monitors, no VTs — and the DRM ioctl paths
+must not be faked (a fake DRM backend would be a lie with green
+tests). Verify on real hardware, in this order:
+
+1. `make clean && make` as your normal user (zero root).
+2. From a TTY (Ctrl+Alt+F3): `xw-session --backend=drm --verbose` —
+   expect the seat provider, device, connector, mode and socket lines
+   in the log; the monitor switches to the desktop; panel, clock,
+   workspaces, tasklist, exit button visible.
+3. Keyboard, mouse, wheel, touchpad, key repeat, workspace shortcuts.
+4. Ctrl+Alt+F2 away and back: screen restores to the TTY, session
+   re-acquires DRM master and repaints.
+5. Ctrl+C: clean exit, the TTY is usable text again (CRTC restored,
+   master dropped).
+6. Repeated with: seatd (and the built-in client), libseat over
+   logind, libseat over elogind where available, and `--seat-provider=direct`
+   from the TTY login. Any provider you could not test, say so.
+
 ## Regression policy
 
 Every bug fixed during development gets a test that fails without the
@@ -316,3 +378,16 @@ Highlights (each verifiable by reverting the fix):
   (`foreign-toplevel-activation`)
 - NULL-source selection fabricated an empty offer to clients
   (`clipboard-selection`)
+- **the seatd client wrote to a dead seat-manager socket with plain
+  `write()`: the compositor died of SIGPIPE the moment a seatd daemon
+  vanished mid-handshake (writes now use `MSG_NOSIGNAL`; the
+  close-early mock test reproduces it)**
+- **raw-protocol lock tests never destroyed their wl_registry/
+  bind proxies: a latent client-side leak that stayed invisible until
+  heavier tests recycled the stack slots LSan uses for reachability
+  (destroy-before-disconnect in the tests)**
+- **xwc_lock_destroy skipped the ext_session_lock_v1 destroy on the
+  `finished` (denied) path and left held-lock proxies allocated after
+  disconnect — the client library now destroys dead locks and frees
+  held ones without a request (server still sees the connection die;
+  spec-verified) (`session-lock-*`)**
