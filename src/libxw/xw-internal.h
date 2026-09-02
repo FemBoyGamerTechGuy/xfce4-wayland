@@ -605,6 +605,14 @@ void xw_lock_role_destroy(struct xw_surface *s);
  * semantics) and refresh the usable area. Called by xw_output_resize. */
 void xw_layer_reconfigure_output(struct xw_compositor *c, struct xw_output *o);
 
+/* an output appeared: adopt output-less layer surfaces and configure
+ * them (they were held unconfigured since creation) */
+void xw_layer_output_added(struct xw_compositor *c, struct xw_output *o);
+
+/* an output is being destroyed: re-anchor its layer surfaces to the
+ * next output, or send .closed when none remains */
+void xw_layer_output_removed(struct xw_compositor *c, struct xw_output *o);
+
 /* --------------------------------------------------- foreign toplevel mgmt */
 struct xw_foreign_toplevel_res {
     struct wl_resource *res;

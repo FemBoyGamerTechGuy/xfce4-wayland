@@ -176,6 +176,9 @@ struct xw_output *xw_output_create(struct xw_compositor *c, const char *name,
     wl_list_insert(c->outputs.prev, &o->link);
     xw_log(XW_LOG_INFO, "output %s: %dx%d+%d+%d scale %d", o->name, o->width,
            o->height, o->x, o->y, o->scale);
+    /* layer surfaces that were created before any output existed have
+     * been waiting for one: adopt them now (sends their configure) */
+    xw_layer_output_added(c, o);
     return o;
 }
 
@@ -186,6 +189,9 @@ void xw_output_destroy(struct xw_output *o) {
      * (the client should have destroyed them on global remove; this is
      * the server-side guarantee) */
     xw_session_lock_output_removed(o->comp, o);
+    /* layer surfaces anchored here: re-anchor or close them before the
+     * output leaves the list */
+    xw_layer_output_removed(o->comp, o);
     wl_list_remove(&o->link);
     if (o->global)
         wl_global_destroy(o->global);

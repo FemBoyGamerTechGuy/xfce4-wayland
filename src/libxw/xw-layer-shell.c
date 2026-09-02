@@ -59,6 +59,15 @@ static struct xw_layer_surface *ls_from_res(struct wl_resource *res) {
 static void ls_configure(struct xw_layer_surface *ls) {
     if (!ls->res || !ls->surface)
         return;
+    /* no output yet (layer surface created before any output existed;
+     * xw_layer_output_added sends the configure the moment one appears)
+     */
+    if (!ls->output) {
+        xw_log(XW_LOG_DEBUG,
+               "layer-shell: deferring configure for '%s' (no output yet)",
+               ls->namespace[0] ? ls->namespace : "?");
+        return;
+    }
     int w = ls->configured_w, h = ls->configured_h;
     uint32_t a = ls->anchors;
     struct xw_output *o = ls->output;
@@ -154,7 +163,8 @@ static void ls_set_layer(struct wl_client *client, struct wl_resource *res,
     if (ls->mapped)
         xw_damage_outputs_rect(ls->comp, ls->x, ls->y, ls->w, ls->h);
     wl_list_remove(&ls->link);
-    wl_list_insert(ls->comp->wm->layers[layer].prev, &ls->link);
+    /* head of the target layer = topmost (see shell_get_layer_surface) */
+    wl_list_insert(&ls->comp->wm->layers[layer], &ls->link);
     ls->layer = layer;
     if (ls->mapped) {
         xw_wm_recalculate_usable(ls->comp->wm);
@@ -303,13 +313,20 @@ static void shell_get_layer_surface(struct wl_client *client,
     }
 
     /* output resolution: explicit (wl_output resource user data is the
-     * struct xw_output) or the first output */
+     * struct xw_output) or the first output. When NEITHER exists the
+     * surface is still created — returning here without binding the
+     * new object id is a protocol kill: the client's very next request
+     * on that id (set_anchor, commit, ...) is an invalid object and
+     * libwayland disconnects the client. Instead: output = NULL, no
+     * configure until one appears (xw_layer_output_added). */
     struct xw_output *o = output ? wl_resource_get_user_data(output) : NULL;
-    if (!o) {
-        if (wl_list_empty(&c->outputs))
-            return;
+    if (!o && !wl_list_empty(&c->outputs))
         o = wl_container_of(c->outputs.next, o, link);
-    }
+    if (!o)
+        xw_log(XW_LOG_WARN,
+               "layer-shell: '%s' created before any output existed — "
+               "holding it unconfigured until an output appears",
+               namespace ? namespace : "?");
 
     struct xw_layer_surface *ls = calloc(1, sizeof(*ls));
     if (!ls) {
@@ -338,7 +355,10 @@ static void shell_get_layer_surface(struct wl_client *client,
 
     wl_resource_set_implementation(lres, &layer_surface_impl, ls,
                                    layer_surface_resource_destroy);
-    wl_list_insert(c->wm->layers[layer].prev, &ls->link);
+    /* head of the layer list = TOPMOST (matches surface_at's first-match
+     * order and the renderer's tail-to-head draw order; newer surfaces
+     * stack above older ones within the same layer) */
+    wl_list_insert(&c->wm->layers[layer], &ls->link);
     s->role = XW_SURFACE_ROLE_LAYER;
     s->role_data = ls;
     /* no configure here: the client sends anchor/margin/size requests
@@ -384,8 +404,13 @@ void xw_layer_role_commit(struct xw_surface *s) {
     }
     ls_layout(ls);
     if (!ls->mapped) {
-        /* a commit with a buffer maps the layer surface */
-        if (s->buf_w > 0 || s->buf_h > 0 || ls->configured_w > 0) {
+        /* a commit with a buffer maps the layer surface — never without
+         * an output: geometry is output-derived, and a client that
+         * committed before any configure (no output yet) is holding a
+         * pre-configure buffer it must re-commit after the configure
+         * that xw_layer_output_added will send */
+        if (ls->output &&
+            (s->buf_w > 0 || s->buf_h > 0 || ls->configured_w > 0)) {
             ls->mapped = true;
             xw_log(XW_LOG_INFO,
                    "layer-shell: surface '%s' mapped at %d,%d %dx%d "
@@ -445,6 +470,75 @@ void xw_layer_role_destroy(struct xw_surface *s) {
 }
 
 /* ------------------------------------------------------------ output resize */
+
+/* An output appeared: adopt every output-less layer surface (created
+ * while no output existed — see shell_get_layer_surface) and finally
+ * send the configure they have been waiting for. The client then sizes
+ * its buffer, commits and maps. Called from xw_output_create. */
+void xw_layer_output_added(struct xw_compositor *c, struct xw_output *o) {
+    if (!c || !c->wm || !o)
+        return;
+    for (int layer = 0; layer < 4; layer++) {
+        struct xw_layer_surface *ls;
+        wl_list_for_each(ls, &c->wm->layers[layer], link) {
+            if (ls->output)
+                continue;
+            ls->output = o;
+            xw_log(XW_LOG_INFO,
+                   "layer-shell: '%s' attached to output '%s' after "
+                   "waiting for one",
+                   ls->namespace[0] ? ls->namespace : "?", o->name);
+            if (ls->configured_sent)
+                ls_configure(ls);
+        }
+    }
+}
+
+/* An output is going away: layer surfaces anchored to it move to the
+ * next remaining output (fresh configure + relayout), or receive
+ * .closed when no output is left (the layer-shell contract for output
+ * loss). Called from xw_output_destroy BEFORE the output is unlinked. */
+void xw_layer_output_removed(struct xw_compositor *c, struct xw_output *o) {
+    if (!c || !c->wm || !o)
+        return;
+    /* the next remaining output, if any (o is still linked here) */
+    struct xw_output *alt = NULL;
+    if (wl_list_length(&c->outputs) > 1) {
+        wl_list_for_each(alt, &c->outputs, link) {
+            if (alt != o)
+                break;
+        }
+        if (alt == o) /* paranoia: only o itself */
+            alt = NULL;
+    }
+    for (int layer = 0; layer < 4; layer++) {
+        struct xw_layer_surface *ls, *tmp;
+        wl_list_for_each_safe(ls, tmp, &c->wm->layers[layer], link) {
+            if (ls->output != o)
+                continue;
+            if (alt) {
+                if (ls->mapped) {
+                    xw_damage_outputs_rect(c, ls->x, ls->y, ls->w, ls->h);
+                    ls->output = alt;
+                    ls_layout(ls);
+                    xw_damage_outputs_rect(c, ls->x, ls->y, ls->w, ls->h);
+                } else {
+                    ls->output = alt;
+                }
+                if (ls->configured_sent)
+                    ls_configure(ls);
+            } else {
+                xw_log(XW_LOG_INFO,
+                       "layer-shell: '%s' closed (its output went away)",
+                       ls->namespace[0] ? ls->namespace : "?");
+                if (ls->res && ls->surface)
+                    zwlr_layer_surface_v1_send_closed(ls->res);
+                xw_layer_surface_destroy(ls);
+            }
+        }
+    }
+    xw_wm_recalculate_usable(c->wm);
+}
 
 /* Output geometry changed (nested window resized by the host WM, output
  * management, ...). Layer surfaces anchored to opposite edges derive
