@@ -457,7 +457,7 @@ DESKTOP
     check "nested: session starts" \
         'wait_for "[ -S \"$RTD/xw-nest.sock\" ]"'
     check "nested: compositor runs with the x11 backend" \
-        'wait_for "rg -q \"nested session: backend x11\" \"$LOG5\" 2>/dev/null"'
+        'wait_for "rg -q \"compositor backend: x11\" \"$LOG5\" 2>/dev/null"'
     check "nested: panel autostarted" \
         'wait_for "rg -q \"autostart .*xw-panel\" \"$LOG5\" 2>/dev/null"'
     # the panel must RUN, not merely be spawned (regression: it used to

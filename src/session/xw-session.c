@@ -72,6 +72,18 @@ struct session {
     bool shutting_down;
     bool restarting;          /* re-exec instead of plain exit */
     bool nested;              /* desktop runs inside the parent session */
+    bool verbose;             /* un-silence the compositor's diagnostics */
+    /* backend selection (explicit --backend or auto):
+     *   drm — real KMS session through a seat provider (never falls
+     *         back; failure is fatal with diagnostics)
+     *   x11 / wayland — nested under a parent session (implies nested)
+     *   headless — in-memory outputs
+     *   auto — TTY with KMS hardware -> drm; graphical parent or no
+     *         KMS -> headless; -N -> parent-session window */
+    int backend;              /* SB_* */
+    bool fatal_backend;       /* explicit drm: a compositor exit is fatal,
+                               * never a restart loop */
+    char comp_backend[16];    /* resolved backend name passed to -B */
     struct {
         pid_t pid;
         int64_t started_ms;
@@ -91,6 +103,16 @@ struct session {
 
 static struct session S;
 
+enum {
+    SB_AUTO = 0,
+    SB_DRM,
+    SB_X11,
+    SB_WAYLAND,
+    SB_HEADLESS,
+};
+
+static void log_msg(const char *level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
 /* nested mode: run the desktop as a window inside the user's current
  * session (the primary development workflow before DRM/KMS). Backend
  * choice: explicit $XW_BACKEND, else a Wayland parent if
@@ -108,6 +130,75 @@ static const char *nested_backend_arg(void) {
     return NULL;
 }
 
+/* Is KMS display hardware reachable in this session? Used by AUTO
+ * only: an explicit --backend=drm must NOT depend on this (its
+ * failures are the compositor's honest diagnostics, not a silent
+ * downgrade). */
+static bool kms_hardware_present(void) {
+    DIR *d = opendir("/dev/dri");
+    if (!d)
+        return false;
+    struct dirent *de;
+    bool found = false;
+    while ((de = readdir(d))) {
+        if (strncmp(de->d_name, "card", 4) == 0 && de->d_name[4] >= '0' &&
+            de->d_name[4] <= '9') {
+            found = true;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+/* Resolve the effective backend + the -B argument for the compositor.
+ * Returns the backend name ("drm", "x11", "nested", "headless") or
+ * NULL when nesting was requested but no parent session exists. */
+static const char *resolve_backend(bool *fatal_on_fail) {
+    *fatal_on_fail = false;
+
+    if (S.backend == SB_DRM) {
+        *fatal_on_fail = true; /* explicit: never silently downgraded */
+        return "drm";
+    }
+    if (S.backend == SB_X11) {
+        S.nested = true;
+        return "x11";
+    }
+    if (S.backend == SB_WAYLAND) {
+        S.nested = true;
+        return "nested";
+    }
+    if (S.backend == SB_HEADLESS)
+        return "headless";
+
+    /* AUTO */
+    if (S.nested) {
+        const char *be = nested_backend_arg();
+        if (!be) {
+            log_msg("error", "nested mode requires $WAYLAND_DISPLAY or "
+                            "$DISPLAY (or set $XW_BACKEND)");
+            return NULL;
+        }
+        return be;
+    }
+    /* a real TTY with KMS hardware is a real session: drive the display */
+    const char *wl = getenv("WAYLAND_DISPLAY");
+    const char *x = getenv("DISPLAY");
+    if ((!wl || !*wl) && (!x || !*x)) {
+        if (kms_hardware_present()) {
+            log_msg("info", "auto: TTY login with KMS hardware — starting "
+                            "the real DRM session (seat provider: auto)");
+            return "drm";
+        }
+        log_msg("info", "auto: TTY login, but no /dev/dri KMS hardware — "
+                        "starting headless (no display will appear)");
+    }
+    /* inside a graphical parent session (or headless CI): the default
+     * remains headless; nesting is an explicit -N */
+    return "headless";
+}
+
 /* -------------------------------------------------------------- utils */
 
 static void on_signal(int sig) {
@@ -116,8 +207,6 @@ static void on_signal(int sig) {
     if (sig == SIGCHLD)
         g_child_event = 1;
 }
-
-static void log_msg(const char *level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
 static void log_msg(const char *level, const char *fmt, ...) {
     va_list ap;
@@ -228,27 +317,27 @@ static pid_t start_compositor(void) {
     if (pipe(outpipe) < 0)
         return -1;
 
-    /* build the argument list: -q, the user config dir, and the
-     * backend when nesting */
-    const char *args[12] = {find_compositor(), "-q", NULL, NULL, NULL,
-                            NULL, NULL, NULL, NULL, NULL, NULL, NULL};
-    int nargs = 2;
+    bool fatal_backend = false;
+    const char *backend = resolve_backend(&fatal_backend);
+    if (!backend)
+        return -1;
+    S.fatal_backend = fatal_backend;
+    snprintf(S.comp_backend, sizeof(S.comp_backend), "%s", backend);
+
+    /* build the argument list: -q (unless verbose), the user config
+     * dir, the backend, the seat provider env is inherited */
+    const char *args[16] = {0};
+    int nargs = 0;
+    args[nargs++] = find_compositor();
+    args[nargs++] = S.verbose ? "-v" : "-q";
     const char *conf = user_config_dir();
     if (conf) {
         args[nargs++] = "--config-dir";
         args[nargs++] = conf;
     }
-    if (S.nested) {
-        const char *be = nested_backend_arg();
-        if (!be) {
-            log_msg("error", "nested mode requires $WAYLAND_DISPLAY or "
-                            "$DISPLAY (or set $XW_BACKEND)");
-            return -1;
-        }
-        args[nargs++] = "--backend";
-        args[nargs++] = be;
-        log_msg("info", "nested session: backend %s", be);
-    }
+    args[nargs++] = "--backend";
+    args[nargs++] = backend;
+    log_msg("info", "compositor backend: %s", backend);
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -257,6 +346,14 @@ static pid_t start_compositor(void) {
     if (pid == 0) {
         /* child: compositor writes its socket path to stdout */
         setenv("XDG_RUNTIME_DIR", S.runtime_dir, 1);
+        if (strcmp(backend, "drm") == 0) {
+            /* a real session: the Wayland environment children expect;
+             * no X display leaks into the session */
+            setenv("XDG_SESSION_TYPE", "wayland", 1);
+            setenv("XDG_CURRENT_DESKTOP", "XFCE", 1);
+            setenv("XDG_SESSION_DESKTOP", "xfce", 1);
+            unsetenv("DISPLAY");
+        }
         dup2(outpipe[1], STDOUT_FILENO);
         close(outpipe[0]);
         close(outpipe[1]);
@@ -349,16 +446,94 @@ static bool only_show_xfce(const char *only, const char *not_show) {
     return true;
 }
 
+/* duplicate-service detection: is a process with this command's
+ * basename already running under this uid? Covers the re-login and
+ * session-restart flows, where blindly re-spawning xfsettingsd /
+ * polkit agents / power managers would fail ("already running") and
+ * look like a compositor crash. Best-effort by design. */
+static bool already_running(const char *exec) {
+    /* first token of the command line that is not an env assignment */
+    char first[256] = {0};
+    const char *p = exec;
+    while (*p == ' ')
+        p++;
+    for (;;) {
+        const char *sp = strchr(p, ' ');
+        size_t len = sp ? (size_t)(sp - p) : strlen(p);
+        if (len >= sizeof(first))
+            len = sizeof(first) - 1;
+        memcpy(first, p, len);
+        first[len] = 0;
+        /* skip leading env assignments (VAR=value cmd) */
+        if (!strchr(first, '=') && strcmp(first, "env") != 0)
+            break;
+        if (!sp)
+            return false; /* only assignments? nothing to check */
+        p = sp + 1;
+        while (*p == ' ')
+            p++;
+    }
+    const char *base = strrchr(first, '/');
+    base = base ? base + 1 : first;
+    if (!*base)
+        return false;
+
+    DIR *d = opendir("/proc");
+    if (!d)
+        return false;
+    struct dirent *de;
+    pid_t me = getpid();
+    while ((de = readdir(d))) {
+        char *end;
+        long pid = strtol(de->d_name, &end, 10);
+        if (*end || pid <= 0 || (pid_t)pid == me)
+            continue;
+        char path[64], cmd[512];
+        snprintf(path, sizeof(path), "/proc/%ld/cmdline", pid);
+        FILE *f = fopen(path, "r");
+        if (!f)
+            continue;
+        size_t n = fread(cmd, 1, sizeof(cmd) - 1, f);
+        fclose(f);
+        cmd[n] = 0;
+        /* cmdline args are NUL-separated: check each token's basename */
+        for (size_t i = 0; i < n;) {
+            char *tok = cmd + i;
+            size_t tlen = strlen(tok);
+            i += tlen + 1;
+            const char *tb = strrchr(tok, '/');
+            tb = tb ? tb + 1 : tok;
+            if (strcmp(tb, base) == 0) {
+                closedir(d);
+                return true;
+            }
+        }
+    }
+    closedir(d);
+    return false;
+}
+
 static pid_t spawn_autostart_exec(const char *exec, const char *name) {
+    if (already_running(exec)) {
+        log_msg("info", "autostart '%s': already running elsewhere — "
+                        "skipping (duplicate service ownership is not an "
+                        "error)", name);
+        return -2; /* not an error, not a child */
+    }
     pid_t pid = fork();
     if (pid < 0)
         return -1;
     if (pid == 0) {
         setenv("XDG_RUNTIME_DIR", S.runtime_dir, 1);
         setenv("WAYLAND_DISPLAY", S.socket_name, 1);
-        if (!S.nested)
-            unsetenv("DISPLAY"); /* wayland-native session: no X by default;
-                                     nested mode keeps it (XWayland future) */
+        if (strcmp(S.comp_backend, "drm") == 0) {
+            setenv("XDG_SESSION_TYPE", "wayland", 1);
+            setenv("XDG_CURRENT_DESKTOP", "XFCE", 1);
+            setenv("XDG_SESSION_DESKTOP", "xfce", 1);
+            unsetenv("DISPLAY"); /* wayland-native session: no X */
+        } else if (!S.nested) {
+            unsetenv("DISPLAY"); /* headless dev session: no X either */
+        } /* nested mode keeps it (XWayland future) */
         const char *sh = getenv("XW_SHELL") ? getenv("XW_SHELL") : "/bin/sh";
         const char *args[] = {sh, "-c", exec, NULL};
         execvp(args[0], (char *const *)args);
@@ -445,6 +620,12 @@ static pid_t spawn_runtime(const char *exec, const char *name) {
     if (pid == 0) {
         setenv("XDG_RUNTIME_DIR", S.runtime_dir, 1);
         setenv("WAYLAND_DISPLAY", S.socket_name, 1);
+        if (strcmp(S.comp_backend, "drm") == 0) {
+            setenv("XDG_SESSION_TYPE", "wayland", 1);
+            setenv("XDG_CURRENT_DESKTOP", "XFCE", 1);
+            setenv("XDG_SESSION_DESKTOP", "xfce", 1);
+            unsetenv("DISPLAY");
+        }
         const char *sh = getenv("XW_SHELL") ? getenv("XW_SHELL") : "/bin/sh";
         const char *args[] = {sh, "-c", exec, NULL};
         execvp(args[0], (char *const *)args);
@@ -679,13 +860,29 @@ static void usage(const char *prog) {
            "\n"
            "The xfce4-wayland session manager.\n"
            "\n"
+           "Backend selection:\n"
+           "  auto     TTY with KMS hardware -> drm; otherwise headless.\n"
+           "           A graphical parent needs -N/--nested or an explicit\n"
+           "           --backend to become a window (the default inside a\n"
+           "           parent session stays headless)\n"
+           "  drm      real display hardware through a seat provider\n"
+           "           (libseat/seatd/direct; never silently downgraded)\n"
+           "  x11      nested window under an X11 session\n"
+           "  wayland  nested window under a Wayland session\n"
+           "  headless no display hardware\n"
+           "\n"
            "Options:\n"
-           "  -S, --ctl-name NAME    control socket name (default: xw-session)\n"
-           "  -n, --no-autostart     skip XDG autostart entries\n"
-           "  -N, --nested           run the desktop inside the current session\n"
-           "                          (window under Wayland or X11; $XW_BACKEND\n"
-           "                          overrides the auto-choice)\n"
-           "  -h, --help             this help\n",
+           "  -B, --backend NAME    drm | x11 | wayland | nested | headless\n"
+           "                        (nested is an alias for wayland)\n"
+           "  -N, --nested          run the desktop inside the current session\n"
+           "                        (window under Wayland or X11; $XW_BACKEND\n"
+           "                        overrides the auto-choice)\n"
+           "  -S, --ctl-name NAME   control socket name (default: xw-session)\n"
+           "  -n, --no-autostart    skip XDG autostart entries\n"
+           "  -V, --verbose         show seat/backend diagnostics from the\n"
+           "                        compositor (seat provider, DRM device,\n"
+           "                        connector, mode, socket, input devices)\n"
+           "  -h, --help            this help\n",
            prog);
 }
 
@@ -693,16 +890,20 @@ int main(int argc, char **argv) {
     const char *ctl_name = "xw-session";
     bool autostart = true;
     S.nested = false;
+    S.verbose = false;
+    S.backend = SB_AUTO;
 
     static const struct option longopts[] = {
         {"ctl-name", required_argument, NULL, 'S'},
         {"no-autostart", no_argument, NULL, 'n'},
         {"nested", no_argument, NULL, 'N'},
+        {"backend", required_argument, NULL, 'B'},
+        {"verbose", no_argument, NULL, 'V'},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0},
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "S:nNh", longopts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "S:nNB:Vh", longopts, NULL)) != -1) {
         switch (opt) {
         case 'S':
             ctl_name = optarg;
@@ -712,6 +913,29 @@ int main(int argc, char **argv) {
             break;
         case 'N':
             S.nested = true;
+            break;
+        case 'B': {
+            if (strcmp(optarg, "drm") == 0)
+                S.backend = SB_DRM;
+            else if (strcmp(optarg, "x11") == 0)
+                S.backend = SB_X11;
+            else if (strcmp(optarg, "wayland") == 0 ||
+                     strcmp(optarg, "nested") == 0)
+                S.backend = SB_WAYLAND;
+            else if (strcmp(optarg, "headless") == 0)
+                S.backend = SB_HEADLESS;
+            else if (strcmp(optarg, "auto") == 0)
+                S.backend = SB_AUTO;
+            else {
+                fprintf(stderr,
+                        "unknown backend '%s' (drm|x11|wayland|headless)\n",
+                        optarg);
+                return 1;
+            }
+            break;
+        }
+        case 'V':
+            S.verbose = true;
             break;
         case 'h':
             usage(argv[0]);
@@ -784,7 +1008,8 @@ int main(int argc, char **argv) {
                         log_msg("info", "compositor exited during shutdown "
                                         "(%s, ran %llds)",
                                 wait_desc(status), (long long)secs);
-                    } else if (S.comp_restarts < COMPOSITOR_MAX_RESTARTS) {
+                    } else if (S.comp_restarts < COMPOSITOR_MAX_RESTARTS &&
+                               !S.fatal_backend) {
                         S.comp_restarts++;
                         log_msg("warn",
                                 "compositor exited (%s, ran %llds), "
@@ -797,6 +1022,16 @@ int main(int argc, char **argv) {
                             g_terminate = 1;
                             g_exit_code = 1;
                         }
+                    } else if (S.fatal_backend) {
+                        log_msg("error",
+                                "compositor with the explicit '%s' backend "
+                                "exited (%s, ran %llds) — the session ends "
+                                "instead of restarting or falling back (see "
+                                "the compositor diagnostics above)",
+                                S.comp_backend, wait_desc(status),
+                                (long long)secs);
+                        g_terminate = 1;
+                        g_exit_code = 1;
                     } else {
                         log_msg("error",
                                 "compositor kept crashing; giving up");
