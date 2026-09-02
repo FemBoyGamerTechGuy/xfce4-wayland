@@ -1185,3 +1185,61 @@ Stage Summary:
   points to either an unregistered elogind session (PAM) or a build
   without libseat — both are now self-identifying in the logs.
   Next hardware run with --verbose will name the exact cause.
+
+---
+Task ID: 3b1d2fa round
+Agent: main
+Task: user reported "mouse still doesn't move" on the real TTY; uploaded xw-tty.log
+
+Work Log:
+- Read the uploaded log: it matches HEAD (7caebac) built WITHOUT
+  libseat. The chain worked exactly as designed: elogind detected
+  (session registered, XDG_SESSION_ID=1, active), but the elogind step
+  runs through libseat -> skipped; seatd socket absent; direct VT ->
+  EACCES on all 18 /dev/input nodes; DRM fine (uaccess covers /dev/dri,
+  not keyboards/mice). Machine configured correctly, build missing one
+  package. Root cause CLOSED, not a code bug.
+- Restored the bare container build env (bootstrap-sysroot.sh,
+  rootless; libseat 0.9.1) and re-verified HEAD: 64/64, 108/108,
+  50/50 — the "install libseat + rebuild" path is proven end to end.
+- Second finding in the same log: no session d-bus (TTY logins have
+  none) -> libdbus X11 autolaunch failures, pipewire/RTKit degraded,
+  wireplumber skipping components, xfsettingsd exit 1.
+- xw-session: start_session_dbus() — one dbus-daemon as a supervised
+  child on $XDG_RUNTIME_DIR/bus before the compositor, address
+  exported to all children; live bus reused (env address or standard
+  path, never killed), stale exported address replaced loudly,
+  fail-open (never blocks the session), teardown stops only the
+  daemon we started, also on the compositor-failure path (first
+  draft leaked an orphan there — caught by manual repro);
+  dbus-update-activation-environment best-effort so dbus-activated
+  services see WAYLAND_DISPLAY; XW_SESSION_DBUS=0 opts out.
+- Makefile: missing-libseat $(info) promoted to a boxed $(warning)
+  with the real-TTY consequence + per-distro install table. Applied
+  via script after the tool-based edit expanded recipe TABs to spaces
+  and broke the Makefile (recovered via git checkout; tab count
+  verified unchanged by the script).
+- BUILDING.md: new section "The most common real-TTY failure: libseat
+  missing at build time" (log signature, line-by-line why, fix table,
+  make clean note), Troubleshooting entry, XW_SEAT_PROVIDER row now
+  lists elogind/logind aliases (was stale), XW_SESSION_DBUS runtime
+  row. README: session manager responsibilities + seat paragraph.
+- Tests: test-session.sh session 9 (20 checks) — start, socket, real
+  dbus-send round trip, autostart children inherit the exact address,
+  clean logout, no orphan, foreign bus reused/never killed, stale
+  address replaced, fresh bus at the standard path. First draft
+  failed "reused-bus session exits cleanly": the logout ran after the
+  "reusing" log line but BEFORE the ctl socket existed (output was
+  discarded -> silent failure). Fixed by gating every logout on
+  "session ready". Harness: 128/128, ASan re-ran the process suite
+  128/128. build regressions 50/50, in-process 64/64.
+
+Stage Summary:
+- Commit 3b1d2fa on main. For the user's machine the fix is: install
+  the distro libseat dev package, make clean && make, rerun with
+  --verbose — the elogind provider then takes the session and
+  logind/elogind grants every input fd (no root, no groups, no chmod).
+  The second visible failure cluster (pipewire/xfsettingsd/polkit)
+  is fixed in code by the session d-bus.
+- The "Edit tool expands Makefile TABs" failure mode is recorded here
+  for future rounds: edit Makefiles via scripted string replacement.
