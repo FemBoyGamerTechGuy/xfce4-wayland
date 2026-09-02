@@ -362,6 +362,12 @@ struct xw_seat {
     /* last input activity (ext-idle-notify; updated by every key,
      * pointer and axis event, injected input included) */
     int64_t last_activity_ms;
+
+    /* instrumentation: session start + first wl_pointer.enter actually
+     * delivered to a client (default-level log lines answer "how far
+     * did pointer input get" from one run) */
+    int64_t started_ms;
+    int64_t first_enter_ms;
 };
 
 struct xw_seat *xw_seat_create(struct xw_compositor *c, const char *name);
@@ -377,6 +383,15 @@ void xw_seat_pointer_axis(struct xw_seat *s, uint32_t axis, double value);
 
 /* focus management (called by wm) */
 void xw_seat_set_kb_focus(struct xw_seat *s, struct xw_surface *surface);
+
+/* re-run the pointer hit-test at the current cursor position for every
+ * seat (surface stack changed without motion: map/unmap/destroy) */
+void xw_seat_repointer(struct xw_compositor *c);
+
+/* drop every seat reference to a dying surface BEFORE it is freed
+ * (ptr_focus/grab/kb-focus/drag origin); called by the surface destroy
+ * path — leaving any of them set is a use-after-free */
+void xw_seat_forget_surface(struct xw_compositor *c, struct xw_surface *s);
 
 /* ------------------------------------------------------------ wm/window */
 struct xw_rect { int x, y, w, h; };

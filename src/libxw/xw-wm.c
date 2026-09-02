@@ -181,6 +181,9 @@ void xw_wm_window_map(struct xw_wm *wm, struct xw_window *w) {
     xw_foreign_toplevel_window_mapped(wm->comp, w);
     xw_foreign_toplevel_notify(wm->comp, w);
     xw_wm_damage_window(wm, w);
+    /* a window mapped under the stationary cursor takes pointer focus
+     * immediately (motion would do it too, but not before then) */
+    xw_seat_repointer(wm->comp);
 }
 
 void xw_wm_window_unmap(struct xw_wm *wm, struct xw_window *w) {
@@ -198,6 +201,9 @@ void xw_wm_window_unmap(struct xw_wm *wm, struct xw_window *w) {
         if (alt)
             xw_wm_focus_window(wm, alt, true);
     }
+    /* focus that pointed at the unmapped window must be re-picked;
+     * surface_at skips unmapped windows */
+    xw_seat_repointer(wm->comp);
 }
 
 void xw_wm_unmanage(struct xw_wm *wm, struct xw_window *w, bool resources_gone) {

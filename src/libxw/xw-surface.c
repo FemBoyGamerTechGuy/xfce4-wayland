@@ -159,6 +159,10 @@ struct wl_resource *xw_surface_create(struct wl_client *client,
 
 void xw_surface_resource_destroyed(struct wl_resource *res) {
     struct xw_surface *s = wl_resource_get_user_data(res);
+    /* drop seat focus/grab references BEFORE anything is freed: a
+     * surface dying under the cursor must not leave a dangling
+     * ptr_focus behind (use-after-free on the next pointer event) */
+    xw_seat_forget_surface(s->comp, s);
     xw_role_destroy(s);
     struct xw_frame *f, *f2;
     wl_list_for_each_safe(f, f2, &s->frames, link) {

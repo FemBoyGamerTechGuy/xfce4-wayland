@@ -401,6 +401,10 @@ void xw_layer_role_commit(struct xw_surface *s) {
             }
             xw_wm_recalculate_usable(s->comp->wm);
             xw_damage_outputs_rect(s->comp, ls->x, ls->y, ls->w, ls->h);
+            /* the cursor may already sit over the freshly mapped bar
+             * (it starts at 0,0 = inside a top panel): hand it focus
+             * now instead of waiting for the next motion event */
+            xw_seat_repointer(s->comp);
         }
     } else {
         xw_damage_outputs_rect(s->comp, ls->x, ls->y, ls->w, ls->h);
@@ -415,6 +419,9 @@ void xw_layer_role_unmap(struct xw_surface *s) {
         xw_damage_outputs_rect(s->comp, ls->x, ls->y, ls->w, ls->h);
         ls->mapped = false;
         xw_wm_recalculate_usable(s->comp->wm);
+        /* focus that pointed at the unmapped layer must be re-picked
+         * (surface_at skips unmapped surfaces) */
+        xw_seat_repointer(s->comp);
     }
 }
 

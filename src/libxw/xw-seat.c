@@ -65,6 +65,7 @@ static void pointer_release(struct wl_client *client, struct wl_resource *res) {
 
 static void send_modifiers(struct xw_seat *s);
 static void disarm_interactive_repeat(struct xw_seat *s);
+static const char *surface_desc(struct xw_surface *s, char *buf, size_t n);
 
 static void seat_get_pointer(struct wl_client *client, struct wl_resource *res,
                              uint32_t id) {
@@ -78,6 +79,25 @@ static void seat_get_pointer(struct wl_client *client, struct wl_resource *res,
     }
     wl_list_insert(s->pointers.prev, wl_resource_get_link(p));
     wl_resource_set_implementation(p, &pointer_impl, s, pointer_resource_destroy);
+    /* if this client already owns pointer focus (surface focused
+     * before the pointer object existed — e.g. the client created its
+     * wl_pointer after mapping), deliver the enter it never saw.
+     * Keyboard has the same contract above; pointer was missing it,
+     * which left a correctly-focused surface with a pointer that
+     * received motion but never enter (clients gate on enter). */
+    if (s->ptr_focus &&
+        wl_resource_get_client(s->ptr_focus->res) == client) {
+        int sx = 0, sy = 0;
+        xw_surface_get_pos(s->ptr_focus, &sx, &sy, NULL, NULL);
+        wl_pointer_send_enter(p, ++s->serial, s->ptr_focus->res,
+                              wl_fixed_from_int(s->cursor_x - sx),
+                              wl_fixed_from_int(s->cursor_y - sy));
+        wl_pointer_send_frame(p);
+        char dbuf[64];
+        xw_log(XW_LOG_DEBUG,
+               "wayland: pointer enter replayed to a late wl_pointer (%s)",
+               surface_desc(s->ptr_focus, dbuf, sizeof(dbuf)));
+    }
 }
 
 static void seat_get_keyboard(struct wl_client *client, struct wl_resource *res,
@@ -172,6 +192,35 @@ static struct xw_layer_surface *layer_keyboard_owner(struct xw_compositor *c) {
         }
     }
     return NULL;
+}
+
+/* short identity string for focus/button logs: role + name. Kept
+ * static (xw-internal.h types only) so every pointer-path line says
+ * WHICH surface got the event — the difference between "focus went
+ * somewhere" and "focus went to the panel" in a real-session log. */
+static const char *surface_desc(struct xw_surface *s, char *buf, size_t n) {
+    if (!s)
+        return "(none)";
+    switch (s->role) {
+    case XW_SURFACE_ROLE_LAYER: {
+        struct xw_layer_surface *ls = s->role_data;
+        snprintf(buf, n, "layer-shell '%.32s'",
+                 ls && ls->namespace[0] ? ls->namespace : "?");
+        return buf;
+    }
+    case XW_SURFACE_ROLE_XDG_TOPLEVEL: {
+        struct xw_window *w = s->role_data;
+        snprintf(buf, n, "window '%.32s'",
+                 w && w->title[0] ? w->title : "?");
+        return buf;
+    }
+    case XW_SURFACE_ROLE_XDG_POPUP:
+        return "xdg-popup";
+    case XW_SURFACE_ROLE_SESSION_LOCK:
+        return "session-lock";
+    default:
+        return "(no role)";
+    }
 }
 
 /* topmost surface at global point, excluding windows (used for layers);
@@ -294,6 +343,9 @@ void xw_seat_set_kb_focus(struct xw_seat *s, struct xw_surface *surface) {
 static void set_ptr_focus(struct xw_seat *s, struct xw_surface *surface) {
     if (s->ptr_focus == surface)
         return;
+    char dbuf[64], nbuf[64];
+    const char *desc_old = surface_desc(s->ptr_focus, dbuf, sizeof(dbuf));
+    const char *desc_new = surface_desc(surface, nbuf, sizeof(nbuf));
     struct wl_client *old =
         s->ptr_focus ? wl_resource_get_client(s->ptr_focus->res) : NULL;
     struct wl_client *newc =
@@ -305,6 +357,8 @@ static void set_ptr_focus(struct xw_seat *s, struct xw_surface *surface) {
             if (wl_resource_get_client(p) == old) {
                 wl_pointer_send_leave(p, ++s->serial, s->ptr_focus->res);
                 wl_pointer_send_frame(p);
+                xw_log(XW_LOG_DEBUG, "wayland: pointer leave %s (serial %u)",
+                       desc_old, s->serial);
             }
         }
     } else if (old && old != newc && s->ptr_focus && s->ptr_grab) {
@@ -318,10 +372,71 @@ static void set_ptr_focus(struct xw_seat *s, struct xw_surface *surface) {
                 int sx = 0, sy = 0;
                 xw_surface_get_pos(surface, &sx, &sy, NULL, NULL);
                 wl_pointer_send_enter(p, ++s->serial, surface->res,
-                                      s->cursor_x - sx, s->cursor_y - sy);
+                                      wl_fixed_from_int(s->cursor_x - sx),
+                                      wl_fixed_from_int(s->cursor_y - sy));
                 wl_pointer_send_frame(p);
+                if (!s->first_enter_ms) {
+                    s->first_enter_ms = xw_now_ms();
+                    xw_log(XW_LOG_INFO,
+                           "pointer: first enter delivered (%s at %d,%d — "
+                           "wl_pointer.enter reached a client %.1fs after "
+                           "startup)",
+                           desc_new, s->cursor_x, s->cursor_y,
+                           (s->first_enter_ms - s->started_ms) / 1000.0);
+                }
+                xw_log(XW_LOG_DEBUG,
+                       "wayland: pointer enter %s at %d,%d (serial %u)",
+                       desc_new, s->cursor_x, s->cursor_y, s->serial);
             }
         }
+    }
+    xw_log(XW_LOG_DEBUG, "pointer: focus %s -> %s", desc_old, desc_new);
+}
+
+/* Re-evaluate pointer focus from the CURRENT cursor position. Called
+ * whenever the surface stack changes under a stationary cursor: a
+ * surface mapping (the cursor was already over the bar when the panel
+ * came up), unmapping, or dying — motion alone re-runs surface_at, but
+ * a stacking change without motion used to leave focus stale. */
+void xw_seat_repointer(struct xw_compositor *c) {
+    if (!c)
+        return;
+    struct xw_seat *s;
+    wl_list_for_each(s, &c->seats, link) {
+        if (s->grab_surface)
+            continue; /* an implicit grab pins focus until release */
+        struct xw_surface *target = surface_at(s, s->cursor_x, s->cursor_y);
+        set_ptr_focus(s, target);
+    }
+}
+
+/* A surface is being destroyed: drop every seat reference to it BEFORE
+ * the memory is freed. This is not optional bookkeeping — ptr_focus is
+ * dereferenced (res -> wl_client) by the next motion event, so a stale
+ * pointer here is a use-after-free that also poisons all later focus
+ * decisions (the classic "panel visible, cursor moves, nothing reacts"
+ * decay after any hovered surface dies). Leave is NOT sent: the surface
+ * resource is going away, and enter/leave reference it. */
+void xw_seat_forget_surface(struct xw_compositor *c, struct xw_surface *s) {
+    if (!c || !s)
+        return;
+    struct xw_seat *seat;
+    wl_list_for_each(seat, &c->seats, link) {
+        if (seat->ptr_focus == s) {
+            char dbuf[64];
+            xw_log(XW_LOG_DEBUG, "pointer: focus surface destroyed (%s)",
+                   surface_desc(s, dbuf, sizeof(dbuf)));
+            seat->ptr_focus = NULL;
+        }
+        if (seat->grab_surface == s) {
+            seat->ptr_grab = NULL;
+            seat->grab_surface = NULL;
+            seat->ptr_grab_is_drag = false;
+        }
+        if (seat->drag.origin == s)
+            seat->drag.origin = NULL;
+        if (seat->kb_focus == s)
+            xw_seat_set_kb_focus(seat, NULL);
     }
 }
 
@@ -636,6 +751,10 @@ void xw_seat_pointer_button(struct xw_seat *s, uint32_t linux_button,
         xw_surface_get_pos(s->ptr_focus, &sx, &sy, NULL, NULL);
         (void)sx;
         (void)sy;
+        char dbuf[64];
+        xw_log(XW_LOG_DEBUG, "wayland: pointer button %u %s surface=%s",
+               linux_button, down ? "pressed" : "released",
+               surface_desc(s->ptr_focus, dbuf, sizeof(dbuf)));
         PTR_FOR_EACH(s->ptr_focus, p) {
             wl_pointer_send_button(p, ++s->serial, time, linux_button, state);
             wl_pointer_send_frame(p);
@@ -672,6 +791,7 @@ struct xw_seat *xw_seat_create(struct xw_compositor *c, const char *name) {
     wl_list_init(&s->data_devices);
     s->keymap_fd = -1;
     s->last_activity_ms = xw_now_ms(); /* idle-notify baseline */
+    s->started_ms = s->last_activity_ms;
 
     s->xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     if (!s->xkb_ctx)
