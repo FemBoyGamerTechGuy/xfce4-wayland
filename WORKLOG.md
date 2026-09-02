@@ -1347,3 +1347,51 @@ Stage Summary:
 - User sequence: git pull; ./scripts/xw-tty-capture.sh; move the
   mouse in both 12s windows; send back the printed .log file. The
   CHECK lines + live windows decide the next fix deterministically.
+
+---
+Task ID: d7562f6 round (2026-09-02)
+Agent: main
+Task: analyze the uploaded xw-tty-capture log ("did not work" round)
+and produce the auto-fix
+
+Work Log:
+- Read upload/xw-tty-capture-20260902-162919.log — verdict
+  unambiguous: seatd 0.9.3-1 installed but the package carries NO
+  libseat files (pkg-config: not found; build/.features: libseat=n;
+  ldd: no libseat linked). pacman -Qi shows degenerate metadata
+  (description "None", 0.00 B, epoch install date) — not a healthy
+  repo package, likely hand-built with the files missing. Same
+  root cause as before, one layer deeper: the elogind path stays
+  compiled out, direct VT gets EACCES on all 18 /dev/input nodes.
+- The capture log also ends mid-window-1 (no WINDOW1_EXIT_CODE, no
+  window 2, no digest): the user Ctrl-C-ed; harmless — window 1 had
+  already proven everything. Environment otherwise healthy: elogind
+  session 1 active on seat0/vt1, 18 input nodes, /dev/dri/card1
+  carries the uaccess ACL.
+- Wrote scripts/xw-seat-fix.sh (POSIX sh, same one-file-log style):
+  route 0 already-linked no-op; route 1 pkg-config sees dev files ->
+  make clean && make tee'd into the log + verify .features/ldd;
+  route 2 sudo pacman -S seatd reinstall (interactive, terminal
+  visible; before/after Qi + Ql + file checks logged) then rebuild
+  if the files appeared; route 3 fallback seatd-daemon route
+  (gpasswd to 'seat' + service enable per detected init:
+  runit/openrc/dinit/systemd, seatd-<init> split-package hint,
+  manual nohup start for today) plus the documented input-group
+  one-liner; relogin banner; DONE banner with the log path.
+- Privileged steps are always printed before running and asked y/N
+  first (auto-skipped when stdin is not a terminal). The script
+  never chmods devices and never runs the compositor as root.
+- Self-tested both branches: A) in-repo (already linked -> route 0
+  clean exit 0); B) scratch tree (no pacman/seatd/build -> full
+  route instructions, exit 0). Cleaned all artifacts.
+
+Stage Summary:
+- Commit d7562f6 pushed to origin/main via the PAT askpass helper.
+- User sequence: git pull; ./scripts/xw-seat-fix.sh (answer y at the
+  sudo/reinstall prompts). SUCCESS banner -> no relogin needed
+  (elogind session already active); route 3 -> one logout/login so
+  the group applies. Then ./scripts/xw-tty-capture.sh and send BOTH
+  log files back.
+- If the repo reinstall still yields no libseat.pc, route 3 makes
+  the machine work via the built-in seatd client anyway — that path
+  needs no library and is fully covered by the tests.
