@@ -1501,3 +1501,58 @@ Stage Summary:
   the mouse in the live windows, sends xw-seat-repair-*.log back.
   If pacman still refuses, its error text is now captured in the
   log; the input-group fallback + relogin is the no-package escape.
+
+---
+Task ID: conflict-round (2026-09-02)
+Agent: main
+Task: user pasted their own `sudo pacman -Syu seatd` output instead
+of running the repair script ("after i updated i didnt run the
+commands you told me").
+
+Work Log:
+- Read upload/Pasted Content_1788363220828.txt (173 lines, Romanian
+  pacman output): the 120-package -Syu transaction aborted at the
+  file-conflict check — "eroare: eșec la efectuarea tranzacției
+  (fișiere în conflict)" — listing ALL TEN seatd files as already
+  existing on disk: /usr/bin/seatd, /usr/bin/seatd-launch,
+  /usr/include/libseat.h, /usr/lib/libseat.so, libseat.so.1,
+  pkgconfig/libseat.pc, /usr/lib/sysusers.d/seatd.conf,
+  /usr/share/licenses/seatd/LICENSE, both man pages. Pacman's
+  conflict check runs pre-commit for the WHOLE transaction, so
+  nothing was installed — seatd stayed broken AND the 119-package
+  system update did not happen.
+- This CONFIRMS (no longer infers) the invisible exit-1 root cause
+  from xw-seat-fix route 2: the corrupted DB entry owns zero files,
+  so the zero-byte on-disk leftovers count as UNOWNED, and pacman
+  refuses to overwrite unowned files. It was never a download,
+  keyring or mirror problem. For the same reason a plain reinstall
+  can NEVER fix this — the orphans must be deleted first.
+- New facts from the transcript: the header is /usr/include/
+  libseat.h (the repair + capture scripts said seat.h — wrong);
+  the repo package ships NO /etc/runit/sv/seatd, so that directory
+  on the user's disk is a leftover too (kept only if intact).
+- Patched scripts/xw-seat-repair.sh (commit a977985, local — no
+  token this session to push): the rm list is now the complete
+  10-file set, the runit service dir is removed only when its run
+  file is zero-byte, [2] evidence gains wc -c of the run file, and
+  the header comment documents the confirmed root cause. The user's
+  on-disk copy is c6ff91a (old 6-file rm list) — its first
+  pacman -S will still hit the leftover conflict, but the
+  --overwrite 'usr/*' retry covers it (pacman's fnmatch does not
+  use FNM_PATHNAME, so the glob crosses '/').
+- Reply sent: manual 3-command repair (pacman -Rdd seatd; rm the
+  ten orphans; pacman -S seatd) THEN ./scripts/xw-seat-repair.sh,
+  which will see pkg-config OK, skip the repair routes, rebuild and
+  open the two live windows; afterwards redo sudo pacman -Syu (the
+  aborted system update). seatd -h printing usage is a quick
+  sanity signal — the old 0-byte binary ran as an empty script and
+  printed nothing.
+
+Stage Summary:
+- Root cause proven by the user's own pacman output; repair recipe
+  is now deterministic (purge DB entry + delete all ten orphans +
+  fresh install).
+- Continuation point: user runs the 3 commands + the repair script,
+  moves the mouse in the two live windows, and sends back the
+  xw-seat-repair-*.log (or the pacman output if the manual install
+  still refuses).
