@@ -1308,3 +1308,42 @@ Stage Summary:
   libseat=y; relaunch xw-session --backend=drm --verbose from the
   TTY login (no sudo) and expect "opened through seat provider" per
   input device.
+
+---
+Task ID: d68d18f round (2026-09-02)
+Agent: main
+Task: user reported the libseat fix "did not work"; asked for a way
+to log everything into one file to hand back instead of running
+commands one by one
+
+Work Log:
+- Interpreted the user's command notes: `cat build/.features` failed
+  because they typed a space (build/ .features); `xw-session` without
+  ./build/bin/ prefix is expected (make does not install to PATH;
+  make install targets ~/.local).
+- "Did not work" is ambiguous (rebuild maybe never linked libseat vs
+  new runtime failure) — resolved by making the machine tell us.
+- Wrote scripts/xw-tty-capture.sh: POSIX sh, zero-persistence capture
+  of every diagnostic in one file (repo root, *.log is gitignored):
+  [0] meta/git, [1] pkg-config versions + pacman -Qi seatd + ldd of
+  both binaries with an explicit "libseat IS/IS NOT linked" CHECK
+  line, [2] build/.features with libseat=y CHECK, [3] env +
+  loginctl show-session + /dev/dri + /dev/input + seatd socket +
+  session bus, [4] live window: bare compositor (-B drm -v) under
+  `timeout`, exit code echoed into the log (124 = normal timeout),
+  [5] live window: full xw-session --backend=drm --verbose, [6]
+  self-digest grep. Every command + output + exit code recorded.
+- Safety: skips live windows as root / without /dev/dri / without
+  the binaries; timeout SIGTERM path verified against the
+  compositor's clean SIGTERM+VT-restore handlers; trap prints the
+  log path on Ctrl-C.
+- Self-tested in the container (non-TTY: windows skipped, all check
+  sections produced a well-formed log; libseat CHECK line verified
+  against the sysroot build).
+
+Stage Summary:
+- Commit d68d18f on main, pushed with the user's PAT (askpass env
+  helper, no persistence).
+- User sequence: git pull; ./scripts/xw-tty-capture.sh; move the
+  mouse in both 12s windows; send back the printed .log file. The
+  CHECK lines + live windows decide the next fix deterministically.
