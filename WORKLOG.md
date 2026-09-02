@@ -1395,3 +1395,57 @@ Stage Summary:
 - If the repo reinstall still yields no libseat.pc, route 3 makes
   the machine work via the built-in seatd client anyway — that path
   needs no library and is fully covered by the tests.
+
+---
+Task ID: repair-round (2026-09-02)
+Agent: main
+Task: user sent the xw-seat-fix and xw-tty-capture logs; mouse still
+frozen; "i recompiled it to make sure ... all i did see its do its
+just reinstall seatd"
+
+Work Log:
+- Read both logs — the machine's seatd 0.9.3-1 install is corrupted
+  at BOTH levels: files (/usr/lib/libseat.so.1, libseat.pc and the
+  /usr/bin/seatd BINARY are zero bytes — `seatd -h` silently
+  succeeding as an "empty shell script" proves it) and pacman
+  database (pacman -Ql lists nothing, -Qi shows all None/0.00 B).
+  That also explains why route 3b failed: the runit service was
+  enabled fine, but there was no working binary to start (no
+  /run/seatd.sock). The repos themselves are healthy (pacman -Si
+  shows full entries in Artix world + Arch extra).
+- The previous round's `sudo pacman -S seatd` exited 1 and its
+  output was NOT captured — xw-seat-fix.sh's sudo_run() failed to
+  redirect into the log (bug, recorded; that script is NOT being
+  edited this round because the user has local modifications in it
+  that would block their git pull).
+- User also never relogged (session still 1, seat group not yet
+  active in id -nG) — irrelevant for the libseat path, only for the
+  group fallbacks.
+- Wrote scripts/xw-seat-repair.sh (NEW file, one-file-log style):
+  [1] df -h/-i + du of the pacman cache, HARD STOP at >= 99% full
+  (a full / is the classic producer of exactly this 0-byte-files +
+  empty-DB corruption, and pacman refuses installs on it); [2]
+  before-evidence incl. wc -c of the binary; [3] repair: pacman
+  -Rdd --noconfirm (empty file list => nothing deleted from disk),
+  fallback rm -rf of the corrupt DB dir, manual rm of the 0-byte
+  leftovers (+ /etc/runit/sv/seatd), fresh `pacman -S --noconfirm`
+  with a -Syy --overwrite retry — ALL sudo output captured into the
+  log this time (sudo password still prompts on the tty; pacman
+  needs no prompt with --noconfirm); [4] make clean && make tee'd +
+  linked CHECK; [5] two 12s live windows (move-the-mouse prompts)
+  only when linked + seatd socket wait (informational); [6]
+  input-group fallback + relogin banner if all else failed.
+- Self-tested: TEST A plain (route 0 no-op, exit 0), TEST B with
+  PKG_CONFIG_PATH into the sysroot after make clean (full rebuild
+  ran, MAKE_EXIT_CODE=0, ldd shows libseat.so.1, SUCCESS CHECK,
+  windows skipped without /dev/dri, digest, exit 0). Fixed two
+  stray-paren typos found by sh -n on the way.
+
+Stage Summary:
+- Commit (new script only, deliberately not touching the two scripts
+  the user has locally modified, so their git pull stays clean).
+- User sequence: git pull && ./scripts/xw-seat-repair.sh — answer y
+  at the two prompts (purge+reinstall, then windows), move the mouse
+  in the live windows, send the xw-seat-repair-*.log back. If the
+  reinstall still fails, its pacman error text is IN the log now,
+  and the input-group fallback fires (one gpasswd + one relogin).
