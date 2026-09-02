@@ -646,6 +646,30 @@ check "drm+direct: no VT here -> honest diagnostic" \
     'rg -q "not a virtual terminal|cannot be taken" "$LOG8D" 2>/dev/null'
 check "drm+direct: exit code 1" '[ "$RC8D" -eq 1 ]'
 
+# --- elogind provider: accepted, pinned to libseat's logind backend,
+# and fails honestly in this container (no registered session, no
+# d-bus) instead of silently falling back to another provider ---
+LOG8E="$RTD/session8-elogind.log"
+env -u DISPLAY -u WAYLAND_DISPLAY -u XDG_SESSION_ID \
+    XDG_RUNTIME_DIR="$RTD" \
+    "$BIN/xw-compositor" -B drm -P elogind -c "$RTD/empty-conf" \
+    >"$LOG8E" 2>&1
+RC8E=$?
+LOG8E2="$RTD/session8-elogind-alias.log"
+env -u DISPLAY -u WAYLAND_DISPLAY -u XDG_SESSION_ID \
+    XDG_RUNTIME_DIR="$RTD" \
+    "$BIN/xw-compositor" -B drm -P logind -c "$RTD/empty-conf" \
+    >"$LOG8E2" 2>&1
+check "drm+elogind: provider names elogind/logind accepted (not 'unknown')" \
+    '! rg -q "unknown seat provider" "$LOG8E" "$LOG8E2" 2>/dev/null'
+check "drm+elogind: libseat pinned to the logind backend" \
+    'rg -q "pinned to its .logind. backend" "$LOG8E" 2>/dev/null'
+check "drm+elogind: failure is the logind diagnostic, not a fallback" \
+    'rg -q "elogind/logind requested" "$LOG8E" 2>/dev/null'
+check "drm+elogind: exit code 1" '[ "$RC8E" -eq 1 ]'
+check "drm+elogind: never fell back to seatd/direct silently" \
+    '! rg -q "opened through seatd|direct VT session on" "$LOG8E" 2>/dev/null'
+
 echo
 echo "test-session: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1

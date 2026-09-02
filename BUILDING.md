@@ -327,15 +327,24 @@ xw-session --backend=drm --verbose
 ```
 
 What happens: `xw-session` starts `xw-compositor -B drm`, which first
-acquires a **seat** (session device access) through one of three
-providers, probed in this order unless forced with
-`--seat-provider` (or `$XW_SEAT_PROVIDER`):
+acquires a **seat** (session device access) through one of the
+providers below. AUTO probes in this order — elogind first, then
+seatd, then direct, and finally libseat's own pick as a catch-all —
+unless forced with `--seat-provider` (or `$XW_SEAT_PROVIDER`):
 
 | Provider | Needs | Where it fits |
 |---|---|---|
-| `libseat` | the libseat library (build-time optional, `XW_LIBSEAT`) | systems where libseat is installed; it wraps logind/elogind/seatd itself |
-| `seatd` | a running seatd daemon (nothing else) | seatd systems (Artix, Void, ...): the built-in wire-protocol client, zero libraries |
+| `elogind` (alias `logind`) | elogind or systemd-logind running, the login registered as a session (PAM), system d-bus up | elogind/logind systems (Artix, Void with elogind, systemd distros): device ACLs follow the active session. Uses libseat pinned to its logind backend — elogind implements the same `org.freedesktop.login1` D-Bus API |
+| `seatd` | a running seatd daemon (nothing else) | seatd systems: the built-in wire-protocol client, zero libraries |
 | `direct` | a TTY login + device permissions (logind/elogind ACLs of the active session, or video/input groups) | plain TTY logins without any seat daemon |
+| `libseat` | the libseat library (build-time optional, `XW_LIBSEAT`) | explicit override: libseat's own backend order (it prefers seatd over logind; its builtin backend can open a degenerate VT-less seat when your own permissions already cover the devices) |
+
+Why the explicit order: libseat's internal backend order is
+seatd-first, logind-second — the opposite of what a mixed
+elogind+seatd machine usually wants. AUTO therefore pins libseat to
+its logind backend for the elogind attempt, uses the built-in client
+for the seatd attempt, and only lets libseat choose freely as the
+last resort. Every accept/reject is logged under `--verbose`.
 
 Then the DRM backend enumerates `/dev/dri/card*` (no hardcoded
 card0), picks a card with connected connectors, becomes DRM master,
@@ -361,7 +370,7 @@ text mode.
 | `xw-session -N` / `--nested` | window under the parent (Wayland or X11, auto) |
 | `xw-session --backend=drm` | `drm` only — failure is fatal with diagnostics, **never** a fallback |
 | `xw-session --backend=x11` / `wayland` / `headless` | exactly that backend |
-| `xw-compositor -B drm -P seatd\|libseat\|direct` | force one seat provider |
+| `xw-compositor -B drm -P elogind\|seatd\|libseat\|direct` | force one seat provider (`elogind`/`logind` are aliases) |
 
 ### Setting up seatd (examples by init system)
 
@@ -414,6 +423,20 @@ x,y` → `compositor: cursor position updated -> x,y`), every device
 open (`/dev/input/eventN opened through seat provider X (fd N)`), and
 the panel's full startup chain — so a dead input path can be localized
 to the exact step from one log.
+
+**"More permission denied after logging out of a graphical session"**
+is elogind/logind's own session-active semantics, not a compositor
+bug: device ACLs follow the *active* session, and right after a
+graphical logout your TTY login may still be registered as
+online-but-not-active while the dying session lingers. Log in again
+fresh on the TTY (or `loginctl activate` / `loginctl terminate-session`
+the stale one, per your elogind's tooling) and the ACLs follow. The
+`--verbose` seat environment line says whether your login has a
+registered session at all (`$XDG_SESSION_ID`): if it is unset on a
+fresh TTY boot, your getty/login PAM stack is not registering
+sessions with elogind (missing `pam_elogind`/`pam_systemd`) — that is
+the machine configuration to fix, or use seatd / the `input` group
+instead.
 
 ### What is hardware-dependent (honest status)
 

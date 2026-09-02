@@ -24,16 +24,21 @@ static void usage(const char *prog) {
            "  drm        physical display hardware (KMS; needs a seat manager)\n"
            "\n"
            "Seat providers (drm backend only):\n"
-           "  auto       try libseat, then the seatd socket, then a direct\n"
-           "             VT session (default)\n"
-           "  libseat    the external libseat library (wraps logind/elogind/\n"
-           "             seatd as configured by the system)\n"
+           "  auto       elogind/logind session through libseat if the\n"
+           "             machine has one, then the seatd socket, then a\n"
+           "             direct VT session (default)\n"
+           "  elogind    libseat pinned to its logind backend (elogind\n"
+           "             speaks the same org.freedesktop.login1 D-Bus API;\n"
+           "             'logind' is an alias)\n"
+           "  libseat    the external libseat library, whatever backend it\n"
+           "             picks itself (it prefers seatd over logind)\n"
            "  seatd      the built-in seatd wire-protocol client\n"
            "  direct     take over the controlling tty directly\n"
            "\n"
            "Options:\n"
            "  -B, --backend NAME        headless | nested | x11 | drm\n"
-           "  -P, --seat-provider NAME  auto | libseat | seatd | direct\n"
+           "  -P, --seat-provider NAME  auto | elogind | logind | libseat |\n"
+           "                            seatd | direct\n"
            "  -I, --input MODE          auto | libinput | none (real input;\n"
            "                               auto only with $XW_INPUT_DEVICES or\n"
            "                               the drm backend)\n"
@@ -65,6 +70,8 @@ static int parse_backend(const char *name) {
 static int parse_seat_provider(const char *name) {
     if (!name || strcmp(name, "auto") == 0)
         return XW_SEAT_PROVIDER_AUTO;
+    if (strcmp(name, "elogind") == 0 || strcmp(name, "logind") == 0)
+        return XW_SEAT_PROVIDER_ELOGIND;
     if (strcmp(name, "libseat") == 0)
         return XW_SEAT_PROVIDER_LIBSEAT;
     if (strcmp(name, "seatd") == 0)
@@ -123,7 +130,7 @@ int main(int argc, char **argv) {
             if (cfg.seat_provider < 0) {
                 fprintf(stderr,
                         "unknown seat provider '%s' "
-                        "(auto|libseat|seatd|direct)\n",
+                        "(auto|elogind|logind|libseat|seatd|direct)\n",
                         optarg);
                 return 1;
             }

@@ -93,9 +93,10 @@ build/bin/xw-session --nested      # picks wayland or x11 automatically
 ```
 
 DRM mode is the real thing: from a TTY login, the session acquires a
-**seat** through whatever the machine provides — libseat (wrapping
-systemd-logind/elogind/seatd), the built-in seatd wire-protocol
-client (zero libraries), or a direct VT takeover — then drives the
+**seat** through whatever the machine provides — an elogind/logind
+session (libseat pinned to its logind backend; elogind speaks the same
+D-Bus API), the built-in seatd wire-protocol client (zero libraries),
+or a direct VT takeover — then drives the
 monitor (connector/mode enumeration, dumb-buffer scanout, page
 flips) and reads real keyboards/mice through the same seat. No
 systemd, elogind, seatd or display-manager assumptions; no root

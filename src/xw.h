@@ -99,14 +99,17 @@ enum xw_backend_type {
 };
 
 /* Seat/session provider for the DRM backend. The compositor never
- * assumes a particular seat manager: libseat (external library that
- * itself wraps logind/elogind/seatd), a built-in seatd wire-protocol
- * client, or a direct VT session (classic TTY login with device
- * ACLs/group permissions). AUTO probes in that order. */
+ * assumes a particular seat manager: elogind/logind sessions through
+ * libseat (forced to its logind backend; elogind implements the same
+ * org.freedesktop.login1 D-Bus API as logind), a built-in seatd
+ * wire-protocol client, or a direct VT session (classic TTY login
+ * with device ACLs/group permissions). AUTO probes in that order:
+ * elogind first, then seatd, then direct. */
 enum xw_seat_provider {
     XW_SEAT_PROVIDER_NONE = 0,  /* nested/headless: no seat at all */
     XW_SEAT_PROVIDER_AUTO,      /* capability detection at runtime */
-    XW_SEAT_PROVIDER_LIBSEAT,
+    XW_SEAT_PROVIDER_ELOGIND,   /* libseat pinned to its logind backend */
+    XW_SEAT_PROVIDER_LIBSEAT,   /* libseat, whatever backend it picks */
     XW_SEAT_PROVIDER_SEATD,
     XW_SEAT_PROVIDER_DIRECT,
 };

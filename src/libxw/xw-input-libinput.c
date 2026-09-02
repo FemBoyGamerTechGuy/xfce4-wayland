@@ -583,13 +583,28 @@ struct xw_input_libinput *xw_input_libinput_create(struct xw_compositor *c) {
                "pointer; %d /dev/input event node(s) present%s)",
                in->n_added, via, in->n_kbd, in->n_ptr, nodes,
                in->path_mode ? "; path mode" : "");
-        if (in->n_kbd == 0 && in->n_ptr == 0)
+        if (in->n_kbd == 0 && in->n_ptr == 0) {
+            /* build capability context: an elogind/logind session path
+             * silently missing from the binary is a build problem the
+             * user can only see if we say so */
+#ifdef XW_HAVE_LIBSEAT
+            xw_log(XW_LOG_ERROR,
+                   "input: note: this build has libseat support compiled "
+                   "in (elogind/logind sessions are reachable)");
+#else
+            xw_log(XW_LOG_ERROR,
+                   "input: note: this build has NO libseat support — the "
+                   "elogind/logind seat path is compiled out; rebuild "
+                   "with libseat development files installed (see "
+                   "BUILDING.md)");
+#endif
             xw_input_log_acquisition_failure(
                 c->backend ? c->backend->name : "?", via, in->seat,
                 xw_seat_session_active(c->seat), nodes, in->n_added,
                 in->n_kbd, in->n_ptr,
                 in->n_open_fail ? in->last_fail_path : NULL,
                 in->n_open_fail ? in->last_fail_errno : 0);
+        }
     }
 
     return in;

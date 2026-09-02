@@ -772,7 +772,8 @@ static const struct xw_seat_impl ls_impl = {
 };
 
 static struct xw_seat_session *libseat_create(struct xw_compositor *c,
-                                              const char *seat_name) {
+                                              const char *seat_name,
+                                              const char *force_backend) {
     static bool log_installed;
     if (!log_installed) {
         libseat_set_log_handler(ls_log);
@@ -792,7 +793,32 @@ static struct xw_seat_session *libseat_create(struct xw_compositor *c,
         .enable_seat = ls_on_enable,
         .disable_seat = ls_on_disable,
     };
+    /* libseat's own backend order is seatd-first, logind-second — the
+     * opposite of this project's preference. When a specific backend
+     * is forced (the elogind/logind path), LIBSEAT_BACKEND makes
+     * libseat try exactly that one; the caller's value (or its
+     * absence) is restored afterwards so nothing leaks between
+     * attempts. A NULL force_backend leaves libseat's own choice and
+     * any environment override intact. */
+    char saved[64] = "";
+    bool had_saved = false;
+    if (force_backend) {
+        const char *cur = getenv("LIBSEAT_BACKEND");
+        had_saved = cur != NULL;
+        if (had_saved)
+            snprintf(saved, sizeof(saved), "%s", cur);
+        setenv("LIBSEAT_BACKEND", force_backend, 1);
+        xw_log(XW_LOG_INFO,
+               "seat: libseat pinned to its '%s' backend for this attempt",
+               force_backend);
+    }
     l->ls = libseat_open_seat(&listener, l);
+    if (force_backend) {
+        if (had_saved)
+            setenv("LIBSEAT_BACKEND", saved, 1);
+        else
+            unsetenv("LIBSEAT_BACKEND");
+    }
     if (!l->ls) {
         xw_log(XW_LOG_DEBUG, "seat: libseat backends unavailable: %s",
                strerror(errno));
@@ -801,7 +827,13 @@ static struct xw_seat_session *libseat_create(struct xw_compositor *c,
     }
     snprintf(l->base.seat_name, sizeof(l->base.seat_name), "%s",
              libseat_seat_name(l->ls));
-    snprintf(l->base.desc, sizeof(l->base.desc), "libseat");
+    snprintf(l->base.desc, sizeof(l->base.desc), "libseat%s%s",
+             force_backend ? " (" : "",
+             force_backend ? force_backend : "");
+    if (force_backend) {
+        size_t n = strlen(l->base.desc);
+        snprintf(l->base.desc + n, sizeof(l->base.desc) - n, ")");
+    }
 
     int fd = libseat_get_fd(l->ls);
     if (fd < 0)
@@ -1022,6 +1054,7 @@ static void seat_report_environment(void) {
         (access("/run/dbus/system_bus_socket", F_OK) == 0) ||
         (getenv("DBUS_SYSTEM_BUS_ADDRESS") != NULL);
     const char *sock_env = getenv("SEATD_SOCK");
+    const char *session_id = getenv("XDG_SESSION_ID");
     xw_log(XW_LOG_INFO,
            "seat: environment: libseat %s; seatd socket %s%s%s; %s",
            libseat, seatd_socket_path(), sock_env && *sock_env ? " ($SEATD_SOCK)" : "",
@@ -1030,8 +1063,17 @@ static void seat_report_environment(void) {
                           : elogind ? "elogind is present (/run/elogind)"
                                     : "no logind/elogind");
     xw_log(XW_LOG_INFO, "seat: environment: system d-bus %s",
-           dbus ? "present" : "absent (logind/libseat logind backend "
-                              "needs it)");
+           dbus ? "present" : "absent (the logind/elogind backend needs "
+                              "it)");
+    xw_log(XW_LOG_INFO,
+           "seat: environment: $XDG_SESSION_ID %s%s%s",
+           session_id && *session_id ? "= " : "",
+           session_id && *session_id ? session_id : "is unset",
+           session_id && *session_id
+               ? " — this login is registered as a logind/elogind "
+                 "session"
+               : " — this login has no registered session (the logind "
+                 "backend will try PID/user-based discovery)");
 }
 
 int xw_seat_session_ack_disable(struct xw_seat_session *s) {
@@ -1047,9 +1089,35 @@ struct xw_seat_session *xw_seat_session_open(struct xw_compositor *c, int provid
 
     const char *seat = seat_name && *seat_name ? seat_name : "seat0";
 
+    if (provider == XW_SEAT_PROVIDER_ELOGIND) {
+#ifdef XW_HAVE_LIBSEAT
+        struct xw_seat_session *s = libseat_create(c, seat, "logind");
+        if (!s)
+            xw_log(XW_LOG_ERROR,
+                   "seat: elogind/logind requested but libseat's logind "
+                   "backend could not acquire a session: %s\n"
+                   "  elogind and logind speak the same "
+                   "org.freedesktop.login1 D-Bus API; the usual causes:\n"
+                   "  - this login is not a registered session ($XDG_SESSION_ID "
+                   "unset and PID/user discovery failed — a TTY login needs "
+                   "pam_elogind/pam_systemd in its PAM stack)\n"
+                   "  - the session exists but is not active (another session "
+                   "holds the seat; switch to this login's VT and log in "
+                   "fresh)\n"
+                   "  - the system d-bus is unreachable",
+                   strerror(errno));
+        return s;
+#else
+        xw_log(XW_LOG_ERROR,
+               "seat: elogind/logind requested, but this build has no "
+               "libseat support (libseat development files were absent at "
+               "build time) — the logind/elogind path needs libseat");
+        return NULL;
+#endif
+    }
     if (provider == XW_SEAT_PROVIDER_LIBSEAT) {
 #ifdef XW_HAVE_LIBSEAT
-        struct xw_seat_session *s = libseat_create(c, seat);
+        struct xw_seat_session *s = libseat_create(c, seat, NULL);
         if (!s)
             xw_log(XW_LOG_ERROR,
                    "seat: libseat requested but no libseat backend could "
@@ -1095,36 +1163,92 @@ struct xw_seat_session *xw_seat_session_open(struct xw_compositor *c, int provid
         return s;
     }
 
-    /* XW_SEAT_PROVIDER_AUTO: capability detection, in preference order.
-     * Each failure is logged at INFO — "which provider did the session
-     * actually use and why" is the first question of every real-TTY
-     * debug, so the try/reject trail must survive --verbose. */
+    /* XW_SEAT_PROVIDER_AUTO: capability detection, in explicit
+     * preference order: elogind/logind first (a session manager that
+     * grants device ACLs to the active login), then the seatd socket,
+     * then a direct VT takeover. libseat's own internal order is the
+     * opposite (seatd before logind), so the elogind attempt pins
+     * libseat to its logind backend via $LIBSEAT_BACKEND — elogind
+     * implements the same org.freedesktop.login1 D-Bus API. Every
+     * accept/reject is logged at INFO: "which provider did the session
+     * actually use and why" must be answerable from one --verbose
+     * run. */
     {
         seat_report_environment();
+
+        /* 1. elogind/logind session (through libseat's logind backend) */
+        bool login1 = access("/run/elogind/", F_OK) == 0 ||
+                      access("/run/systemd/seats/", F_OK) == 0;
+        bool dbus = (access("/run/dbus/system_bus_socket", F_OK) == 0) ||
+                    (getenv("DBUS_SYSTEM_BUS_ADDRESS") != NULL);
+        if (login1 && dbus) {
 #ifdef XW_HAVE_LIBSEAT
-        xw_log(XW_LOG_INFO, "seat: trying libseat (wraps logind/elogind/"
-                             "seatd as configured by the system)");
-        struct xw_seat_session *s = libseat_create(c, seat);
-        if (s)
-            return s;
-        xw_log(XW_LOG_INFO, "seat: libseat unavailable (%s)",
-               strerror(errno));
+            xw_log(XW_LOG_INFO,
+                   "seat: elogind/logind detected (/run/elogind or "
+                   "/run/systemd/seats, d-bus up) — trying libseat's "
+                   "logind backend first");
+            struct xw_seat_session *s = libseat_create(c, seat, "logind");
+            if (s)
+                return s;
+            xw_log(XW_LOG_INFO,
+                   "seat: the logind/elogind backend did not grant a "
+                   "session (%s) — continuing with seatd",
+                   strerror(errno ? errno : EPERM));
 #else
-        xw_log(XW_LOG_INFO,
-               "seat: libseat not compiled in — trying built-in providers");
+            xw_log(XW_LOG_INFO,
+                   "seat: elogind/logind is present, but this build has "
+                   "no libseat support — the logind path is unavailable");
 #endif
-        xw_log(XW_LOG_INFO, "seat: trying the built-in seatd client (%s)",
-               seatd_socket_path());
-        struct xw_seat_session *sd = seatd_create(c, seat);
-        if (sd)
-            return sd;
-        xw_log(XW_LOG_INFO, "seat: seatd socket not usable (%s)",
-               seatd_socket_path());
-        xw_log(XW_LOG_INFO,
-               "seat: trying a direct VT session (/dev/tty)");
+        } else if (login1) {
+            xw_log(XW_LOG_INFO,
+                   "seat: elogind/logind dirs present but the system "
+                   "d-bus is unreachable — skipping the logind backend");
+        } else {
+            xw_log(XW_LOG_INFO,
+                   "seat: no elogind/logind (/run/elogind and "
+                   "/run/systemd/seats both absent) — skipping the "
+                   "logind path");
+        }
+
+        /* 2. seatd daemon (built-in wire client, no library) */
+        if (access(seatd_socket_path(), F_OK) == 0) {
+            xw_log(XW_LOG_INFO,
+                   "seat: seatd socket present — trying the built-in "
+                   "seatd client (%s)", seatd_socket_path());
+            struct xw_seat_session *sd = seatd_create(c, seat);
+            if (sd)
+                return sd;
+            xw_log(XW_LOG_INFO, "seat: seatd socket not usable (%s): %s",
+                   seatd_socket_path(), strerror(errno ? errno : ECONNREFUSED));
+        } else {
+            xw_log(XW_LOG_INFO,
+                   "seat: no seatd socket (%s) — skipping the seatd "
+                   "client", seatd_socket_path());
+        }
+
+        /* 3. direct VT takeover */
+        xw_log(XW_LOG_INFO, "seat: trying a direct VT session (/dev/tty)");
         struct xw_seat_session *dr = direct_create(c, seat);
         if (dr)
             return dr;
+
+        /* 4. last resort: libseat with its own backend choice
+         * (seatd -> logind -> builtin). The builtin backend can open a
+         * degenerate VT-less seat when the user's own permissions
+         * already cover the devices — DRM often works that way (video
+         * group) while input does not, so this step exists to keep the
+         * session alive and let the input acquisition report explain
+         * exactly what is and is not reachable. */
+#ifdef XW_HAVE_LIBSEAT
+        xw_log(XW_LOG_INFO,
+               "seat: last resort — libseat with its own backend order "
+               "(seatd, logind, builtin)");
+        struct xw_seat_session *ls = libseat_create(c, seat, NULL);
+        if (ls)
+            return ls;
+        xw_log(XW_LOG_INFO, "seat: libseat found no usable backend (%s)",
+               strerror(errno));
+#endif
 
         /* nothing worked: the honest combined diagnostic */
         xw_log(XW_LOG_ERROR,
@@ -1132,18 +1256,25 @@ struct xw_seat_session *xw_seat_session_open(struct xw_compositor *c, int provid
                "\n"
                "Tried seat/session providers:\n"
 #ifdef XW_HAVE_LIBSEAT
-               "  libseat (logind/elogind/seatd): unavailable\n"
+               "  libseat logind backend (elogind/logind): %s\n"
 #else
-               "  libseat: not compiled into this build\n"
+               "  libseat: not compiled into this build (the "
+               "elogind/logind path needs it)\n"
 #endif
-               "  seatd socket %s: unavailable\n"
+               "  seatd socket %s: %s\n"
                "  direct VT session: no usable virtual terminal\n"
                "\n"
                "For a TTY session, install/configure a supported seat "
-               "manager such as seatd or logind/elogind (see "
-               "BUILDING.md, \"Seat and session management\").\n"
+               "manager such as elogind or seatd (see BUILDING.md, "
+               "\"Seat and session management\").\n"
                "This compositor never falls back to running as root.",
-               seatd_socket_path());
+#ifdef XW_HAVE_LIBSEAT
+               login1 ? "did not grant this login a session"
+                      : "no elogind/logind present",
+#endif
+               seatd_socket_path(),
+               access(seatd_socket_path(), F_OK) == 0 ? "unusable"
+                                                      : "absent");
         return NULL;
     }
 }
