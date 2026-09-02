@@ -1449,3 +1449,55 @@ Stage Summary:
   in the live windows, send the xw-seat-repair-*.log back. If the
   reinstall still fails, its pacman error text is IN the log now,
   and the input-group fallback fires (one gpasswd + one relogin).
+
+---
+Task ID: question-round (2026-09-02)
+Agent: main
+Task: user asked how other Wayland compositors actually acquire the
+keyboard/mouse ("have you looked at their code to see why it works
+for them?"); seatd repair still pending on their machine.
+
+Work Log:
+- Verified c6ff91a (xw-seat-repair.sh) IS on origin/main (0 commits
+  ahead) — the user's `git pull` delivers it. sh -n re-checked.
+- Pulled real upstream sources for exact quotes (gitlab raw is
+  bot-gated with an HTTP-200 challenge page; used the swaywm GitHub
+  mirror for wlroots and the kennylevinsen mirror for seatd; added
+  an anti-bot-HTML rejection guard to the fetch helper):
+  wlroots backend/libinput/backend.c (libinput_interface wiring:
+  open_restricted -> wlr_session_open_file), backend/session/
+  session.c (libseat_open_seat + libseat_open_device in
+  wlr_session_open_file), seatd libseat/libseat.c (backend order
+  seatd, logind, builtin; $LIBSEAT_BACKEND pinning),
+  libseat/backend/logind.c (TakeControl; TakeDevice "uu" call with
+  the fd arriving in the "hb" reply), seatd/client.c (SO_PEERCRED
+  identity; handle_open_device -> dup -> connection_put_fd),
+  common/connection.c (SCM_RIGHTS cmsg), seatd/seat.c
+  (CLIENT_ACTIVE gate, path sanitizing, open() as root).
+  Saved under tool-results/refs/ (gitignored).
+- Confirmed this repo's own design mirrors wlroots line-for-line:
+  xw-input-libinput.c open_restricted/close_restricted +
+  libinput_udev_create_context; xw-session-seat.c
+  libseat_open_seat/libseat_open_device — plus extras wlroots does
+  not have (built-in seatd wire client, direct VT provider).
+- Mapped every dead provider route to the corrupted seatd package:
+  route 1 (elogind via libseat) dead = libseat not linked (0-byte
+  .pc -> build/.features libseat=n); route 2 (built-in seatd
+  client) dead = the seatd BINARY itself is 0 bytes, so the enabled
+  runit service starts nothing and /run/seatd.sock never appears;
+  route 3 (direct) alive for DRM (elogind udev ACL / video perms)
+  but EACCES on /dev/input BY DESIGN (input never gets ACLs —
+  broker-only). That is the exact "picture renders, mouse frozen"
+  state in the user's logs.
+- No source changes this round (analysis + answer only). This
+  worklog entry committed locally, NOT pushed (no token this
+  session — origin already has everything the user needs).
+
+Stage Summary:
+- Answer delivered with side-by-side upstream quotes (sway ->
+  wlroots -> libseat -> elogind D-Bus / seatd SCM_RIGHTS).
+- Continuation point UNCHANGED: user runs `git pull &&
+  ./scripts/xw-seat-repair.sh`, answers y at the two prompts, moves
+  the mouse in the live windows, sends xw-seat-repair-*.log back.
+  If pacman still refuses, its error text is now captured in the
+  log; the input-group fallback + relogin is the no-package escape.
