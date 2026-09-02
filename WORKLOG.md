@@ -1131,3 +1131,57 @@ Stage Summary:
   TTY) is direct-provider EACCES on /dev/input/event* — the report
   will name it with the legitimate fix (usermod -aG input + re-login,
   or run seatd and join the seat group).
+
+---
+Task ID: 2026-09-02-elogind-first-provider-chain
+Agent: main (Super Z)
+Task: User report — mouse still dead on a clean-boot TTY login (XFCE
+never running); MORE permission denied after logging out of an XFCE
+Xlibre session; requested seat provider order elogind first, then
+seatd.
+
+Work Log:
+- Container had been reset again (sysroot + credentials wiped);
+  re-ran scripts/bootstrap-sysroot.sh (proven disaster-recovery path).
+- Verified the sysroot's Debian libseat1 ships the logind backend:
+  DT_NEEDED libsystemd.so.0, org.freedesktop.login1 D-Bus strings,
+  XDG_SESSION_ID/TakeControl/GetSession — elogind implements this
+  exact API, so the path is real, not theoretical.
+- Downloaded upstream libseat source and confirmed the smoking gun:
+  libseat's internal backend order is seatd FIRST, logind SECOND —
+  the opposite of the requested preference. Also found the supported
+  override: $LIBSEAT_BACKEND forces one named backend.
+- Implemented the requested chain in xw_seat_session_open AUTO:
+  elogind (libseat pinned to logind via LIBSEAT_BACKEND, save/
+  restored) -> seatd socket (built-in client) -> direct VT ->
+  last-resort libseat unpinned. The last-resort step exists because
+  the old chain's libseat attempt could fall to its builtin backend
+  (degenerate VT-less seat from the user's own perms) — that is very
+  likely how the user's DRM scanout worked while input stayed EACCES
+  (video group without input group). Preserved at the tail, after the
+  requested order, so the input acquisition report explains reality.
+- New XW_SEAT_PROVIDER_ELOGIND + -P elogind/logind aliases, forced
+  semantics with a diagnostic naming the three usual causes
+  (unregistered login/PAM, inactive session, unreachable d-bus).
+- Diagnostics: seat environment report now prints $XDG_SESSION_ID
+  and its meaning; input acquisition failure states whether libseat
+  is compiled into the build (silent compile-out is a build problem
+  the log must name).
+- Fixed a regression found by test-session session 8: the first
+  version of the chain skipped the libseat catch-all and the
+  compositor failed at seat acquisition before DRM enumeration
+  ("no DRM subsystem" never printed). The last-resort step restores
+  the old container behavior under the new order.
+- Full battery: 64/64 in-process, 50/50 build regressions,
+  108/108 process-level (5 new elogind checks), ASan+UBSan+LSan PASS.
+- Docs: BUILDING.md provider table + order rationale + the
+  "more permission denied after graphical logout" explanation
+  (elogind session-active semantics); README seat paragraph.
+
+Stage Summary:
+- Commit 7caebac on main. elogind is now tried first and pinned
+  deterministically; every decision is visible under --verbose.
+- The user's symptom set (DRM works, input dead, worse after logout)
+  points to either an unregistered elogind session (PAM) or a build
+  without libseat — both are now self-identifying in the logs.
+  Next hardware run with --verbose will name the exact cause.
