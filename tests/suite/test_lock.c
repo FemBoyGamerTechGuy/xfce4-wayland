@@ -601,6 +601,19 @@ static void test_session_lock_commit_before_ack(struct xwt_ctx *t) {
     xwt_pump(t);
     XWT_CHECK(!xw_session_lock_active(t->comp),
               "PENDING offender death released the gate");
+    /* proxies created through wl_proxy_marshal are owned by the caller,
+     * not by the display: destroy them before disconnecting, or they
+     * leak (visible under LSan once later tests recycle the stack) */
+    wl_proxy_destroy((struct wl_proxy *)ls);
+    wl_proxy_destroy((struct wl_proxy *)l);
+    wl_proxy_destroy((struct wl_proxy *)s);
+    if (ctx.compositor)
+        wl_proxy_destroy((struct wl_proxy *)ctx.compositor);
+    if (ctx.manager)
+        wl_proxy_destroy((struct wl_proxy *)ctx.manager);
+    if (ctx.output)
+        wl_proxy_destroy((struct wl_proxy *)ctx.output);
+    wl_proxy_destroy((struct wl_proxy *)reg);
     wl_display_disconnect(d);
 }
 

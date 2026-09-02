@@ -570,6 +570,82 @@ XDG_RUNTIME_DIR="$RTD" "$BIN/xw-session-ctl" -S xw-fail logout \
     >/dev/null 2>&1
 check "exitlog: logout exits cleanly" 'wait_pid_exit "$SESS7_PID"'
 
+
+echo
+echo "== session 8: DRM backend selection (seat providers, honest failures) =="
+# The container has no /dev/dri: every DRM attempt must fail HONESTLY
+# (distinct diagnostics, exit 1, never a silent fallback to another
+# backend) and the seat acquisition itself must work through the real
+# seatd wire protocol against the mock server.
+
+LOG8="$RTD/session8-drm.log"
+env -u DISPLAY -u WAYLAND_DISPLAY XDG_RUNTIME_DIR="$RTD" \
+    "$BIN/xw-session" --backend=drm -n -S xw-drm >"$LOG8" 2>&1 &
+SESS8_PID=$!
+check "drm: explicit backend fails without KMS (no silent fallback)" \
+    'wait_pid_exit "$SESS8_PID"'
+wait "$SESS8_PID"; DR_RC=$?
+check "drm: session exit code is 1" '[ "$DR_RC" -eq 1 ]'
+check "drm: the compositor's reason is visible" \
+    'rg -q "no DRM subsystem|no /dev/dri" "$LOG8" 2>/dev/null'
+check "drm: the session reports the failure" \
+    'rg -q "cannot start the compositor" "$LOG8" 2>/dev/null'
+check "drm: no restart loop was attempted" \
+    '! rg -q "restarting" "$LOG8" 2>/dev/null'
+
+LOG8B="$RTD/session8-auto.log"
+env -u DISPLAY -u WAYLAND_DISPLAY XDG_RUNTIME_DIR="$RTD" \
+    "$BIN/xw-session" -n -S xw-auto >"$LOG8B" 2>&1 &
+SESS8B_PID=$!
+check "drm-auto: TTY without KMS starts headless" \
+    'wait_for "[ -S \"$RTD/xw-auto.sock\" ]"'
+check "drm-auto: the headless downgrade is explained, not silent" \
+    'rg -q "no /dev/dri KMS hardware" "$LOG8B" 2>/dev/null'
+XDG_RUNTIME_DIR="$RTD" "$BIN/xw-session-ctl" -S xw-auto logout \
+    >/dev/null 2>&1
+check "drm-auto: logout exits cleanly" 'wait_pid_exit "$SESS8B_PID"'
+
+check "drm: bogus backend name is rejected" \
+    '! "$BIN/xw-session" --backend=sidecar >/dev/null 2>&1'
+check "drm: compositor rejects bogus backend names" \
+    '! "$BIN/xw-compositor" -B sidecar >/dev/null 2>&1'
+check "drm: compositor rejects bogus seat providers" \
+    '! "$BIN/xw-compositor" -B drm -P gnome >/dev/null 2>&1'
+
+# --- seat acquisition through the REAL protocol (mock seatd) ---
+MOCK_SOCK="$RTD/seatd-test.sock"
+MOCK_LOG="$RTD/mockseatd.log"
+"$ROOT/build/tests/mockseatd" "$MOCK_SOCK" 20 >"$MOCK_LOG" 2>&1 &
+MOCK_PID=$!
+check "drm: mock seatd is listening" \
+    'wait_for "[ -S \"$MOCK_SOCK\" ]"'
+
+LOG8C="$RTD/session8-seatd.log"
+SEATD_SOCK="$MOCK_SOCK" env -u DISPLAY -u WAYLAND_DISPLAY \
+    XDG_RUNTIME_DIR="$RTD" \
+    "$BIN/xw-compositor" -B drm -P seatd -c "$RTD/empty-conf" \
+    >"$LOG8C" 2>&1
+RC8C=$?
+check "drm+seatd: compositor acquired the seat via the real protocol" \
+    'rg -q "seat: opened through seatd" "$LOG8C" 2>/dev/null'
+check "drm+seatd: seat name from the mock server" \
+    'rg -q "seat seat-mock" "$LOG8C" 2>/dev/null'
+check "drm+seatd: then fails honestly (no /dev/dri in this container)" \
+    'rg -q "no DRM subsystem" "$LOG8C" 2>/dev/null'
+check "drm+seatd: exit code 1" '[ "$RC8C" -eq 1 ]'
+check "drm+seatd: the mock saw the seat open" \
+    'rg -q "seat-opened seat-mock" "$MOCK_LOG" 2>/dev/null'
+wait "$MOCK_PID" 2>/dev/null
+
+LOG8D="$RTD/session8-direct.log"
+env -u DISPLAY -u WAYLAND_DISPLAY XDG_RUNTIME_DIR="$RTD" \
+    "$BIN/xw-compositor" -B drm -P direct -c "$RTD/empty-conf" \
+    >"$LOG8D" 2>&1
+RC8D=$?
+check "drm+direct: no VT here -> honest diagnostic" \
+    'rg -q "not a virtual terminal|cannot be taken" "$LOG8D" 2>/dev/null'
+check "drm+direct: exit code 1" '[ "$RC8D" -eq 1 ]'
+
 echo
 echo "test-session: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1

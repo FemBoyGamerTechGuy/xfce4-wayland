@@ -527,8 +527,15 @@ check "R6: XW_LIBINPUT=0 compositor produced" \
 check "R6: XW_LIBINPUT=0 libxw.a excludes the backend member" \
     '! ar t "$NOINPUT/build/lib/libxw.a" 2>/dev/null | grep -q xw-input-libinput'
 nm "$NOINPUT/build/bin/xw-compositor" >"$TMP/r6f.nm" 2>&1 || true
-check "R6: XW_LIBINPUT=0 binary references no udev/libinput symbols" \
-    '! grep -qE "U (udev_|libinput_)" "$TMP/r6f.nm"'
+# libinput is off, so no libinput_ symbols may appear. udev_ symbols
+# remain expected: the DRM backend (built here) runs its own udev
+# monitor for display hotplug, which makes libudev a direct link
+# dependency of the DRM feature, not of libinput.
+check "R6: XW_LIBINPUT=0 binary references no libinput symbols" \
+    '! grep -qE "U libinput_" "$TMP/r6f.nm"'
+check "R6: XW_LIBINPUT=0 DRM hotplug keeps udev symbols" \
+    'grep -qE "U udev_monitor_new_from_netlink" "$TMP/r6f.nm" 2>/dev/null || \
+     ! pkg-config --exists libdrm 2>/dev/null'
 
 # --- R6g: symbol-coverage audit of every final link command
 if [ -f "$ROOT/build/lib/libxw.a" ]; then

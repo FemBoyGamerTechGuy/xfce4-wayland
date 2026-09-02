@@ -224,15 +224,22 @@ void xwc_lock_destroy(struct xwc_lock *k) {
         ext_session_lock_surface_v1_destroy(k->lsurf);
     if (k->surface)
         wl_surface_destroy(k->surface);
-    if (k->lock && !k->locked && !k->finished) {
-        /* does not hold the lock: the object may be destroyed */
+    if (k->lock && (!k->locked || k->finished)) {
+        /* Safe to destroy: either the lock was never held, or the
+         * server sent `finished` (the object is dead by its own
+         * protocol — destroying it is the documented reaction and
+         * releases the client-side proxy). */
         ext_session_lock_v1_destroy(k->lock);
+    } else if (k->lock) {
+        /* the lock is HELD (locked && !finished): sending destroy
+         * would be a protocol error (server: invalid_destroy), and the
+         * server must keep the session locked after we disconnect
+         * (spec). Free the client-side proxy WITHOUT a request: the
+         * object dies with the connection, the memory is ours. (A raw
+         * wl_proxy_destroy sends nothing; the lsurf child was already
+         * destroyed above.) */
+        wl_proxy_destroy((struct wl_proxy *)k->lock);
     }
-    /* if the lock is HELD (locked && !finished): destroying the lock
-     * object would be a protocol error (server: invalid_destroy). The
-     * lock object proxy dies with the connection instead — the server
-     * sees the client die and keeps the session locked (spec), with
-     * the surfaces destroyed above falling back to blank rendering. */
     k->lock = NULL;
     k->lsurf = NULL;
     k->surface = NULL;
