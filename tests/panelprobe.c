@@ -1,7 +1,7 @@
 /* panelprobe.c — check whether the xw-panel top bar is visible in the
  * compositor's nested X11 window.
  *
- * Panel visual constants (src/clients/xw-panel.c):
+ * Panel visual constants (subprojects/panel/xw-panel.c):
  *   BAR_H 28, COL_BAR_BG 0xff22262e, COL_BTN_BG 0xff2e3440,
  *   COL_BTN_ACTIVE 0xff3584e4, COL_EXIT_BG 0xffa33434, COL_TEXT 0xffe6e6e6
  * bg of the compositor: 0xff202530.

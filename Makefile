@@ -434,7 +434,7 @@ $(GEN)/xw-font-data.h: tools/genfont.py $(XW_FONT_DEP) | $(GEN)
 
 # consolidated directory rule
 DIRECTORIES := $(GEN) $(OBJ)/libxw $(OBJ)/libxwcl $(OBJ)/compositor \
-	$(OBJ)/session $(OBJ)/clients $(OBJ)/tests $(OBJ)/gen build/lib \
+	$(OBJ)/session $(OBJ)/clients $(OBJ)/panel $(OBJ)/tests $(OBJ)/gen build/lib \
 	build/bin build/tests
 $(DIRECTORIES):
 	mkdir -p $@
@@ -528,8 +528,15 @@ $(OBJ)/session/%.o: src/session/%.c | $(OBJ)/session
 
 # ---------------------------------------------------------------- clients
 
-build/bin/xw-panel: $(OBJ)/clients/xw-panel.o $(OBJ)/clients/xw-ctl.o build/lib/libxwcl.a | build/bin
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-panel.o $(OBJ)/clients/xw-ctl.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
+# the panel lives in its own subproject (subprojects/panel) and builds
+# from the CLIENT stack only: libxwcl + xw-ctl. It never links or
+# compiles anything from libxw — `make panel` works without the
+# compositor and the compositor never references it.
+build/bin/xw-panel: $(OBJ)/panel/xw-panel.o $(OBJ)/clients/xw-ctl.o build/lib/libxwcl.a | build/bin
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/panel/xw-panel.o $(OBJ)/clients/xw-ctl.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
+
+$(OBJ)/panel/%.o: subprojects/panel/%.c src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/panel
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLC) $(CFLAGS_PIX) -c $< -o $@
 
 build/bin/xw-exit: $(OBJ)/clients/xw-exit.o $(OBJ)/clients/xw-ctl.o $(OBJ)/session/xw-power.o build/lib/libxwcl.a | build/bin
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-exit.o $(OBJ)/clients/xw-ctl.o $(OBJ)/session/xw-power.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
@@ -606,14 +613,15 @@ $(OBJ)/tests/fdtest2.o: tests/fdtest2.c | $(OBJ)/tests
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(CFLAGS_WLS) $(CFLAGS_X11) -c $< -o $@
 
 # ---------------------------------------------------------------- targets
-.PHONY: all tests check asan clean dist install uninstall config
+.PHONY: all tests check asan clean dist install uninstall config \
+	compositor panel session clients
 
 # session manager, exit dialog, panel, demo client
 SESSION_BINS := $(if $(wildcard src/session/xw-session.c),build/bin/xw-session build/bin/xw-session-ctl,)
 CLIENT_BINS := $(if $(wildcard src/clients/xw-demo.c),build/bin/xw-demo,) \
 	$(if $(wildcard src/clients/xw-exit.c),build/bin/xw-exit,) \
 	$(if $(wildcard src/clients/xw-lock.c),build/bin/xw-lock,) \
-	$(if $(wildcard src/clients/xw-panel.c),build/bin/xw-panel,)
+	$(if $(wildcard subprojects/panel/xw-panel.c),build/bin/xw-panel,)
 all: build/.profile build/.features build/bin/xw-compositor $(SESSION_BINS) $(CLIENT_BINS) \
 	build/tests/run-tests
 ifeq ($(X11_ON),y)
@@ -634,6 +642,14 @@ build/.features:
 
 tests: all
 	build/tests/run-tests
+
+# ------------------------------------------------- component build targets
+# Each desktop component builds on its own; the compositor never needs
+# the panel (and vice versa). See subprojects/README.md for the map.
+compositor: build/.profile build/bin/xw-compositor
+panel: build/.profile build/bin/xw-panel
+session: build/.profile $(SESSION_BINS)
+clients: build/.profile build/bin/xw-demo build/bin/xw-exit build/bin/xw-lock
 
 check: tests
 	sh scripts/test-session.sh

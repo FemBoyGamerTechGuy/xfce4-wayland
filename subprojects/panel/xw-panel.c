@@ -21,7 +21,7 @@
  * blitter exists).
  */
 #include "xwc.h"
-#include "xw-ctl.h"
+#include "clients/xw-ctl.h" /* client-side ctl wire (src/clients, via -Isrc) */
 
 #include <signal.h>
 #include <stdio.h>

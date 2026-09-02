@@ -132,7 +132,7 @@ echo "== R2: build failure handling =="
 BROKEN="$TMP/broken"
 copy_repo "$BROKEN"
 printf '\n#error deliberate regression-test compile failure\n' \
-    >> "$BROKEN/src/clients/xw-panel.c"
+    >> "$BROKEN/subprojects/panel/xw-panel.c"
 
 ( cd "$BROKEN" && make -s all ) >"$TMP/broken-make.log" 2>&1
 rc=$?
