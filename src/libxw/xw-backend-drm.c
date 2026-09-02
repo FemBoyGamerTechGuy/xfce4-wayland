@@ -173,6 +173,18 @@ int xw_drm_plan_crtc(int conn_enc, int enc_crtc, uint32_t enc_possible,
 #define DRM_MAX_OUTPUTS 8
 #define DRM_MAX_MODES 64
 
+/* page-flip watchdog: a vblank is at most ~17ms, so a flip the driver
+ * ACCEPTED that still has not completed after 300ms (~20 frames)
+ * means the vblank event is never coming. The real-world offender is
+ * the NVIDIA proprietary DRM driver: drmModePageFlip() returns 0 on
+ * the legacy path but no DRM_EVENT_PAGE_FLIP is ever delivered, so
+ * waiting_flip would stay set forever and every later frame would
+ * stay parked — a silently frozen display. */
+#define XW_FLIP_TIMEOUT_MS 300
+/* startup diagnostics window: 2s DRM presentation stats lines */
+#define XW_DRM_STATS_MS 2000
+#define XW_DRM_STATS_TICKS 15
+
 struct drm_bo { /* one dumb-buffer scanout object */
     uint32_t fb_id;  /* KMS framebuffer id */
     uint32_t handle; /* GEM handle */
@@ -194,6 +206,12 @@ struct drm_output_priv {
     bool waiting_flip; /* a page flip is in flight */
     bool parked_frame; /* a frame arrived while a flip was in flight */
     bool no_flip;      /* driver rejects page flips: immediate updates */
+    int64_t flip_ms;   /* when the in-flight flip was queued (watchdog) */
+    /* presentation counters for the startup stats window: presents =
+     * frames handed to present(), flips = flips the driver accepted,
+     * events = vblank events actually delivered, parked = frames
+     * dropped while a flip was in flight */
+    uint64_t n_presents, n_flips, n_events, n_parked;
     struct wl_list link;
 };
 
@@ -210,6 +228,11 @@ struct drm_backend {
     struct wl_list outputs;
     bool active; /* seat session active (VT visible) */
     bool master; /* we hold DRM master */
+    struct wl_event_source *flip_timer; /* recurring flip watchdog */
+    struct wl_event_source *stats_src;  /* startup stats window */
+    int stats_ticks;
+    uint64_t n_watchdog; /* watchdog fallbacks so far */
+    char driver[32];     /* kernel driver name — "nvidia" matters here */
 };
 
 static struct drm_backend *db_of(struct xw_backend *b) {
@@ -311,6 +334,8 @@ static void output_queue_flip(struct drm_backend *db,
                         DRM_MODE_PAGE_FLIP_EVENT, op) == 0) {
         op->current = next;
         op->waiting_flip = true;
+        op->flip_ms = xw_now_ms();
+        op->n_flips++;
         return;
     }
     if (errno == EINVAL || errno == ENOSPC || errno == EOPNOTSUPP) {
@@ -338,6 +363,7 @@ static void db_present(struct xw_backend *b, struct xw_output *o) {
     struct drm_output_priv *op = op_of(db, o);
     if (!op)
         return;
+    op->n_presents++;
     if (op->no_flip) {
         /* immediate mode: copy into the buffer being scanned out */
         bo_copy_frame(&op->bos[op->current], o);
@@ -345,6 +371,7 @@ static void db_present(struct xw_backend *b, struct xw_output *o) {
     }
     if (op->waiting_flip) {
         /* a flip is in flight: park this frame; it flips on vblank */
+        op->n_parked++;
         op->parked_frame = true;
         return;
     }
@@ -360,6 +387,7 @@ static void page_flip_complete(int fd, unsigned int sequence,
     (void)tv_sec;
     (void)tv_usec;
     struct drm_output_priv *op = user_data;
+    op->n_events++;
     op->waiting_flip = false;
     if (op->parked_frame) {
         op->parked_frame = false;
@@ -379,6 +407,95 @@ static int db_on_drm_readable(int fd, uint32_t mask, void *data) {
     drmEventContext ctx = {.version = DRM_EVENT_CONTEXT_VERSION,
                            .vblank_handler = page_flip_complete};
     drmHandleEvent(db->drm_fd, &ctx);
+    return 0;
+}
+
+/* --------------------------------------------- flip watchdog + stats --- */
+
+/* Recurring (100ms) watchdog over the page-flip event path — see
+ * XW_FLIP_TIMEOUT_MS above for why it must exist. Without it, a
+ * driver that accepts flips but never delivers the vblank event
+ * freezes the display on the last completed frame for the whole
+ * session while the compositor keeps "presenting" into parked
+ * buffers — the exact "picture renders, cursor never moves"
+ * symptom. The 100ms cadence adds no wakeups beyond the event loop's
+ * own 100ms dispatch timeout. */
+static int db_flip_watchdog_cb(void *data) {
+    struct drm_backend *db = data;
+    if (db->active) {
+        int64_t now = xw_now_ms();
+        struct drm_output_priv *op;
+        wl_list_for_each(op, &db->outputs, link) {
+            if (!op->waiting_flip ||
+                now - op->flip_ms < XW_FLIP_TIMEOUT_MS)
+                continue; /* nothing overdue */
+            db->n_watchdog++;
+            op->waiting_flip = false;
+            op->parked_frame = false;
+            op->no_flip = true;
+            xw_log(XW_LOG_WARN,
+                   "drm: page flip on %s never completed — the driver "
+                   "ACCEPTED the flip but no vblank event arrived within "
+                   "%dms (the NVIDIA proprietary driver does this on the "
+                   "legacy page-flip path). Switching %s to immediate "
+                   "buffer updates: frames become visible without "
+                   "vblank sync (slight tearing possible, otherwise "
+                   "fully functional).",
+                   op->name, XW_FLIP_TIMEOUT_MS, op->name);
+            /* pin scanout to the buffer present() now writes into and
+             * show the newest composited frame immediately — this is
+             * the moment a frozen display un-freezes */
+            if (drmModeSetCrtc(db->drm_fd, op->crtc_id,
+                               op->bos[op->current].fb_id, 0, 0,
+                               &op->conn_id, 1, &op->mode) < 0)
+                xw_log(XW_LOG_ERROR,
+                       "drm: cannot re-program %s after the flip "
+                       "watchdog tripped: %s — the display may stay "
+                       "frozen",
+                       op->name, strerror(errno));
+            bo_copy_frame(&op->bos[op->current], op->out);
+        }
+    }
+    wl_event_source_timer_update(db->flip_timer, 100);
+    return 0;
+}
+
+/* 2s INFO presentation stats for the first 30s — the display half of
+ * the "cursor does not move" bisect, visible at the DEFAULT log
+ * level (right next to input's stats lines). flips>0 with
+ * events==0 is the signature of a dead flip path, usually right
+ * before the watchdog trips and fixes it. */
+static int db_stats_timer_cb(void *data) {
+    struct drm_backend *db = data;
+    uint64_t presents = 0, flips = 0, events = 0, parked = 0;
+    int no_flip = 0, in_flight = 0;
+    struct drm_output_priv *op;
+    wl_list_for_each(op, &db->outputs, link) {
+        presents += op->n_presents;
+        flips += op->n_flips;
+        events += op->n_events;
+        parked += op->n_parked;
+        no_flip += op->no_flip;
+        in_flight += op->waiting_flip;
+    }
+    xw_log(XW_LOG_INFO,
+           "drm: stats: driver=%s presents=%llu flips=%llu "
+           "vblank-events=%llu parked=%llu no-flip=%d in-flight=%d "
+           "watchdog=%llu%s",
+           db->driver[0] ? db->driver : "?",
+           (unsigned long long)presents, (unsigned long long)flips,
+           (unsigned long long)events, (unsigned long long)parked,
+           no_flip, in_flight, (unsigned long long)db->n_watchdog,
+           (flips > 0 && events == 0)
+               ? " [flips queued but NO vblank events — dead flip path, "
+                 "the watchdog will switch to immediate updates]"
+               : "");
+    if (++db->stats_ticks >= XW_DRM_STATS_TICKS) {
+        wl_event_source_remove(db->stats_src);
+        db->stats_src = NULL;
+        return 0; /* source removed; nothing more to schedule */
+    }
+    wl_event_source_timer_update(db->stats_src, XW_DRM_STATS_MS);
     return 0;
 }
 
@@ -522,6 +639,10 @@ static void db_destroy(struct xw_backend *b) {
         udev_unref(db->udev);
     if (db->drm_src)
         wl_event_source_remove(db->drm_src);
+    if (db->flip_timer)
+        wl_event_source_remove(db->flip_timer);
+    if (db->stats_src)
+        wl_event_source_remove(db->stats_src);
 
     /* every output: restore the CRTC the firmware had before us, then
      * release the buffers. Restoring a previously-DISABLED CRTC matters
@@ -789,6 +910,25 @@ struct xw_backend *xw_backend_drm_create(struct xw_compositor *c,
     xw_log(XW_LOG_INFO, "drm: device %s through %s", best_path,
            seat ? xw_seat_session_desc(seat) : "direct open");
 
+    /* kernel driver identification — "nvidia" predicts the flip-event
+     * trouble the watchdog below covers; knowing the driver in the log
+     * turns a mystery into a lookup */
+    drmVersionPtr drv_ver = drmGetVersion(db->drm_fd);
+    if (drv_ver) {
+        if (drv_ver->name)
+            snprintf(db->driver, sizeof(db->driver), "%.*s",
+                     (int)sizeof(db->driver) - 1, drv_ver->name);
+        xw_log(XW_LOG_INFO, "drm: kernel driver: %s %d.%d.%d%s",
+               db->driver[0] ? db->driver : "?", drv_ver->version_major,
+               drv_ver->version_minor, drv_ver->version_patchlevel,
+               strncmp(db->driver, "nvidia", 6) == 0
+                   ? " (NVIDIA proprietary: page-flip events are not "
+                     "delivered on the legacy path; the flip watchdog "
+                     "covers it)"
+                   : "");
+        drmFreeVersion(drv_ver);
+    }
+
     /* ---- 2. DRM master (needed to modeset) ---- */
     if (!drmIsMaster(db->drm_fd)) {
         if (drmSetMaster(db->drm_fd) < 0) {
@@ -902,6 +1042,20 @@ struct xw_backend *xw_backend_drm_create(struct xw_compositor *c,
                                        db);
     if (!db->drm_src)
         goto fail;
+
+    /* flip watchdog + the startup stats window (both on the same
+     * loop; both removed in db_destroy) */
+    db->flip_timer = wl_event_loop_add_timer(c->loop, db_flip_watchdog_cb, db);
+    if (db->flip_timer)
+        wl_event_source_timer_update(db->flip_timer, 100);
+    else
+        xw_log(XW_LOG_WARN,
+               "drm: flip watchdog timer unavailable — a driver that "
+               "accepts flips but never delivers vblank events would "
+               "freeze the display silently");
+    db->stats_src = wl_event_loop_add_timer(c->loop, db_stats_timer_cb, db);
+    if (db->stats_src)
+        wl_event_source_timer_update(db->stats_src, XW_DRM_STATS_MS);
 
     db->udev = udev_new();
     if (db->udev) {

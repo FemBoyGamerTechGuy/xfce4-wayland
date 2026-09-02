@@ -1681,3 +1681,83 @@ Stage Summary:
 - Continuation point: user runs the 3 manual bisect commands,
   moves the mouse in every window, and pastes both logs (or the
   4 counts) back; the verdict matrix picks the next fix.
+
+---
+Task ID: nvidia-bisect-round (2026-09-03)
+Agent: main
+Task: user's manual bisect attempt: kernel half failed (libinput CLI
+missing on their machine), compositor-half greps all zero; new fact
+from the user: "probably forgot to say that I use a NVIDIA GPU".
+
+Work Log:
+- Read the user's paste: both halves INCONCLUSIVE, not negative.
+  kernel-side: "timeout: libinput: no such file or directory" — the
+  libinput CLI binary does not exist on their box while the library
+  IS linked and working (compositor runs) — same corruption family
+  as the old seatd package; `pacman -Qk libinput` / `sudo pacman -S
+  libinput` restores it. comp-side: their run had no -v, and every
+  per-event line is XW_LOG_DEBUG, filtered at the default INFO level
+  — "compositor motion: 0" proves nothing either way.
+- Re-traced the static chain with the NVIDIA fact in hand: the input
+  wiring (fd -> dispatch -> handlers) is correct; the cursor is a
+  SOFTWARE cursor (xw-render.c draw_cursor from seat->cursor_x — no
+  hardware cursor plane, so the classic WLR_NO_HARDWARE_CURSORS
+  problem does NOT apply here); damage -> idle repaint -> present
+  all wired.
+- Found the display-side NVIDIA landmine: db_present() parks every
+  frame while waiting_flip is set, and waiting_flip is cleared ONLY
+  by the vblank event in page_flip_complete. The NVIDIA proprietary
+  DRM driver accepts drmModePageFlip() on the legacy path but never
+  delivers the DRM_EVENT_PAGE_FLIP vblank event — waiting_flip then
+  sticks forever, every later frame parks, and the display freezes
+  on the last flipped frame for the whole session while frame
+  callbacks keep flowing. This is a second, INDEPENDENT way to get
+  "picture renders, cursor frozen", and it must be fixed regardless
+  of what the input bisect says.
+- xw-backend-drm.c changes: (1) flip watchdog — recurring 100ms
+  timer (no extra wakeups beyond the loop's own 100ms dispatch
+  timeout); a flip the driver ACCEPTED that is older than
+  XW_FLIP_TIMEOUT_MS (300ms) trips it: a WARN naming the NVIDIA
+  legacy path, the no_flip fallback engages, drmModeSetCrtc pins
+  scanout to bos[current], and the newest frame is copied in — the
+  display un-freezes on the spot; (2) kernel driver identification
+  via drmGetVersion logged at startup ("nvidia" gets an explicit
+  flip-event warning); (3) presentation counters + a 2s INFO stats
+  line for the first 30s (presents/flips/vblank-events/parked/
+  no-flip/in-flight/watchdog); (4) db_destroy removes the two new
+  timer sources.
+- xw-input-libinput.c changes: the input half of the instrumentation
+  — per-type event counters (motion/abs/key/button/axis), one-time
+  INFO "first pointer/key event" markers, and a 2s INFO stats line
+  for the first 30s including live cursor coordinates. After 30s the
+  stats timer removes itself (no long-term log spam). Everything is
+  visible at the DEFAULT log level — that is the whole point.
+- scripts/xw-input-bisect.sh: the kernel half no longer dies when
+  the libinput CLI is missing — it falls back to picking the
+  pointer's event node from /proc/bus/input/devices and counting
+  raw 24-byte evdev records via `sudo timeout 8 dd | wc -c` (no
+  package needed); the dmesg dump still fires on zero. sh -n clean.
+- Rebuilt the dev sysroot in the fresh workspace, full make with
+  -Werror clean, 64/64 tests pass, new log strings verified present
+  in the binary, headless smoke run fine.
+- No push token this session (env scan empty) — 6 commits sit
+  locally, user HEAD is c6ff91a. Deliverables written to download/:
+  a functional patch (git diff origin/main..main limited to src/ and
+  the bisect script) plus full copies of the 3 changed/new files as
+  a copy-over fallback for the case where git apply hits their local
+  script edits.
+
+Stage Summary:
+- Both independent frozen-cursor causes are now covered: (a) the
+  input half is measurable at default log level (stats + first-event
+  markers + raw kernel fallback in the bisect); (b) the NVIDIA
+  legacy page-flip event hole is FIXED by the watchdog — if that was
+  the cause, the cursor starts moving the moment the new build runs.
+- User sequence: apply the patch (or copy the 3 files), make, sudo
+  pacman -S libinput (restore the CLI), then ./scripts/xw-input-
+  bisect.sh with the mouse moving in every window. The [4] verdict +
+  the new stats lines decide the next step: kernel=0 -> hardware/
+  driver; kernel>0 & comp motion=0 -> seat-brokered fds inert (the
+  next code fix is a fallback open path); comp motion>0 & screen
+  still frozen -> flip path (the watchdog WARN + drm stats will show
+  it, and the watchdog already self-heals it).

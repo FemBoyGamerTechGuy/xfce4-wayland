@@ -65,6 +65,16 @@ struct xw_input_libinput {
     int n_open_fail;
     char last_fail_path[128];
     int last_fail_errno;
+    /* startup diagnostics window: per-type event counters printed at
+     * INFO level on a 2s timer for the first 30s. The per-event DEBUG
+     * lines are invisible at the default log level, which made
+     * "devices are open, but is anything arriving?" unanswerable
+     * from a default-level capture — these counters answer it. */
+    uint64_t n_motion, n_abs, n_key, n_button, n_axis;
+    int64_t started_ms;   /* session start (stats reference) */
+    int64_t first_ptr_ms, first_key_ms; /* 0 = not yet seen */
+    struct wl_event_source *stats_src;
+    int stats_ticks;
 };
 
 /* how many evdev nodes exist at all (diagnostics only; libinput owns
@@ -268,6 +278,30 @@ void xw_input_handle_axis(struct xw_input_libinput *in, uint32_t axis,
 
 /* ------------------------------------------------------------ event loop */
 
+/* one-time INFO marker for the first pointer/key event of the session.
+ * With the per-event lines at DEBUG, a default-level log gives zero
+ * evidence either way; this single line separates "events never
+ * arrive" from "events arrive but the cursor still does not move". */
+static void note_first_pointer_event(struct xw_input_libinput *in) {
+    if (in->first_ptr_ms)
+        return;
+    in->first_ptr_ms = xw_now_ms();
+    xw_log(XW_LOG_INFO,
+           "input: first pointer event %.1fs after startup — pointer "
+           "events ARE reaching the compositor",
+           (in->first_ptr_ms - in->started_ms) / 1000.0);
+}
+
+static void note_first_key_event(struct xw_input_libinput *in) {
+    if (in->first_key_ms)
+        return;
+    in->first_key_ms = xw_now_ms();
+    xw_log(XW_LOG_INFO,
+           "input: first key event %.1fs after startup — key events ARE "
+           "reaching the compositor",
+           (in->first_key_ms - in->started_ms) / 1000.0);
+}
+
 static const char *device_name(struct libinput_device *dev) {
     const char *name = libinput_device_get_name(dev);
     return name ? name : "?";
@@ -306,6 +340,8 @@ static void handle_libinput_event(struct xw_input_libinput *in,
         uint32_t code = libinput_event_keyboard_get_key(kev);
         bool down =
             libinput_event_keyboard_get_key_state(kev) == LIBINPUT_KEY_STATE_PRESSED;
+        in->n_key++;
+        note_first_key_event(in);
         xw_log(XW_LOG_DEBUG, "libinput: KEY %u %s", code,
                down ? "down" : "up");
         xw_input_handle_key(in, code, down);
@@ -315,6 +351,8 @@ static void handle_libinput_event(struct xw_input_libinput *in,
         struct libinput_event_pointer *pev = libinput_event_get_pointer_event(ev);
         double dx = libinput_event_pointer_get_dx(pev);
         double dy = libinput_event_pointer_get_dy(pev);
+        in->n_motion++;
+        note_first_pointer_event(in);
         xw_log(XW_LOG_DEBUG, "libinput: POINTER_MOTION dx=%.2f dy=%.2f",
                dx, dy);
         xw_input_handle_pointer_rel(in, dx, dy);
@@ -324,6 +362,8 @@ static void handle_libinput_event(struct xw_input_libinput *in,
         struct libinput_event_pointer *pev = libinput_event_get_pointer_event(ev);
         double x = libinput_event_pointer_get_absolute_x(pev);
         double y = libinput_event_pointer_get_absolute_y(pev);
+        in->n_abs++;
+        note_first_pointer_event(in);
         xw_log(XW_LOG_DEBUG,
                "libinput: POINTER_MOTION_ABSOLUTE x=%.4f y=%.4f", x, y);
         xw_input_handle_pointer_abs(in, x, y);
@@ -334,6 +374,7 @@ static void handle_libinput_event(struct xw_input_libinput *in,
         uint32_t btn = libinput_event_pointer_get_button(pev);
         bool down = libinput_event_pointer_get_button_state(pev) ==
                     LIBINPUT_BUTTON_STATE_PRESSED;
+        in->n_button++;
         xw_log(XW_LOG_DEBUG, "libinput: BUTTON %u %s", btn,
                down ? "down" : "up");
         xw_input_handle_button(in, btn, down);
@@ -357,6 +398,7 @@ static void handle_libinput_event(struct xw_input_libinput *in,
                 continue;
             double value;
             bool continuous;
+            in->n_axis++; /* per axis: one wheel tick can carry both */
             if (src == LIBINPUT_POINTER_AXIS_SOURCE_WHEEL) {
                 /* high-res wheels: 120 units per traditional notch */
                 value = libinput_event_pointer_get_scroll_value_v120(pev, axes[i].li) / 120.0;
@@ -461,6 +503,39 @@ void xw_input_log_acquisition_failure(const char *backend_name,
            "permissions.");
 }
 
+/* -------------------------------------------- startup stats timer --- */
+
+/* 2s INFO summary of everything the input path has seen — the input
+ * half of the "cursor does not move" bisect, visible at the DEFAULT
+ * log level. Runs for the first 30s (a diagnostic capture window),
+ * then removes itself and goes silent. */
+#define XW_INPUT_STATS_MS 2000
+#define XW_INPUT_STATS_TICKS 15
+
+static int input_stats_timer_cb(void *data) {
+    struct xw_input_libinput *in = data;
+    double up = (xw_now_ms() - in->started_ms) / 1000.0;
+    struct xw_seat *s = xw_seat_first(in->comp);
+    xw_log(XW_LOG_INFO,
+           "input: stats %.0fs: motion=%llu abs=%llu key=%llu button=%llu "
+           "axis=%llu cursor=%d,%d%s",
+           up, (unsigned long long)in->n_motion,
+           (unsigned long long)in->n_abs, (unsigned long long)in->n_key,
+           (unsigned long long)in->n_button,
+           (unsigned long long)in->n_axis,
+           s ? (int)s->cursor_x : -1, s ? (int)s->cursor_y : -1,
+           (in->n_motion || in->n_abs)
+               ? ""
+               : " [no pointer events yet — wiggle the mouse]");
+    if (++in->stats_ticks >= XW_INPUT_STATS_TICKS) {
+        wl_event_source_remove(in->stats_src);
+        in->stats_src = NULL;
+        return 0; /* source removed; nothing more to schedule */
+    }
+    wl_event_source_timer_update(in->stats_src, XW_INPUT_STATS_MS);
+    return 0;
+}
+
 /* --------------------------------------------------------------- create */
 
 /* Splits a colon-separated device list. Returns the number of paths
@@ -491,6 +566,7 @@ struct xw_input_libinput *xw_input_libinput_create(struct xw_compositor *c) {
     if (!in)
         return NULL;
     in->comp = c;
+    in->started_ms = xw_now_ms();
     /* the udev seat grouping tag: prefer the name the seat provider
      * actually negotiated (seatd servers name their seat in the
      * SEAT_OPENED reply); fall back to the config value, then "seat0" */
@@ -607,6 +683,12 @@ struct xw_input_libinput *xw_input_libinput_create(struct xw_compositor *c) {
         }
     }
 
+    /* startup stats window (see input_stats_timer_cb): the definitive
+     * "events or no events" line at default log level */
+    in->stats_src = wl_event_loop_add_timer(c->loop, input_stats_timer_cb, in);
+    if (in->stats_src)
+        wl_event_source_timer_update(in->stats_src, XW_INPUT_STATS_MS);
+
     return in;
 
 fail:
@@ -620,6 +702,8 @@ fail:
 void xw_input_libinput_destroy(struct xw_input_libinput *in) {
     if (!in)
         return;
+    if (in->stats_src)
+        wl_event_source_remove(in->stats_src);
     if (in->fd_src)
         wl_event_source_remove(in->fd_src);
     /* draining unreturned events keeps the log honest on teardown */

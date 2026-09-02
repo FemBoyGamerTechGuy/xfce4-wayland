@@ -14,6 +14,11 @@
 #       /dev/input directly, NO compositor, NO libseat involved).
 #       If motion lines appear here, mouse + kernel + libinput are
 #       all fine and the problem is on the compositor side.
+#       (2026-09-03: if the libinput CLI is missing — it was on the
+#       user's machine, same corruption family as the old seatd
+#       breakage — the half falls back to a raw `dd` read of the
+#       mouse's event node and counts 24-byte evdev records; no
+#       package needed)
 #   [2] COMPOSITOR half — the bare compositor, -v, with the mouse
 #       wiggled the whole window; the script then COUNTS the
 #       motion/key/button debug lines and prints a verdict:
@@ -125,8 +130,46 @@ if command -v libinput >/dev/null 2>&1; then
         say " will only be able to rule on the compositor half)"
     fi
 else
-    say "(no /usr/bin/libinput tool on PATH — the kernel half cannot run;"
-    say " install the libinput package if it is truly missing)"
+    say "(no libinput CLI on PATH — the compositor links libinput.so"
+    say " fine, so this is another damaged package like seatd was;"
+    say " restore it later with: sudo pacman -S libinput)"
+    say "(kernel half falls back to a RAW evdev read — no package needed)"
+    MOUSENODE=$(awk -v RS='' '/H: Handlers=.*mouse/ {
+        match($0, /event[0-9]+/)
+        if (RSTART > 0) { print "/dev/input/" substr($0, RSTART, RLENGTH); exit }
+    }' /proc/bus/input/devices 2>/dev/null)
+    if [ -z "$MOUSENODE" ]; then
+        say "(no pointer event node found in /proc/bus/input/devices —"
+        say " the kernel half cannot run at all; the verdict below can"
+        say " only rule on the compositor half)"
+    elif [ "$(id -u)" -eq 0 ] || ask "read raw events from $MOUSENODE for 8s as root? (mouse must move!)"; then
+        say ""
+        say ">>> MOVE THE MOUSE CONTINUOUSLY FOR THE NEXT 8 SECONDS <<<"
+        sleep 1
+        say "\$ (sudo) timeout 8 dd if=$MOUSENODE bs=24 2>/dev/null | wc -c"
+        if [ "$(id -u)" -eq 0 ]; then
+            EVBYTES=$(timeout 8 dd if="$MOUSENODE" bs=24 2>/dev/null | wc -c) || EVBYTES=0
+        else
+            EVBYTES=$(sudo timeout 8 dd if="$MOUSENODE" bs=24 2>/dev/null | wc -c) || EVBYTES=0
+        fi
+        say "   raw evdev bytes read in 8s from $MOUSENODE: $EVBYTES"
+        KTESTED=1
+        KMOVES=$((EVBYTES / 24))
+        say "CHECK: kernel half (raw): $KMOVES evdev record(s) of ANY kind"
+        say "(motion+key+button together — 24 bytes per kernel event)"
+        if [ "$KMOVES" -eq 0 ]; then
+            say "(zero raw events under ROOT — below the compositor entirely."
+            say " dmesg tail:"
+            if [ "$(id -u)" -eq 0 ]; then
+                rp "dmesg | tail -n 30"
+            else
+                sudo_log dmesg
+            fi
+        fi
+    else
+        say "(declined — the kernel half stays untested; the verdict below"
+        say " will only be able to rule on the compositor half)"
+    fi
 fi
 
 # ---- [2] COMPOSITOR half -----------------------------------------------------
