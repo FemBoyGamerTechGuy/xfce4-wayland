@@ -281,6 +281,19 @@ void xw_input_handle_button(struct xw_input_libinput *in,
 void xw_input_handle_axis(struct xw_input_libinput *in, uint32_t axis,
                           double value, bool continuous);
 
+/* Explicit input-acquisition failure report: the structured diagnostic
+ * printed when the compositor acquired no keyboard AND no pointer
+ * through the active seat provider (real TTY sessions). Pure formatter
+ * over plain arguments so tests can drive every branch without
+ * hardware. fail_path may be NULL; fail_errno 0 = no recorded error. */
+void xw_input_log_acquisition_failure(const char *backend_name,
+                                      const char *seat_provider,
+                                      const char *seat_name,
+                                      bool session_active, int nodes_present,
+                                      int devices_acquired, int keyboards,
+                                      int pointers, const char *fail_path,
+                                      int fail_errno);
+
 /* ------------------------------------------------------------------- seat */
 struct xw_window;
 
@@ -557,6 +570,7 @@ struct xw_layer_surface {
 
     int x, y, w, h;               /* current geometry, global coords */
     bool mapped;
+    char namespace[32];           /* client-declared identity, for logs */
     struct wl_list link;          /* wm.layers[layer] */
 };
 

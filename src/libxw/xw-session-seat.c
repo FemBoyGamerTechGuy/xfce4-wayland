@@ -676,11 +676,19 @@ static struct xw_seat_ls *ls_of(struct xw_seat_session *s) {
 
 static void ls_log(enum libseat_log_level level, const char *fmt,
                    va_list args) {
-    (void)level; /* probing failures are expected during AUTO detection;
-                  * keep libseat chatter at DEBUG */
+    /* libseat's own backend selection messages ("opened seat through
+     * logind", "seatd socket unavailable", ...) are the ONLY place the
+     * active backend name is stated: route ERROR as WARN and INFO as
+     * INFO so a real-session log answers "which libseat backend is
+     * active" without guesswork; DEBUG stays DEBUG */
     char buf[256];
     vsnprintf(buf, sizeof(buf), fmt, args);
-    xw_log(XW_LOG_DEBUG, "seat: libseat: %s", buf);
+    enum xw_log_level xw = XW_LOG_DEBUG;
+    if (level == LIBSEAT_LOG_LEVEL_ERROR)
+        xw = XW_LOG_WARN;
+    else if (level == LIBSEAT_LOG_LEVEL_INFO)
+        xw = XW_LOG_INFO;
+    xw_log(xw, "seat: libseat: %s", buf);
 }
 
 static void ls_on_enable(struct libseat *ls, void *ud) {
@@ -996,6 +1004,36 @@ fail:
 
 /* ------------------------------------------------------------- open + pick */
 
+/* Read-only probes of the machine's seat-management environment — the
+ * facts a real-session log must state up front so "which provider
+ * should have been used" can be answered from one run: is libseat
+ * compiled in, is a seat manager actually present. Never used for
+ * selection (selection is by trying, above), only for diagnostics. */
+static void seat_report_environment(void) {
+#ifdef XW_HAVE_LIBSEAT
+    const char *libseat = "compiled in";
+#else
+    const char *libseat = "not compiled into this build";
+#endif
+    bool seatd_sock = access(seatd_socket_path(), F_OK) == 0;
+    bool logind = access("/run/systemd/seats/", F_OK) == 0;
+    bool elogind = access("/run/elogind/", F_OK) == 0;
+    bool dbus =
+        (access("/run/dbus/system_bus_socket", F_OK) == 0) ||
+        (getenv("DBUS_SYSTEM_BUS_ADDRESS") != NULL);
+    const char *sock_env = getenv("SEATD_SOCK");
+    xw_log(XW_LOG_INFO,
+           "seat: environment: libseat %s; seatd socket %s%s%s; %s",
+           libseat, seatd_socket_path(), sock_env && *sock_env ? " ($SEATD_SOCK)" : "",
+           seatd_sock ? ": present" : ": absent", logind
+                          ? "systemd-logind is booted (/run/systemd/seats)"
+                          : elogind ? "elogind is present (/run/elogind)"
+                                    : "no logind/elogind");
+    xw_log(XW_LOG_INFO, "seat: environment: system d-bus %s",
+           dbus ? "present" : "absent (logind/libseat logind backend "
+                              "needs it)");
+}
+
 int xw_seat_session_ack_disable(struct xw_seat_session *s) {
     if (!s || !s->impl->ack_disable)
         return 0;
@@ -1058,28 +1096,31 @@ struct xw_seat_session *xw_seat_session_open(struct xw_compositor *c, int provid
     }
 
     /* XW_SEAT_PROVIDER_AUTO: capability detection, in preference order.
-     * Each failure is logged at DEBUG so --verbose explains every try. */
+     * Each failure is logged at INFO — "which provider did the session
+     * actually use and why" is the first question of every real-TTY
+     * debug, so the try/reject trail must survive --verbose. */
     {
+        seat_report_environment();
 #ifdef XW_HAVE_LIBSEAT
-        xw_log(XW_LOG_DEBUG, "seat: trying libseat (wraps logind/elogind/"
+        xw_log(XW_LOG_INFO, "seat: trying libseat (wraps logind/elogind/"
                              "seatd as configured by the system)");
         struct xw_seat_session *s = libseat_create(c, seat);
         if (s)
             return s;
-        xw_log(XW_LOG_DEBUG, "seat: libseat unavailable (%s)",
+        xw_log(XW_LOG_INFO, "seat: libseat unavailable (%s)",
                strerror(errno));
 #else
-        xw_log(XW_LOG_DEBUG,
+        xw_log(XW_LOG_INFO,
                "seat: libseat not compiled in — trying built-in providers");
 #endif
-        xw_log(XW_LOG_DEBUG, "seat: trying the built-in seatd client (%s)",
+        xw_log(XW_LOG_INFO, "seat: trying the built-in seatd client (%s)",
                seatd_socket_path());
         struct xw_seat_session *sd = seatd_create(c, seat);
         if (sd)
             return sd;
-        xw_log(XW_LOG_DEBUG, "seat: seatd socket not usable (%s)",
+        xw_log(XW_LOG_INFO, "seat: seatd socket not usable (%s)",
                seatd_socket_path());
-        xw_log(XW_LOG_DEBUG,
+        xw_log(XW_LOG_INFO,
                "seat: trying a direct VT session (/dev/tty)");
         struct xw_seat_session *dr = direct_create(c, seat);
         if (dr)

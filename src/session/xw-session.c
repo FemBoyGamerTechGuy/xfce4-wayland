@@ -73,6 +73,8 @@ struct session {
     bool restarting;          /* re-exec instead of plain exit */
     bool nested;              /* desktop runs inside the parent session */
     bool verbose;             /* un-silence the compositor's diagnostics */
+    bool want_panel;          /* launch the panel as a session component
+                               * (like xfce4-session starts xfce4-panel) */
     /* backend selection (explicit --backend or auto):
      *   drm — real KMS session through a seat provider (never falls
      *         back; failure is fatal with diagnostics)
@@ -607,6 +609,96 @@ static void run_autostart(void) {
 
 /* --------------------------------------------------------- runtime spawns */
 
+static pid_t spawn_runtime(const char *exec, const char *name);
+
+/* PATH lookup for a session component (no shell): fills out[0] with the
+ * first executable directory hit. Returns false when not found. */
+static bool search_path(const char *name, char *out, size_t outn) {
+    const char *path = getenv("PATH");
+    if (!path || !*path)
+        return false;
+    const char *p = path;
+    while (*p) {
+        const char *colon = strchr(p, ':');
+        size_t len = colon ? (size_t)(colon - p) : strlen(p);
+        if (len > 0 && len < outn - strlen(name) - 2) {
+            snprintf(out, outn, "%.*s/%s", (int)len, p, name);
+            if (access(out, X_OK) == 0)
+                return true;
+        }
+        if (!colon)
+            break;
+        p = colon + 1;
+    }
+    return false;
+}
+
+/* The panel is a first-class session component, not an autostart app:
+ * xfce4-session starts xfce4-panel itself, and a build-tree session
+ * (no system install, no ~/.config/autostart) must still have a panel.
+ * Resolution order: $XW_PANEL_CMD ("none" disables), the binary next
+ * to this session manager (build/bin layout), /usr/local/bin, PATH.
+ * Returns NULL (with a logged reason) when no panel exists at all. */
+static const char *find_panel(void) {
+    const char *env = getenv("XW_PANEL_CMD");
+    if (env && *env) {
+        if (strcmp(env, "none") == 0 || strcmp(env, "off") == 0) {
+            log_msg("info", "panel: disabled via $XW_PANEL_CMD");
+            return NULL;
+        }
+        return env;
+    }
+    static char path[1024];
+    /* sibling of this binary: <dir>/xw-panel (build/bin layout) */
+    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 32);
+    if (n > 0) {
+        path[n] = 0;
+        char *slash = strrchr(path, '/');
+        if (slash) {
+            snprintf(slash + 1, sizeof(path) - (slash + 1 - path), "xw-panel");
+            if (access(path, X_OK) == 0)
+                return path;
+        }
+    }
+    if (access("/usr/local/bin/xw-panel", X_OK) == 0)
+        return "/usr/local/bin/xw-panel";
+    if (search_path("xw-panel", path, sizeof(path)))
+        return path;
+    log_msg("info", "panel: no xw-panel binary found next to the session "
+                    "manager, in /usr/local/bin or on PATH — starting "
+                    "without one (build it, or set $XW_PANEL_CMD)");
+    return NULL;
+}
+
+/* Start the panel unless disabled, already running (re-login/restart
+ * flows — same duplicate rule as autostart) or spawnable-free. Runs
+ * after the compositor is ready; user autostart entries for xw-panel
+ * are then skipped as duplicates, so exactly one panel exists. */
+static void start_panel(void) {
+    if (!S.want_panel) {
+        log_msg("info", "panel: skipped (--no-panel)");
+        return;
+    }
+    const char *cmd = find_panel();
+    if (!cmd)
+        return;
+    if (already_running(cmd)) {
+        log_msg("info", "panel: already running — reusing it");
+        return;
+    }
+    /* --verbose lights the panel's startup-chain trace too: the child
+     * copies the environment at fork (inside spawn_runtime), so the
+     * parent unsets it right after to keep autostart apps clean */
+    if (S.verbose)
+        setenv("XW_PANEL_TRACE", "1", 1);
+    pid_t pid = spawn_runtime(cmd, "xw-panel");
+    if (S.verbose)
+        unsetenv("XW_PANEL_TRACE");
+    if (pid > 0)
+        log_msg("info", "panel: started as a session component (pid %d)",
+                (int)pid);
+}
+
 /* fork + exec via /bin/sh -c, tracked as a supervised session child
  * (same environment as autostart).  Returns the pid or -1. */
 static pid_t spawn_runtime(const char *exec, const char *name) {
@@ -879,6 +971,10 @@ static void usage(const char *prog) {
            "                        overrides the auto-choice)\n"
            "  -S, --ctl-name NAME   control socket name (default: xw-session)\n"
            "  -n, --no-autostart    skip XDG autostart entries\n"
+           "  -p, --no-panel        skip the session panel (it is a session\n"
+           "                        component like xfce4-panel, started even\n"
+           "                        without autostart entries; $XW_PANEL_CMD=none\n"
+           "                        does the same)\n"
            "  -V, --verbose         show seat/backend diagnostics from the\n"
            "                        compositor (seat provider, DRM device,\n"
            "                        connector, mode, socket, input devices)\n"
@@ -891,11 +987,13 @@ int main(int argc, char **argv) {
     bool autostart = true;
     S.nested = false;
     S.verbose = false;
+    S.want_panel = true;
     S.backend = SB_AUTO;
 
     static const struct option longopts[] = {
         {"ctl-name", required_argument, NULL, 'S'},
         {"no-autostart", no_argument, NULL, 'n'},
+        {"no-panel", no_argument, NULL, 'p'},
         {"nested", no_argument, NULL, 'N'},
         {"backend", required_argument, NULL, 'B'},
         {"verbose", no_argument, NULL, 'V'},
@@ -903,13 +1001,16 @@ int main(int argc, char **argv) {
         {0, 0, 0, 0},
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "S:nNB:Vh", longopts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "S:npB:Vh", longopts, NULL)) != -1) {
         switch (opt) {
         case 'S':
             ctl_name = optarg;
             break;
         case 'n':
             autostart = false;
+            break;
+        case 'p':
+            S.want_panel = false;
             break;
         case 'N':
             S.nested = true;
@@ -980,11 +1081,16 @@ int main(int argc, char **argv) {
     if (ctl_fd < 0)
         goto out;
 
-    /* 3. autostart applications */
+    /* 3. the panel: a session component (like xfce4-panel inside
+     * xfce4-session), not an autostart app — a build-tree session
+     * with no ~/.config/autostart still gets a panel */
+    start_panel();
+
+    /* 4. autostart applications */
     if (autostart)
         run_autostart();
 
-    /* 4. main loop: ctl requests + child supervision */
+    /* 5. main loop: ctl requests + child supervision */
     log_msg("info", "session ready (ctl %s)", S.ctl_path);
     while (!g_terminate) {
         struct pollfd pfd = {.fd = ctl_fd, .events = POLLIN};

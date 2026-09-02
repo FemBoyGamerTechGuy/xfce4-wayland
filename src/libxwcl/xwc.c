@@ -725,6 +725,15 @@ struct xwc_layer *xwc_layer_create(struct xwc *c,
                                   const struct xwc_callbacks *cb,
                                   uint32_t layer, uint32_t anchors,
                                   int exclusive_zone, int w, int h) {
+    /* a compositor without the layer-shell global (wrong
+     * WAYLAND_DISPLAY, bare wl_compositor) must fail cleanly, not
+     * dereference a NULL proxy */
+    if (!c->layer_shell) {
+        fprintf(stderr,
+                "xwc: no zwlr_layer_shell_v1 global — this compositor has "
+                "no layer-shell; cannot create a layer surface\n");
+        return NULL;
+    }
     struct xwc_layer *l = calloc(1, sizeof(*l));
     if (!l)
         return NULL;

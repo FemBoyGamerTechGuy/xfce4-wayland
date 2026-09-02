@@ -391,6 +391,30 @@ traditional group-based systems add yourself to `video` and `input`
 (historical Unix permissions — your distribution's own mechanism, no
 permission hacks from this project).
 
+### Input devices: what each seat provider grants
+
+A visible cursor proves only scanout — **input needs its own device
+access**, and each provider gets it differently:
+
+| Provider | Who may open `/dev/input/event*` | If missing you see |
+|---|---|---|
+| `libseat`/`seatd` | the seat daemon (it holds the fds; your compositor only asks) | `the seat provider refused device ...` + the acquisition report |
+| `direct` on logind/elogind | the **active** login session's udev ACLs | `last open failure: /dev/input/eventN: Permission denied` |
+| `direct` without a session manager | `input` group membership (`sudo usermod -aG input $USER`, then **log out and back in**) | same EACCES report |
+
+The diagnostic contract: when no keyboard **and** no pointer could be
+acquired, the compositor prints one structured report naming the seat
+provider, seat name, session state, backend, how many `/dev/input`
+nodes exist, how many devices were acquired, and the exact last error
+— plus the legitimate fixes above. It never runs as root, never
+chmods devices, and never fakes input. With `xw-session
+--backend=drm --verbose` you additionally get per-event traces
+(`libinput: POINTER_MOTION dx=… dy=…` → `xw-input: pointer motion ->
+x,y` → `compositor: cursor position updated -> x,y`), every device
+open (`/dev/input/eventN opened through seat provider X (fd N)`), and
+the panel's full startup chain — so a dead input path can be localized
+to the exact step from one log.
+
 ### What is hardware-dependent (honest status)
 
 * Implemented and exercised by tests in this repository: seat provider

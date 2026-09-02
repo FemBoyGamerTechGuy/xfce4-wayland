@@ -27,6 +27,7 @@
  */
 #include "xw-internal.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -55,7 +56,31 @@ struct xw_input_libinput {
     } seat_devs[16];
     int n_seat_devs;
     bool path_mode; /* XW_INPUT_DEVICES set: device list is fixed */
+    /* acquisition bookkeeping for the startup report: every device
+     * libinput successfully added (with its capabilities) and every
+     * failed device open, so "cursor visible but input dead" has an
+     * explicit, structured explanation in the log instead of a bare
+     * permission-denied line the user cannot act on */
+    int n_added, n_kbd, n_ptr;
+    int n_open_fail;
+    char last_fail_path[128];
+    int last_fail_errno;
 };
+
+/* how many evdev nodes exist at all (diagnostics only; libinput owns
+ * real discovery) */
+static int count_event_nodes(void) {
+    DIR *d = opendir("/dev/input");
+    if (!d)
+        return 0;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(d)))
+        if (strncmp(de->d_name, "event", 5) == 0)
+            n++;
+    closedir(d);
+    return n;
+}
 
 /* ------------------------------------------------------- open/close glue */
 
@@ -64,23 +89,46 @@ struct xw_input_libinput {
  * access, and libinput's open_restricted is exactly the hook it uses.
  * Without a seat (headless + XW_INPUT_DEVICES debugging) this is a
  * plain privileged-free open(). */
+static void note_open_failure(struct xw_input_libinput *in, const char *path,
+                              int e) {
+    in->n_open_fail++;
+    snprintf(in->last_fail_path, sizeof(in->last_fail_path), "%s", path);
+    in->last_fail_errno = e;
+}
+
 static int open_restricted(const char *path, int flags, void *ud) {
     struct xw_input_libinput *in = ud;
     int fd = -1;
     if (in->comp->seat) {
         int dev_id = xw_seat_session_open_device(in->comp->seat, path, &fd);
-        if (dev_id < 0)
+        if (dev_id < 0) {
+            note_open_failure(in, path, errno);
+            xw_log(XW_LOG_ERROR,
+                   "input: the seat provider (%s) refused device %s: %s",
+                   xw_seat_session_desc(in->comp->seat), path,
+                   strerror(errno));
             return -1;
+        }
         if (in->n_seat_devs < 16) {
             in->seat_devs[in->n_seat_devs].fd = fd;
             in->seat_devs[in->n_seat_devs].dev_id = dev_id;
             in->n_seat_devs++;
         }
+        /* the anti-pattern this line rules out: acquire through the
+         * seat, ignore the returned fd, then open /dev/input/event*
+         * directly. libinput will read THIS fd — the one the seat
+         * manager granted — and nothing else. */
+        xw_log(XW_LOG_INFO,
+               "input: %s opened through seat provider %s (fd %d, "
+               "seat device id %d)",
+               path, xw_seat_session_desc(in->comp->seat), fd, dev_id);
     } else {
         fd = open(path, flags | O_CLOEXEC | O_NONBLOCK);
-        if (fd < 0)
+        if (fd < 0) {
+            note_open_failure(in, path, errno);
             xw_log(XW_LOG_WARN, "input: cannot open device %s: %s", path,
                    strerror(errno));
+        }
     }
     return fd;
 }
@@ -180,6 +228,7 @@ void xw_input_handle_pointer_rel(struct xw_input_libinput *in, double dx,
         return;
     int nx = clampi(s->cursor_x + step_x, bx, bx + bw - 1);
     int ny = clampi(s->cursor_y + step_y, by, by + bh - 1);
+    xw_log(XW_LOG_DEBUG, "xw-input: pointer motion -> %d,%d", nx, ny);
     xw_compositor_inject_pointer_motion(in->comp, nx, ny);
 }
 
@@ -198,6 +247,7 @@ void xw_input_handle_pointer_abs(struct xw_input_libinput *in, double nx,
         ny = 1.0;
     int x = bx + (int)lround(nx * (bw - 1));
     int y = by + (int)lround(ny * (bh - 1));
+    xw_log(XW_LOG_DEBUG, "xw-input: pointer abs -> %d,%d", x, y);
     xw_compositor_inject_pointer_motion(in->comp, x, y);
 }
 
@@ -231,12 +281,19 @@ static void handle_libinput_event(struct xw_input_libinput *in,
     switch (type) {
     case LIBINPUT_EVENT_DEVICE_ADDED: {
         struct libinput_device *dev = libinput_event_get_device(ev);
-        xw_log(XW_LOG_INFO, "input: device added: %s (%s)", device_name(dev),
-               libinput_device_has_capability(dev, LIBINPUT_DEVICE_CAP_KEYBOARD)
-                   ? "keyboard"
-                   : libinput_device_has_capability(dev, LIBINPUT_DEVICE_CAP_POINTER)
-                         ? "pointer"
-                         : "other");
+        bool kbd = libinput_device_has_capability(
+            dev, LIBINPUT_DEVICE_CAP_KEYBOARD);
+        bool ptr = libinput_device_has_capability(
+            dev, LIBINPUT_DEVICE_CAP_POINTER);
+        in->n_added++;
+        if (kbd)
+            in->n_kbd++;
+        if (ptr)
+            in->n_ptr++;
+        xw_log(XW_LOG_INFO, "input: device added: %s (%s%s%s)",
+               device_name(dev), kbd ? "keyboard" : "",
+               kbd && ptr ? "+" : "", !kbd && !ptr ? "other"
+                                               : ptr ? "pointer" : "");
         break;
     }
     case LIBINPUT_EVENT_DEVICE_REMOVED: {
@@ -249,6 +306,8 @@ static void handle_libinput_event(struct xw_input_libinput *in,
         uint32_t code = libinput_event_keyboard_get_key(kev);
         bool down =
             libinput_event_keyboard_get_key_state(kev) == LIBINPUT_KEY_STATE_PRESSED;
+        xw_log(XW_LOG_DEBUG, "libinput: KEY %u %s", code,
+               down ? "down" : "up");
         xw_input_handle_key(in, code, down);
         break;
     }
@@ -256,6 +315,8 @@ static void handle_libinput_event(struct xw_input_libinput *in,
         struct libinput_event_pointer *pev = libinput_event_get_pointer_event(ev);
         double dx = libinput_event_pointer_get_dx(pev);
         double dy = libinput_event_pointer_get_dy(pev);
+        xw_log(XW_LOG_DEBUG, "libinput: POINTER_MOTION dx=%.2f dy=%.2f",
+               dx, dy);
         xw_input_handle_pointer_rel(in, dx, dy);
         break;
     }
@@ -263,6 +324,8 @@ static void handle_libinput_event(struct xw_input_libinput *in,
         struct libinput_event_pointer *pev = libinput_event_get_pointer_event(ev);
         double x = libinput_event_pointer_get_absolute_x(pev);
         double y = libinput_event_pointer_get_absolute_y(pev);
+        xw_log(XW_LOG_DEBUG,
+               "libinput: POINTER_MOTION_ABSOLUTE x=%.4f y=%.4f", x, y);
         xw_input_handle_pointer_abs(in, x, y);
         break;
     }
@@ -271,6 +334,8 @@ static void handle_libinput_event(struct xw_input_libinput *in,
         uint32_t btn = libinput_event_pointer_get_button(pev);
         bool down = libinput_event_pointer_get_button_state(pev) ==
                     LIBINPUT_BUTTON_STATE_PRESSED;
+        xw_log(XW_LOG_DEBUG, "libinput: BUTTON %u %s", btn,
+               down ? "down" : "up");
         xw_input_handle_button(in, btn, down);
         break;
     }
@@ -301,6 +366,11 @@ static void handle_libinput_event(struct xw_input_libinput *in,
                 value = libinput_event_pointer_get_scroll_value(pev, axes[i].li);
                 continuous = true;
             }
+            xw_log(XW_LOG_DEBUG, "libinput: AXIS %s%s value=%.2f",
+                   axes[i].wl == WL_POINTER_AXIS_VERTICAL_SCROLL
+                       ? "vertical"
+                       : "horizontal",
+                   continuous ? " (continuous)" : " (wheel)", value);
             xw_input_handle_axis(in, axes[i].wl, value, continuous);
         }
         break;
@@ -315,8 +385,13 @@ static void handle_libinput_event(struct xw_input_libinput *in,
 
 static void drain_libinput(struct xw_input_libinput *in) {
     struct libinput_event *ev;
-    while ((ev = libinput_get_event(in->li)))
+    while ((ev = libinput_get_event(in->li))) {
         handle_libinput_event(in, ev);
+        /* libinput contract: every event gotten must be destroyed by
+         * the caller; dropping this leaks one event object per key
+         * press, motion sample and wheel tick in real sessions */
+        libinput_event_destroy(ev);
+    }
 }
 
 static int on_libinput_fd(int fd, uint32_t mask, void *data) {
@@ -337,6 +412,53 @@ static int on_libinput_fd(int fd, uint32_t mask, void *data) {
     }
     drain_libinput(in);
     return 0;
+}
+
+/* ------------------------------------------------ acquisition report */
+
+/* The explicit, structured "input is dead and here is why" report the
+ * real-session contract requires. Printed once at startup when no
+ * keyboard AND no pointer were acquired: a visible cursor proves only
+ * scanout, not input, so this is the line the user must be able to
+ * find and act on. Suggested fixes name the legitimate mechanisms
+ * (seat manager configuration, group membership) — never chmod or
+ * root. */
+void xw_input_log_acquisition_failure(const char *backend_name,
+                                      const char *seat_provider,
+                                      const char *seat_name,
+                                      bool session_active, int nodes_present,
+                                      int devices_acquired, int keyboards,
+                                      int pointers, const char *fail_path,
+                                      int fail_errno) {
+    xw_log(XW_LOG_ERROR,
+           "input: failed to acquire keyboard/pointer devices through "
+           "the active seat\n"
+           "  seat provider:    %s\n"
+           "  seat name:        %s\n"
+           "  session state:    %s\n"
+           "  backend:          %s\n"
+           "  /dev/input:       %d event node(s) present, %d device(s) "
+           "acquired (%d keyboard, %d pointer)",
+           seat_provider ? seat_provider : "none",
+           seat_name ? seat_name : "?",
+           session_active ? "active" : "inactive",
+           backend_name ? backend_name : "?", nodes_present, devices_acquired,
+           keyboards, pointers);
+    if (fail_path && fail_errno)
+        xw_log(XW_LOG_ERROR, "  last open failure: %s: %s", fail_path,
+               strerror(fail_errno));
+    xw_log(XW_LOG_ERROR,
+           "  suggested legitimate configuration fixes:\n"
+           "    - seatd: enable the seatd service and add this user to the\n"
+           "      'seat' group (device fds are granted per active session)\n"
+           "    - logind/elogind: ensure it is running and this login is a\n"
+           "      registered, active session (device ACLs follow it)\n"
+           "    - direct VT sessions (no seat manager): the login's own\n"
+           "      permissions apply — add the user to the 'input' group\n"
+           "      (e.g. usermod -aG input <user>), then log out and back in\n"
+           "  The compositor keeps running (Ctrl+C returns to the TTY); it\n"
+           "  never falls back to running as root or relaxing device "
+           "permissions.");
 }
 
 /* --------------------------------------------------------------- create */
@@ -369,8 +491,13 @@ struct xw_input_libinput *xw_input_libinput_create(struct xw_compositor *c) {
     if (!in)
         return NULL;
     in->comp = c;
-    snprintf(in->seat, sizeof(in->seat), "%s",
-             c->conf.seat_name ? c->conf.seat_name : "seat0");
+    /* the udev seat grouping tag: prefer the name the seat provider
+     * actually negotiated (seatd servers name their seat in the
+     * SEAT_OPENED reply); fall back to the config value, then "seat0" */
+    const char *seat_for_udev =
+        c->seat ? xw_seat_session_name(c->seat)
+                : (c->conf.seat_name ? c->conf.seat_name : "seat0");
+    snprintf(in->seat, sizeof(in->seat), "%s", seat_for_udev);
 
     const char *devlist = getenv("XW_INPUT_DEVICES");
 
@@ -443,6 +570,27 @@ struct xw_input_libinput *xw_input_libinput_create(struct xw_compositor *c) {
      * assign_seat / path_add_device) */
     libinput_dispatch(in->li);
     drain_libinput(in);
+
+    /* acquisition report: a summary line always, the structured
+     * failure report when neither keyboard nor pointer could be
+     * acquired ("cursor visible but input dead" must be explicit) */
+    {
+        int nodes = count_event_nodes();
+        const char *via = c->seat ? xw_seat_session_desc(c->seat)
+                                  : "direct open (no seat provider)";
+        xw_log(XW_LOG_INFO,
+               "input: %d device(s) acquired through %s (%d keyboard, %d "
+               "pointer; %d /dev/input event node(s) present%s)",
+               in->n_added, via, in->n_kbd, in->n_ptr, nodes,
+               in->path_mode ? "; path mode" : "");
+        if (in->n_kbd == 0 && in->n_ptr == 0)
+            xw_input_log_acquisition_failure(
+                c->backend ? c->backend->name : "?", via, in->seat,
+                xw_seat_session_active(c->seat), nodes, in->n_added,
+                in->n_kbd, in->n_ptr,
+                in->n_open_fail ? in->last_fail_path : NULL,
+                in->n_open_fail ? in->last_fail_errno : 0);
+    }
 
     return in;
 

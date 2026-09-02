@@ -29,6 +29,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdarg.h>
 
 #include "wlr-layer-shell-unstable-v1.h"
 
@@ -71,6 +72,24 @@ enum {
     BTN_CLOCK,
     BTN_EXIT,
 };
+
+/* Startup chain trace ($XW_PANEL_TRACE=1, or inherited from
+ * xw-session --verbose): one stderr line per step of the
+ * connect -> globals -> layer create -> configure -> buffer ->
+ * commit chain, so "panel missing" can be localized to the exact
+ * broken step from a single real-TTY run. */
+static bool g_trace;
+static void trace(const char *fmt, ...) {
+    if (!g_trace)
+        return;
+    fputs("xw-panel: ", stderr);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
 
 #define MAX_BTNS 64
 
@@ -222,6 +241,12 @@ static void draw(struct panel *p) {
     uint32_t *pix = xwc_layer_pixels(p->layer, &stride);
     if (!pix || stride < 1)
         return;
+    static bool first = true;
+    if (first) {
+        first = false;
+        trace("first buffer ready: %dx%d — attach+commit follows",
+              stride, p->bar_h);
+    }
     int w = stride, h = p->bar_h;
 
     xwc_fill_rect(pix, stride, w, h, 0, 0, w, h, COL_BAR_BG);
@@ -354,6 +379,7 @@ static void on_configure(struct xwc_win *win, int w, int h, void *ud) {
     struct panel *p = ud;
     if (win)
         p->layer = (struct xwc_layer *)win;
+    trace("configure: %dx%d (drawing into a fresh buffer)", w, h);
     p->bar_w = w;
     p->bar_h = h;
     request_layout(p);
@@ -387,6 +413,10 @@ int main(int argc, char **argv) {
 
     struct panel p = {0};
     g_panel = &p;
+    g_trace = getenv("XW_PANEL_TRACE") != NULL;
+    const char *wd = getenv("WAYLAND_DISPLAY");
+    trace("starting: WAYLAND_DISPLAY=%s socket=%s", wd ? wd : "(unset)",
+          socket_name ? socket_name : "(default)");
     clock_read(p.clock, sizeof(p.clock));
     const char *term = getenv("XW_TERMINAL");
     snprintf(p.terminal_cmd, sizeof(p.terminal_cmd), "%s",
@@ -398,9 +428,12 @@ int main(int argc, char **argv) {
 
     if (xwc_connect(&p.c, socket_name) < 0)
         return 1;
+    trace("connected: registry round-trip done (globals bound)");
 
     p.tl = xwc_tasklist_create(&p.c, on_tasklist_changed, &p);
     p.wsp = xwc_wspaces_create(&p.c, on_wspaces_changed, &p);
+    trace("tasklist %s, workspaces %s", p.tl ? "bound" : "unavailable",
+          p.wsp ? "bound" : "unavailable");
 
     struct xwc_callbacks cb = {
         .button = on_button,
@@ -412,6 +445,9 @@ int main(int argc, char **argv) {
     };
     /* top bar spanning the output, reserving its height as exclusive
      * zone; width comes from the anchors (LEFT|RIGHT) */
+    trace("requesting layer: TOP bar, anchors T|L|R, exclusive %d, fixed "
+          "height %d — commit sent, awaiting configure",
+          BAR_H, BAR_H);
     p.layer = xwc_layer_create(
         &p.c, &cb, ZWLR_LAYER_SHELL_V1_LAYER_TOP,
         ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |

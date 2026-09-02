@@ -332,8 +332,9 @@ static void shell_get_layer_surface(struct wl_client *client,
     ls->exclusive_zone = -1; /* auto: derived from committed size */
     ls->configured_w = 0;
     ls->configured_h = 0;
-    if (namespace && *namespace)
-        xw_log(XW_LOG_DEBUG, "layer-shell: namespace '%s'", namespace);
+    /* keep the namespace for lifecycle logs (mapped/unmapped) */
+    snprintf(ls->namespace, sizeof(ls->namespace), "%s",
+             namespace ? namespace : "");
 
     wl_resource_set_implementation(lres, &layer_surface_impl, ls,
                                    layer_surface_resource_destroy);
@@ -386,6 +387,11 @@ void xw_layer_role_commit(struct xw_surface *s) {
         /* a commit with a buffer maps the layer surface */
         if (s->buf_w > 0 || s->buf_h > 0 || ls->configured_w > 0) {
             ls->mapped = true;
+            xw_log(XW_LOG_INFO,
+                   "layer-shell: surface '%s' mapped at %d,%d %dx%d "
+                   "(exclusive zone %d) — rendering it this frame",
+                   ls->namespace[0] ? ls->namespace : "?", ls->x, ls->y,
+                   ls->w, ls->h, ls->exclusive_zone);
             /* a keyboard-interactivity layer claims the keyboard when
              * it maps (the request typically arrives before mapping) */
             if (ls->keyboard_interactivity) {

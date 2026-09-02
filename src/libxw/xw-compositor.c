@@ -512,6 +512,7 @@ void xw_compositor_inject_key(struct xw_compositor *c, uint32_t linux_keycode,
 }
 
 void xw_compositor_inject_pointer_motion(struct xw_compositor *c, int x, int y) {
+    xw_log(XW_LOG_DEBUG, "compositor: cursor position updated -> %d,%d", x, y);
     struct xw_seat *s = xw_seat_first(c);
     if (s)
         xw_seat_pointer_motion(s, x, y);

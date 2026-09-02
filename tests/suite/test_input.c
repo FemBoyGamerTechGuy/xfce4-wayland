@@ -13,6 +13,7 @@
  */
 #include "xwtest.h"
 
+#include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -449,6 +450,28 @@ static void test_input_key_pipeline(struct xwt_ctx *t) {
     ictx_stop(&ic);
 }
 
+/* the explicit acquisition-failure report: a pure formatter over the
+ * startup bookkeeping (device counts, provider, last open error). It
+ * must run in both shapes — with and without a recorded failure —
+ * since the real-TTY bug class it addresses ("cursor visible, input
+ * dead, why?") depends on every field printing, not crashing. */
+static void test_input_acquisition_report(struct xwt_ctx *t) {
+    (void)t;
+    /* no recorded open failure (e.g. zero nodes present at all) */
+    xw_input_log_acquisition_failure(
+        "drm", "direct (vt 3)", "seat0", true, 0, 0, 0, 0, NULL, 0);
+    XWT_CHECK(1, "report without a recorded failure prints");
+    /* the classic shape: nodes exist, the seat refused them */
+    xw_input_log_acquisition_failure(
+        "drm", "direct (vt 3)", "seat0", true, 12, 0, 0, 0,
+        "/dev/input/event5", EACCES);
+    XWT_CHECK(1, "report with a recorded permission failure prints");
+    /* degenerate inputs must not crash the formatter either */
+    xw_input_log_acquisition_failure(NULL, NULL, NULL, false, -1, -1, -1,
+                                     -1, NULL, 0);
+    XWT_CHECK(1, "report tolerates NULL/degenerate fields");
+}
+
 #endif /* XW_HAVE_LIBINPUT */
 
 __attribute__((constructor)) static void register_input(void) {
@@ -462,6 +485,7 @@ __attribute__((constructor)) static void register_input(void) {
         {"input-auto-off", test_input_auto_off},
         {"input-motion-pipeline", test_input_motion_pipeline},
         {"input-key-pipeline", test_input_key_pipeline},
+        {"input-acquisition-report", test_input_acquisition_report},
 #endif
     };
     xwt_register(tests, sizeof(tests) / sizeof(tests[0]));
