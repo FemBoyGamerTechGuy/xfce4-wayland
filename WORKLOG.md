@@ -1039,3 +1039,38 @@ Stage Summary:
     git push origin main
 - Until then the work is safe locally on main ahead of origin by 4
   commits.
+
+---
+Task ID: 2026-09-02-phase4-push-complete
+Agent: main (Super Z)
+Task: re-provision the PAT, push Phase 4, restore and re-verify the
+build environment
+
+Work Log:
+- Container had come back bare again: ~/.git-credentials wiped AND
+  .toolchain gone (build could not have run). Re-provisioned the
+  credential store from the user's re-sent PAT (0600, outside the
+  repo, never echoed into any committed file).
+- `git push origin main`: 007f4ed..08c6367 — all five Phase 4
+  commits (seat+drm, session backend selection, tests, docs,
+  worklog) are on GitHub; local main == origin/main, tree clean.
+- Re-bootstrapped the rootless sysroot with
+  scripts/bootstrap-sysroot.sh (wayland 1.23.1, xkbcommon, libinput,
+  libudev, libdrm, libseat, seatd; wayland-scanner verified).
+- Full re-verification of the SAME tree at HEAD in the fresh
+  environment: `make clean && make` — all four features
+  (XW_HAVE_X11_BACKEND / XW_HAVE_LIBINPUT / XW_HAVE_LIBSEAT /
+  XW_HAVE_DRM_BACKEND), zero warnings under -Werror;
+  `make check` 63/63 in-process; process-level 103/103;
+  build regressions 50/50 (+1 skip); `make asan` PASS
+  (ASan+UBSan+LSan clean, release restored).
+
+Stage Summary:
+- Phase 4 is pushed and independently re-verified after a full
+  environment loss. No code changes were needed — the committed tree
+  rebuilt green from a bare container, which is itself the
+  bootstrap-sysroot.sh disaster-recovery path working as designed.
+- Remaining gaps are unchanged and hardware-gated: physical DRM
+  verification (manual checklist in TESTING.md), live modeset of
+  newly plugged monitors, atomic modesetting, hardware cursor
+  planes, GL/EGL rendering.
