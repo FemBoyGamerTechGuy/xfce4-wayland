@@ -327,7 +327,7 @@ else
     $(warning log will say exactly: "libseat not compiled into this build".)
     $(warning Fix — install the libseat development files and rebuild:)
     $(warning   Debian/Ubuntu: apt install libseat-dev)
-    $(warning   Arch/Artix:    pacman -S libseat)
+    $(warning   Arch/Artix:    pacman -S seatd)
     $(warning   Fedora:        dnf install libseat-devel)
     $(warning   Void:          xbps-install libseat-devel)
     $(warning   Alpine:        apk add libseat-dev)

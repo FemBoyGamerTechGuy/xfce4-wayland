@@ -476,11 +476,17 @@ The fix is one package plus a rebuild:
 | Distribution | Install |
 |---|---|
 | Debian / Ubuntu | `sudo apt install libseat-dev` |
-| Arch / Artix | `sudo pacman -S libseat` |
+| Arch / Artix | `sudo pacman -S seatd` |
 | Fedora | `sudo dnf install libseat-devel` |
 | Void | `sudo xbps-install libseat-devel` |
-| Alpine | `sudo apk add libseat-dev` |
+| Alpine | `sudo apk add seatd seatd-dev` |
 | Gentoo | `sudo emerge gui-libs/libseat` |
+
+On Arch/Artix there is no `libseat` package: the `seatd` package ships
+the daemon **and** the library (`/usr/lib/libseat.so`, `libseat.pc`,
+`seat.h`), so `sudo pacman -S seatd` is the entire install — verify
+with `pkg-config --modversion libseat` before the rebuild. Alpine is
+the same idea under different names (`seatd` + `seatd-dev`).
 
 ```sh
 make clean && make    # feature switches over a built tree need the clean
@@ -640,8 +646,8 @@ packages from the [requirements table](#requirements) as needed.
 ```sh
 sudo pacman -S base-devel wayland wayland-protocols libxkbcommon \
                  pixman libx11 libinput systemd-libs python-pillow
-# real TTY sessions (DRM/KMS + seatd, first-class here; libseat
-# from the AUR/extra is optional):
+# real TTY sessions (DRM/KMS + the seatd daemon, first-class here;
+# the same package also ships libseat for the elogind provider):
 sudo pacman -S libdrm seatd
 # for `make check`:
 sudo pacman -S xorg-server-xvfb libxtst libxi
