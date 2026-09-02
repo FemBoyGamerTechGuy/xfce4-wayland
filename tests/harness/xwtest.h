@@ -83,6 +83,8 @@ struct xwt_ctx {
     struct xw_compositor *comp;
     struct xwc client;
     char socket_name[32];
+    bool client_dead; /* in-process client hit a connection/protocol
+                         error; the pump stops touching its display */
 };
 
 /* Starts a compositor with a unique socket and connects a client.

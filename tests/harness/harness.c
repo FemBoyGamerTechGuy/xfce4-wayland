@@ -12,7 +12,7 @@ static char s_runtimedir[128];
 
 const char *g_runtimedir(void) { return s_runtimedir; }
 
-#define XWT_MAX_TESTS 64
+#define XWT_MAX_TESTS 96
 static struct xwt_test g_tests[XWT_MAX_TESTS];
 static int g_n_tests;
 
@@ -27,16 +27,29 @@ static void xwt_pump_server(void *ud) {
     struct xwt_ctx *t = ud;
     xw_compositor_dispatch(t->comp, 0);
     wl_display_flush(t->client.display);
-    while (wl_display_prepare_read(t->client.display) != 0)
-        wl_display_dispatch_pending(t->client.display);
+    if (t->client_dead)
+        return; /* connection error earlier: stop touching the display —
+                   wl_display_prepare_read spins forever on a dead
+                   connection and used to wedge the whole suite */
+    while (wl_display_prepare_read(t->client.display) != 0) {
+        if (wl_display_dispatch_pending(t->client.display) < 0) {
+            t->client_dead = true;
+            return;
+        }
+    }
     struct pollfd pfd = {.fd = wl_display_get_fd(t->client.display),
                          .events = POLLIN};
     poll(&pfd, 1, 0);
-    if (pfd.revents & POLLIN)
-        wl_display_read_events(t->client.display);
-    else
+    if (pfd.revents & POLLIN) {
+        if (wl_display_read_events(t->client.display) < 0) {
+            t->client_dead = true;
+            return;
+        }
+    } else {
         wl_display_cancel_read(t->client.display);
-    wl_display_dispatch_pending(t->client.display);
+    }
+    if (wl_display_dispatch_pending(t->client.display) < 0)
+        t->client_dead = true;
     xw_compositor_dispatch(t->comp, 0);
 }
 

@@ -369,12 +369,421 @@ static void test_panel_exit_button(struct xwt_ctx *t) {
 /* the launcher + full session wiring (ctl run, real exit dialog spawn)
  * are covered process-level by scripts/test-session.sh */
 
+/* --------------------------------------------------- pointer focus tests */
+
+/* the panel-interaction lifecycle: enter, leave, hover redraw, the
+ * focus pointer itself, and — the UAF regression — focus surviving the
+ * panel process dying while hovered (surface destroyed under focus) */
+static void test_panel_pointer_focus(struct xwt_ctx *t) {
+    pid_t pid = spawn_panel(t, "-focus");
+    XWT_ASSERT(pid > 0);
+    PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
+
+    struct xw_seat *seat = xw_seat_first(t->comp);
+    XWT_ASSERT(seat);
+    struct xw_surface *panel_surf = first_top_layer(t)->surface;
+
+    /* pointer over the bar takes focus on the panel surface */
+    xw_compositor_inject_pointer_motion(t->comp, 640, 14);
+    XWT_WAIT(t, seat->ptr_focus == panel_surf);
+    XWT_CHECK(seat->ptr_focus == panel_surf,
+              "pointer over bar focuses the panel surface");
+
+    /* leaving the bar drops focus (no window below on empty desktop) */
+    xw_compositor_inject_pointer_motion(t->comp, 640, 400);
+    XWT_WAIT(t, seat->ptr_focus == NULL);
+    XWT_CHECK(seat->ptr_focus == NULL, "leaving the bar clears focus");
+
+    /* re-entering restores it */
+    xw_compositor_inject_pointer_motion(t->comp, 640, 14);
+    XWT_WAIT(t, seat->ptr_focus == panel_surf);
+    XWT_CHECK(true, "re-entering the bar re-focuses");
+
+    /* hover feedback proves enter+motion reach the panel CLIENT and it
+     * redraws: the workspace button lights up its hover fill */
+    xw_compositor_inject_pointer_motion(t->comp, 50, 14);
+    /* NOTE: check a pixel INSIDE the button but clear of the software
+     * cursor — the cursor itself is drawn over the hover fill at the
+     * exact pointer position */
+    PANEL_WAIT(t, pixel_at(t, 44, 14) == 0xff3b4252);
+    XWT_CHECK(pixel_at(t, 44, 14) == 0xff3b4252,
+              "workspace button shows the hover fill (enter+motion+redraw)");
+
+    /* THE regression: panel dies while it holds pointer focus. The
+     * surface destroy path must clear ptr_focus BEFORE freeing it — a
+     * stale pointer here is a use-after-free on the next motion and
+     * poisons every later focus decision (frozen-input decay). */
+    XWT_ASSERT(seat->ptr_focus == panel_surf);
+    reap(&pid);
+    XWT_WAIT(t, seat->ptr_focus == NULL);
+    XWT_CHECK(seat->ptr_focus == NULL,
+              "panel death under the cursor clears pointer focus (no UAF)");
+    /* the next motion re-evaluates cleanly against freed memory gone */
+    xw_compositor_inject_pointer_motion(t->comp, 700, 16);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_motion(t->comp, 640, 400);
+    xwt_pump(t);
+    XWT_CHECK(true, "motion after panel death does not crash");
+}
+
+/* late wl_pointer creation must receive the enter replay: a client
+ * that binds wl_seat but creates its wl_pointer AFTER its surface
+ * already holds pointer focus used to get motion events without ever
+ * seeing enter (clients gate all pointer state on enter) */
+static int g_late_enter_count;
+static struct wl_surface *g_late_enter_surface;
+static void late_ptr_enter(void *data, struct wl_pointer *p, uint32_t serial,
+                           struct wl_surface *surface, wl_fixed_t sx,
+                           wl_fixed_t sy) {
+    (void)data;
+    (void)p;
+    (void)serial;
+    (void)sx;
+    (void)sy;
+    g_late_enter_count++;
+    g_late_enter_surface = surface;
+}
+static void late_ptr_leave(void *data, struct wl_pointer *p, uint32_t serial,
+                           struct wl_surface *surface) {
+    (void)data;
+    (void)p;
+    (void)serial;
+    (void)surface;
+}
+static void late_ptr_motion(void *data, struct wl_pointer *p, uint32_t time,
+                            wl_fixed_t sx, wl_fixed_t sy) {
+    (void)data;
+    (void)p;
+    (void)time;
+    (void)sx;
+    (void)sy;
+}
+static void late_ptr_button(void *data, struct wl_pointer *p, uint32_t serial,
+                            uint32_t time, uint32_t button, uint32_t state) {
+    (void)data;
+    (void)p;
+    (void)serial;
+    (void)time;
+    (void)button;
+    (void)state;
+}
+static void late_ptr_axis(void *data, struct wl_pointer *p, uint32_t time,
+                          uint32_t axis, wl_fixed_t value) {
+    (void)data;
+    (void)p;
+    (void)time;
+    (void)axis;
+    (void)value;
+}
+static void late_ptr_frame(void *data, struct wl_pointer *p) {
+    (void)data;
+    (void)p;
+}
+static const struct wl_pointer_listener late_ptr_listener = {
+    .enter = late_ptr_enter,
+    .leave = late_ptr_leave,
+    .motion = late_ptr_motion,
+    .button = late_ptr_button,
+    .axis = late_ptr_axis,
+    .frame = late_ptr_frame,
+};
+
+static void test_late_pointer_enter_replay(struct xwt_ctx *t) {
+    g_late_enter_count = 0;
+    g_late_enter_surface = NULL;
+
+    struct xwc_win *win = xwt_window_solid(t, 0xff334455, 300, 200, "Hovered");
+    XWT_ASSERT(win);
+    XWT_WAIT(t, t->comp->wm->focused && t->comp->wm->focused->title &&
+             strcmp(t->comp->wm->focused->title, "Hovered") == 0);
+
+    /* focus the window with the pointer (cursor 640,400 -> 200x200 at
+     * center placement: map puts windows at the usable-area center) */
+    struct xw_seat *seat = xw_seat_first(t->comp);
+    XWT_ASSERT(seat);
+    int wx = t->comp->wm->focused->x, wy = t->comp->wm->focused->y;
+    xw_compositor_inject_pointer_motion(t->comp, wx + 100, wy + 100);
+    XWT_WAIT(t, seat->ptr_focus &&
+                    seat->ptr_focus->role == XW_SURFACE_ROLE_XDG_TOPLEVEL);
+    XWT_CHECK(seat->ptr_focus == t->comp->wm->focused->surface,
+              "window focused under the cursor");
+
+    /* destroy the client's wl_pointer (simulating a client that creates
+     * it late), then re-create it on the same seat */
+    wl_pointer_destroy(t->client.pointer);
+    t->client.pointer = NULL;
+    t->client.pointer = wl_seat_get_pointer(t->client.seat);
+    XWT_ASSERT(t->client.pointer);
+    wl_pointer_add_listener(t->client.pointer, &late_ptr_listener, NULL);
+
+    XWT_WAIT(t, g_late_enter_count > 0);
+    XWT_CHECK(g_late_enter_count == 1,
+              "late wl_pointer received exactly one enter replay (%d)",
+              g_late_enter_count);
+    XWT_CHECK(g_late_enter_surface &&
+                  wl_proxy_get_id((struct wl_proxy *)g_late_enter_surface) ==
+                      wl_resource_get_id(t->comp->wm->focused->surface->res),
+              "enter replay names the focused surface");
+
+    xwc_win_destroy(win);
+}
+
+/* the launcher button: resolves a terminal ($XW_TERMINAL wins) and
+ * sends the ctl 'run <terminal>' line to the session manager */
+static void test_panel_launcher(struct xwt_ctx *t) {
+    char ctl_path[192];
+    snprintf(ctl_path, sizeof(ctl_path), "%s/xw-session.sock",
+             g_runtimedir());
+    unlink(ctl_path);
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    int ncpy = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", ctl_path);
+    XWT_ASSERT(ncpy >= 0 && (size_t)ncpy < sizeof(addr.sun_path));
+    XWT_ASSERT(bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    XWT_ASSERT(listen(lfd, 4) == 0);
+
+    setenv("XW_TERMINAL", "/bin/true", 1); /* inherited by the panel */
+    pid_t pid = spawn_panel(t, "-launcher");
+    unsetenv("XW_TERMINAL");
+    XWT_ASSERT(pid > 0);
+    PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
+
+    /* launcher occupies x=3..39 at bar height 28 */
+    xw_compositor_inject_pointer_motion(t->comp, 20, 14);
+    pump_ms(t, 60);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+
+    char line[128] = {0};
+    bool got = false;
+    for (int i = 0; i < 600 && !got; i++) {
+        xwt_pump(t);
+        struct pollfd pfd = {.fd = lfd, .events = POLLIN};
+        if (poll(&pfd, 1, 0) == 1) {
+            int cfd = accept(lfd, NULL, NULL);
+            if (cfd >= 0) {
+                ssize_t n = read(cfd, line, sizeof(line) - 1);
+                if (n > 0) {
+                    line[n] = 0;
+                    got = true;
+                    dprintf(cfd, "ok spawned\n");
+                }
+                close(cfd);
+            }
+        }
+        usleep(10000);
+    }
+    XWT_CHECK(got && strncmp(line, "run /bin/true", 13) == 0,
+              "launcher sent the resolved terminal (got '%.60s')",
+              got ? line : "(none)");
+
+    pump_ms(t, 100);
+    XWT_CHECK(kill(pid, 0) == 0, "panel alive after launcher click");
+    reap(&pid);
+    unlink(ctl_path);
+    close(lfd);
+}
+
+/* v0 documented behavior: the clock is display-only — a click neither
+ * crashes the panel nor fires any session action */
+static void test_panel_clock_click(struct xwt_ctx *t) {
+    char ctl_path[192];
+    snprintf(ctl_path, sizeof(ctl_path), "%s/xw-session.sock",
+             g_runtimedir());
+    unlink(ctl_path);
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    int ncpy = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", ctl_path);
+    XWT_ASSERT(ncpy >= 0 && (size_t)ncpy < sizeof(addr.sun_path));
+    XWT_ASSERT(bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    XWT_ASSERT(listen(lfd, 4) == 0);
+
+    pid_t pid = spawn_panel(t, "-clock");
+    XWT_ASSERT(pid > 0);
+    PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
+
+    /* locate the exit button (red fill) — the clock is its left
+     * neighbor; click inside the clock, clear of the gap */
+    int red_x = -1;
+    for (int i = 0; i < 2000 && red_x < 0; i++) {
+        xwt_pump(t);
+        for (int x = 800; x < 1280; x++) {
+            if (pixel_at(t, x, 14) == 0xffa33434) {
+                red_x = x;
+                break;
+            }
+        }
+        if (red_x < 0)
+            usleep(10000);
+    }
+    XWT_ASSERT(red_x > 0);
+    int clock_x = red_x - 30;
+    int ws_before = t->comp->wm->ws_current;
+
+    xw_compositor_inject_pointer_motion(t->comp, clock_x, 14);
+    pump_ms(t, 60);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    pump_ms(t, 200);
+
+    XWT_CHECK(kill(pid, 0) == 0, "panel alive after clock click (v0)");
+    XWT_CHECK(t->comp->wm->ws_current == ws_before,
+              "clock click changed nothing (display-only v0)");
+    struct pollfd pfd = {.fd = lfd, .events = POLLIN};
+    XWT_CHECK(poll(&pfd, 1, 200) == 0,
+              "clock click fired no session action");
+
+    reap(&pid);
+    unlink(ctl_path);
+    close(lfd);
+}
+
+/* layer surface created while the compositor has NO outputs: the
+ * request used to be silently dropped (unbound object id) and the
+ * client disconnected on its next request. It must be held, then
+ * adopted + configured when an output appears. */
+static void test_layer_before_outputs(struct xwt_ctx *t) {
+    /* the connect roundtrip can return while the client's bind
+     * requests are still queued server-side (the sync reply overtakes
+     * nothing — the pump dispatches the server BEFORE the client
+     * flushes its binds). Pump until the server has digested them, or
+     * destroying the output below rejects the queued wl_output bind
+     * with a protocol error. */
+    pump_ms(t, 150);
+
+    /* remove the headless output: the backend keeps no references, the
+     * render loop iterates the (now empty) list */
+    struct xw_output *o;
+    XWT_ASSERT(!wl_list_empty(&t->comp->outputs));
+    o = wl_container_of(t->comp->outputs.next, o, link);
+    xw_output_destroy(o);
+    XWT_CHECK(wl_list_empty(&t->comp->outputs), "output removed");
+
+    pid_t pid = spawn_panel(t, "-nooutputs");
+    XWT_ASSERT(pid > 0);
+    pump_ms(t, 400);
+    /* the panel must SURVIVE creating a layer surface with no outputs
+     * (protocol kill = instant exit under the old code) */
+    XWT_CHECK(kill(pid, 0) == 0,
+              "panel survives layer creation without outputs");
+
+    /* an output appears: the held layer surface is adopted, configured,
+     * and the panel maps + renders */
+    struct xw_output *o2 = xw_output_create(t->comp, "TEST", 0, 0, 1280, 720, 1);
+    XWT_ASSERT(o2);
+    PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
+    XWT_CHECK(first_top_layer(t) && first_top_layer(t)->mapped,
+              "layer surface adopted + mapped when the output appeared");
+    PANEL_WAIT(t, bar_rendered(t));
+    XWT_CHECK(bar_rendered(t), "bar rendered after late output");
+    XWT_CHECK(first_top_layer(t)->output == o2,
+              "adopted surface is bound to the new output");
+
+    /* and it is interactive end-to-end */
+    struct xw_seat *seat = xw_seat_first(t->comp);
+    XWT_ASSERT(seat);
+    xw_compositor_inject_pointer_motion(t->comp, 42 + 27 + 12, 14);
+    XWT_WAIT(t, seat->ptr_focus == first_top_layer(t)->surface);
+    XWT_CHECK(seat->ptr_focus == first_top_layer(t)->surface,
+              "late-adopted panel takes pointer focus");
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, t->comp->wm->ws_current == 1);
+    XWT_CHECK(t->comp->wm->ws_current == 1,
+              "click on late-adopted panel switches workspace");
+
+    reap(&pid);
+}
+
+/* the compositor as a compositor: no panel process, no session manager
+ * — windows still map, take pointer focus, and receive clicks */
+static int g_nopanel_button_count;
+static struct xwc_win *g_nopanel_win;
+static void nopanel_button(struct xwc_win *w, uint32_t button, bool down,
+                           int x, int y, void *ud) {
+    (void)button;
+    (void)x;
+    (void)y;
+    (void)ud;
+    if (down && w == g_nopanel_win)
+        g_nopanel_button_count++;
+}
+
+/* a mapped, clickable window without the panel: configure draws the
+ * solid fill and commits (an uncommitted window never maps and never
+ * takes focus — xwt_window_solid's pattern plus a button callback) */
+static void nopanel_configure(struct xwc_win *w, int width, int height,
+                              void *ud) {
+    (void)width;
+    (void)height;
+    uint32_t color = *(uint32_t *)ud;
+    int ww = 0, wh = 0, stride = 0;
+    xwc_win_size(w, &ww, &wh);
+    uint32_t *pix = xwc_win_pixels(w, &stride);
+    if (!pix || ww < 1 || wh < 1)
+        return;
+    xwc_fill_rect(pix, stride, ww, wh, 0, 0, ww, wh, color);
+    xwc_win_commit(w);
+}
+
+static void test_compositor_without_panel(struct xwt_ctx *t) {
+    XWT_CHECK(wl_list_empty(&t->comp->wm->layers[2]),
+              "no layer-shell surfaces without a panel");
+    XWT_CHECK(wl_list_empty(&t->comp->wm->layers[3]), "overlay empty");
+
+    g_nopanel_button_count = 0;
+    g_nopanel_win = NULL;
+    static uint32_t color = 0xff667788;
+    struct xwc_callbacks cb = {
+        .button = nopanel_button,
+        .motion = NULL,
+        .configure = nopanel_configure,
+        .close = NULL,
+        .key = NULL,
+        .ud = &color,
+    };
+    g_nopanel_win = xwc_win_create(&t->client, &cb, "Solo", "solo", 400, 300);
+    XWT_ASSERT(g_nopanel_win);
+    xwt_pump(t);
+    xwt_pump(t);
+    XWT_WAIT(t, xw_compositor_window_count(t->comp) == 1);
+    XWT_WAIT(t, t->comp->wm->focused && t->comp->wm->focused->title &&
+             strcmp(t->comp->wm->focused->title, "Solo") == 0);
+    XWT_ASSERT(t->comp->wm->focused); /* do not deref a failed wait */
+
+    struct xw_seat *seat = xw_seat_first(t->comp);
+    XWT_ASSERT(seat);
+    int wx = t->comp->wm->focused->x, wy = t->comp->wm->focused->y;
+    xw_compositor_inject_pointer_motion(t->comp, wx + 100, wy + 100);
+    XWT_WAIT(t, seat->ptr_focus == t->comp->wm->focused->surface);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    XWT_WAIT(t, g_nopanel_button_count == 1);
+    XWT_CHECK(g_nopanel_button_count == 1,
+              "window received the click without any panel existing");
+
+    xwc_win_destroy(g_nopanel_win);
+    g_nopanel_win = NULL;
+}
+
 static const struct xwt_test tests[] = {
     {"tasklist-client", test_tasklist_client},
     {"workspace-client", test_workspaces_client},
     {"panel-maps", test_panel_maps},
     {"panel-clicks", test_panel_clicks},
     {"panel-exit-button", test_panel_exit_button},
+    {"panel-pointer-focus", test_panel_pointer_focus},
+    {"late-pointer-enter-replay", test_late_pointer_enter_replay},
+    {"panel-launcher", test_panel_launcher},
+    {"panel-clock-click", test_panel_clock_click},
+    {"layer-before-outputs", test_layer_before_outputs},
+    {"compositor-without-panel", test_compositor_without_panel},
 };
 
 __attribute__((constructor)) static void register_tests(void) {
