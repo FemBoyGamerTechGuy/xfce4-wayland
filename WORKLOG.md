@@ -1607,3 +1607,77 @@ Stage Summary:
   wlr-output-management for display settings), plus general
   hardening/testing. The 119-package system update they aborted
   with the failed -Syu should still be run (sudo pacman -Syu).
+
+---
+Task ID: bisect-round (2026-09-02)
+Agent: main
+Task: user reports the cursor STILL does not move despite the
+seat fix being verified healthy — new bug, downstream of device
+acquisition.
+
+Work Log:
+- Read the success-round capture log again with fresh eyes: with
+  -v == XW_LOG_DEBUG (confirmed in src/compositor/xw-compositor.c
+  line 183 and xw-util.c level logic — debug lines DO print at
+  -v), BOTH 12s live windows logged ZERO input events of any
+  kind: not one "libinput: POINTER_MOTION/KEY/BUTTON" line, no
+  "xw-input: pointer motion", no "compositor: cursor position
+  updated". Devices are open, 8 acquired, but no events flow.
+- Traced the ENTIRE static chain and exonerated every layer:
+  xw-input-libinput.c (wl_event_loop_add_fd on libinput fd ->
+  on_libinput_fd -> libinput_dispatch -> drain_libinput -> all
+  event cases handled incl. POINTER_MOTION rel+abs);
+  xw-compositor.c inject_* -> xw-seat.c pointer_motion (cursor
+  update + client delivery + damage_cursor at old+new); damage
+  -> xw_output_damage_rect -> xw_schedule_repaint ->
+  wl_event_loop_add_idle -> on_repaint_idle repaints damaged
+  outputs; xw-render.c draw_cursor (software cursor, 12x17
+  arrow); xw-backend-drm.c present path (flip + parked_frame +
+  drmHandleEvent via db_on_drm_readable registered in the same
+  loop); xw-session-seat.c DOES dispatch libseat's own fd
+  (ls_on_readable via wl_event_loop_add_fd + initial
+  libseat_dispatch(0)); libseat's logind backend dups the D-Bus
+  fd (fcntl F_DUPFD_CLOEXEC, fetched upstream source verified).
+  The event loop demonstrably dispatches (xw-panel round-trip
+  mid-window in the last capture proves it).
+- Conclusion: static analysis cannot find it — runtime bisect
+  needed. The decisive split: kernel/libinput half (sudo
+  libinput debug-events — root, opens /dev/input directly, NO
+  compositor, NO libseat) vs compositor half (bare -v window
+  through the seat broker), with event COUNTS per half and an
+  automatic verdict matrix:
+  kernel>0 & comp=0 -> seat-brokered fds inert (code fix: open
+    input nodes on a fallback path / investigate paused devices)
+  comp>0 -> input fine, RENDER/presentation bug (present path)
+  kernel=0 -> hardware/driver (below the compositor entirely)
+  keys>0 & motion=0 -> mouse-device-specific
+- Wrote scripts/xw-input-bisect.sh (commit 838f7c0, local):
+  one-file-log style, [1] kernel half (sudo y/N, 8s
+  debug-events, auto list-devices + dmesg dump when zero),
+  [2] bare compositor 12s window with loud WIGGLE banners,
+  [3] xw-session window, [4] verdict with KTESTED/CTESTED flags
+  so skipped halves cannot fake a verdict. Counting slices the
+  log between section markers; patterns 'libinput: KEY ' /
+  'libinput: BUTTON' cannot match device-add lines (unit-tested
+  with a synthetic window: motion=4 keys=1 buttons=1, and
+  "Gaming Mouse Keyboard" NOT counted as a key). Container dry
+  run passes (guards fire, honest "incomplete data" verdict,
+  exit 0).
+- Fixed two stray-paren typos and one say/sd typo found by
+  sh -n + dry run on the way (Edit tool round-trips verified).
+- Cannot push 838f7c0 (no token this session) — the user gets
+  the EQUIVALENT MANUAL COMMANDS in the chat instead (3 runs +
+  4 grep counts), which is what the reply delivers.
+
+Stage Summary:
+- New working hypothesis set, in priority order: (a) the
+  libseat/logind-brokered device fds are inert (paused state or
+  broker quirk) — no events reach the compositor; (b) the user
+  did not move the mouse during the capture windows (bisect
+  banners + counts make this testable); (c) hardware/driver
+  produces no evdev events at all; (d) events arrive but
+  render/flip never updates the screen (would contradict the
+  zero-debug-lines evidence unless (b)).
+- Continuation point: user runs the 3 manual bisect commands,
+  moves the mouse in every window, and pastes both logs (or the
+  4 counts) back; the verdict matrix picks the next fix.
