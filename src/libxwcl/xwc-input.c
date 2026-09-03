@@ -316,5 +316,6 @@ void xwc_output_init(struct xwc *c, struct wl_registry *r, uint32_t name,
     st->scale = 1;
     c->output = out;
     c->output_state = st;
+    c->output_global = name;
     wl_output_add_listener(out, &output_listener, st);
 }

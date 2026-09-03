@@ -295,6 +295,90 @@ static void test_workspaces_client(struct xwt_ctx *t) {
     xwc_wspaces_destroy(wl);
 }
 
+
+/* -------------------------------------------------- bar widget finder */
+/* Geometry-agnostic widget location for the process-level tests: scan
+ * the bar's middle row for contiguous non-background runs (buttons).
+ * The runs classify left-to-right as: start, launchers?, task
+ * buttons?, workspace boxes, clock, exit — the panel's region order.
+ * Survives any change of pixel metrics. */
+#define MAX_RUNS 32
+struct bar_run {
+    int x0, x1;
+    uint32_t color;
+};
+static int bar_scan_runs(struct xwt_ctx *t, struct bar_run *runs) {
+    int h = first_top_layer(t) ? first_top_layer(t)->h : 30;
+    int y = h / 2;
+    int n = 0;
+    int x = 0;
+    const int W = 1280;
+    while (x < W && n < MAX_RUNS) {
+        uint32_t c = pixel_at(t, x, y);
+        if (c == BAR_BG || c == 0) { /* background or unmapped */
+            x++;
+            continue;
+        }
+        int x0 = x;
+        while (x < W && pixel_at(t, x, y) != BAR_BG &&
+               pixel_at(t, x, y) != 0)
+            x++;
+        if (x - x0 < 6) /* sub-6px runs are glyph/noise artifacts */
+            continue;
+        runs[n].x0 = x0;
+        runs[n].x1 = x;
+        runs[n].color = c;
+        n++;
+    }
+    return n;
+}
+
+/* center x of run i (from the left) */
+static int bar_run_cx(struct xwt_ctx *t, int i) {
+    struct bar_run runs[MAX_RUNS];
+    int n = bar_scan_runs(t, runs);
+    if (i < 0 || i >= n)
+        return -1;
+    return (runs[i].x0 + runs[i].x1) / 2;
+}
+/* wait for the bar to render, then the Start button center (run 0) */
+static int start_cx(struct xwt_ctx *t) {
+    for (int i = 0; i < 300; i++) {
+        xwt_pump(t);
+        int cx = bar_run_cx(t, 0);
+        if (cx > 0)
+            return cx;
+        usleep(10000);
+    }
+    return -1;
+}
+#define START_CX start_cx(t)
+
+/* the workspace pager boxes: runs between the tasklist area and the
+ * clock/exit pair at the right end. With no windows open the run list
+ * is [start, ws..., clock, exit] — the ws runs are 1..n-3. */
+static int ws_box_cx(struct xwt_ctx *t, int ws_idx) {
+    struct bar_run runs[MAX_RUNS];
+    int n = bar_scan_runs(t, runs);
+    /* find the exit (red) run at the right, clock is one before it */
+    int exit_i = -1;
+    for (int i = n - 1; i >= 0; i--)
+        if (runs[i].color == 0xffa33434 || runs[i].color == 0xffc94b4b) {
+            exit_i = i;
+            break;
+        }
+    if (exit_i < 2)
+        return -1;
+    int clock_i = exit_i - 1;
+    /* the boxes run left from the clock: count = clock_i - 1 - 0... */
+    int first_ws = 1; /* run 0 = the start button (no launchers/tasks) */
+    int n_ws = clock_i - first_ws;
+    if (ws_idx < 0 || ws_idx >= n_ws)
+        return -1;
+    struct bar_run *r = &runs[first_ws + ws_idx];
+    return (r->x0 + r->x1) / 2;
+}
+
 /* ------------------------------------------------- panel process tests */
 
 static void test_panel_maps(struct xwt_ctx *t) {
@@ -304,15 +388,17 @@ static void test_panel_maps(struct xwt_ctx *t) {
     /* the bar maps on the top layer and renders */
     PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
     XWT_CHECK(true, "panel layer mapped (top)");
-    XWT_CHECK(first_top_layer(t)->h == 28, "bar height 28");
+    XWT_CHECK(first_top_layer(t)->h == 30,
+              "bar height auto-derived at 720p (got %d)",
+              first_top_layer(t)->h);
     PANEL_WAIT(t, bar_rendered(t));
     XWT_CHECK(bar_rendered(t), "bar pixels rendered");
 
     /* the exclusive zone displaces windows below the bar */
-    PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->exclusive_zone == 28);
+    PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->exclusive_zone == 30);
     struct xw_output *o =
         wl_container_of(t->comp->outputs.next, o, link);
-    XWT_CHECK(o->usable.y >= 28, "usable area starts below the bar (y=%d)",
+    XWT_CHECK(o->usable.y >= 30, "usable area starts below the bar (y=%d)",
               o->usable.y);
 
     /* a new window lands below the bar */
@@ -324,7 +410,7 @@ static void test_panel_maps(struct xwt_ctx *t) {
         if (strcmp(w->title, "Below") == 0)
             break;
     }
-    XWT_CHECK(w && w->y >= 28, "window placed below the bar (y=%d)",
+    XWT_CHECK(w && w->y >= 30, "window placed below the bar (y=%d)",
               w ? w->y : -1);
 
     reap(&pid);
@@ -336,9 +422,16 @@ static void test_panel_clicks(struct xwt_ctx *t) {
     XWT_ASSERT(pid > 0);
     PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
 
-    /* deterministic switcher geometry: launcher at x=3..39, workspace
-     * buttons 24 wide with 3px gaps starting at x=42 → ws2 at 69..93 */
-    int ws2_x = 42 + 27 + 12;
+    /* the workspace boxes live in the right region now; locate them
+     * by pixel scan (geometry-agnostic) */
+    int ws2_x = -1;
+    for (int i = 0; i < 300 && ws2_x < 0; i++) {
+        xwt_pump(t);
+        ws2_x = ws_box_cx(t, 1);
+        if (ws2_x < 0)
+            usleep(10000);
+    }
+    XWT_ASSERT(ws2_x > 0);
     XWT_CHECK(t->comp->wm->ws_current == 0, "start on workspace 1");
     xw_compositor_inject_pointer_motion(t->comp, ws2_x, 14);
     pump_ms(t, 60);
@@ -352,7 +445,9 @@ static void test_panel_clicks(struct xwt_ctx *t) {
 
     /* clicking the active button again is harmless; clicking ws3 works
      * from the new state */
-    xw_compositor_inject_pointer_motion(t->comp, 42 + 2 * 27 + 12, 14);
+    int ws3_x = ws_box_cx(t, 2);
+    XWT_ASSERT(ws3_x > 0);
+    xw_compositor_inject_pointer_motion(t->comp, ws3_x, 14);
     pump_ms(t, 60);
     xw_compositor_inject_pointer_button(t->comp, 0x110, true);
     xwt_pump(t);
@@ -630,8 +725,9 @@ static void test_panel_launcher(struct xwt_ctx *t) {
     XWT_ASSERT(pid > 0);
     PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
 
-    /* launcher occupies x=3..39 at bar height 28 */
-    xw_compositor_inject_pointer_motion(t->comp, 20, 14);
+    /* Start button occupies the bar's left edge; its center is around
+     * x=20 (icon + label; the run scan locates it precisely) */
+    xw_compositor_inject_pointer_motion(t->comp, 20, 15);
     pump_ms(t, 60);
     xw_compositor_inject_pointer_button(t->comp, 0x110, true);
     xwt_pump(t);
@@ -771,7 +867,7 @@ static void test_panel_start_repeated(struct xwt_ctx *t) {
      * opens and every even click toggles closed) */
     bool saw_popup = false;
     for (int round = 0; round < 20; round++) {
-        xw_compositor_inject_pointer_motion(t->comp, 20, 14);
+        xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
         pump_ms(t, 60);
         xw_compositor_inject_pointer_button(t->comp, 0x110, true);
         xwt_pump(t);
@@ -838,7 +934,7 @@ static void test_panel_menu(struct xwt_ctx *t) {
 
     /* 1. Start click opens the menu: popup exists, mapped, parented to
      * the bar layer, anchored under the button */
-    xw_compositor_inject_pointer_motion(t->comp, 20, 14);
+    xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
     pump_ms(t, 60);
     xw_compositor_inject_pointer_button(t->comp, 0x110, true);
     xwt_pump(t);
@@ -849,25 +945,25 @@ static void test_panel_menu(struct xwt_ctx *t) {
     XWT_CHECK(pu->mapped, "menu popup mapped");
     XWT_CHECK(pu->parent == first_top_layer(t)->surface,
               "menu parented to the bar layer surface");
-    XWT_CHECK(pu->anchor_x == 3 && pu->anchor_y == 28,
-              "menu anchored under the Start button (%d,%d)", pu->anchor_x,
-              pu->anchor_y);
+    XWT_CHECK(pu->anchor_x == 3 && pu->anchor_y == 30,
+              "menu anchored under the Start button (3,%d)", pu->anchor_y);
     /* 3 sorted entries (Alpha/Beta/Gamma; NoDisplay and Type=Link
-     * filtered), 26px rows */
-    XWT_CHECK(pu->h == 3 * 26 + 8, "menu height = 3 items (%d)", pu->h);
-    XWT_CHECK(pu->w == 230, "menu width 230 (%d)", pu->w);
+     * filtered); row height = font line + 10, 2px pad */
+    XWT_CHECK(pu->h == 2 + 3 * (XWC_LINE_H + 10),
+              "menu height = 3 items (%d)", pu->h);
+    XWT_CHECK(pu->w == 300, "menu width 300 (%d)", pu->w);
     /* menu pixels actually rendered below the bar (item 1's row:
      * item 0 carries the hover fill once the pointer is inside) */
-    PANEL_WAIT(t, pixel_at(t, 50, 28 + 4 + 26 + 13) == 0xff262b33);
-    XWT_CHECK(pixel_at(t, 50, 28 + 4 + 26 + 13) == 0xff262b33,
-              "menu background rendered");
+    PANEL_WAIT(t, pixel_at(t, 150, 30 + 2 + 29 + 14) == 0xff262b33);
+    XWT_CHECK(pixel_at(t, 150, 30 + 2 + 29 + 14) == 0xff262b33,
+              "menu background rendered (below item 0's row)");
 
     /* 2. hover: motion over item 0 lights the highlight (checked at
      * x=150: the software cursor sprite sits exactly on the pointer
      * position and would cover a pixel taken at the pointer itself) */
-    xw_compositor_inject_pointer_motion(t->comp, 50, 28 + 4 + 13);
-    PANEL_WAIT(t, pixel_at(t, 150, 28 + 4 + 13) == 0xff3584e4);
-    XWT_CHECK(pixel_at(t, 150, 28 + 4 + 13) == 0xff3584e4,
+    xw_compositor_inject_pointer_motion(t->comp, 150, 30 + 2 + 14);
+    PANEL_WAIT(t, pixel_at(t, 200, 30 + 2 + 14) == 0xff3584e4);
+    XWT_CHECK(pixel_at(t, 200, 30 + 2 + 14) == 0xff3584e4,
               "menu item hover highlight rendered");
     XWT_CHECK(seat->grab_surface == pu->surface,
               "the menu holds the seat grab (all pointer events)");
@@ -888,7 +984,7 @@ static void test_panel_menu(struct xwt_ctx *t) {
     XWT_CHECK(kill(pid, 0) == 0, "panel alive after Escape close");
 
     /* 4. reopen + item click launches through the ctl wire */
-    xw_compositor_inject_pointer_motion(t->comp, 20, 14);
+    xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
     pump_ms(t, 300); /* clear the suppression window */
     xw_compositor_inject_pointer_button(t->comp, 0x110, true);
     xwt_pump(t);
@@ -896,7 +992,7 @@ static void test_panel_menu(struct xwt_ctx *t) {
     PANEL_WAIT(t, n_top_popups(t) == 1);
     /* item 0 (Alpha, sorted): click its center; the panel forks the
      * async ctl round trip — service the fake socket for it */
-    xw_compositor_inject_pointer_motion(t->comp, 50, 28 + 4 + 13);
+    xw_compositor_inject_pointer_motion(t->comp, 150, 30 + 2 + 14);
     pump_ms(t, 60);
     xw_compositor_inject_pointer_button(t->comp, 0x110, true);
     xwt_pump(t);
@@ -916,7 +1012,7 @@ static void test_panel_menu(struct xwt_ctx *t) {
     XWT_CHECK(kill(pid, 0) == 0, "panel alive after launching an item");
 
     /* 5. outside click dismisses (press on the desktop background) */
-    xw_compositor_inject_pointer_motion(t->comp, 20, 14);
+    xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
     pump_ms(t, 300);
     xw_compositor_inject_pointer_button(t->comp, 0x110, true);
     xwt_pump(t);
@@ -933,7 +1029,7 @@ static void test_panel_menu(struct xwt_ctx *t) {
 
     /* 6. exit button with the menu previously opened: the async ctl
      * round trip must not freeze or kill the panel */
-    xw_compositor_inject_pointer_motion(t->comp, 20, 14);
+    xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
     pump_ms(t, 300);
     xw_compositor_inject_pointer_button(t->comp, 0x110, true);
     xwt_pump(t);
@@ -995,7 +1091,7 @@ static void test_panel_menu_compositor_shutdown(struct xwt_ctx *t) {
     XWT_ASSERT(pid > 0);
     PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
 
-    xw_compositor_inject_pointer_motion(t->comp, 20, 14);
+    xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
     pump_ms(t, 60);
     xw_compositor_inject_pointer_button(t->comp, 0x110, true);
     xwt_pump(t);
@@ -1125,7 +1221,15 @@ static void test_layer_before_outputs(struct xwt_ctx *t) {
     /* and it is interactive end-to-end */
     struct xw_seat *seat = xw_seat_first(t->comp);
     XWT_ASSERT(seat);
-    xw_compositor_inject_pointer_motion(t->comp, 42 + 27 + 12, 14);
+    int ws2b_x = -1;
+    for (int i = 0; i < 300 && ws2b_x < 0; i++) {
+        xwt_pump(t);
+        ws2b_x = ws_box_cx(t, 1);
+        if (ws2b_x < 0)
+            usleep(10000);
+    }
+    XWT_ASSERT(ws2b_x > 0);
+    xw_compositor_inject_pointer_motion(t->comp, ws2b_x, 14);
     XWT_WAIT(t, seat->ptr_focus == first_top_layer(t)->surface);
     XWT_CHECK(seat->ptr_focus == first_top_layer(t)->surface,
               "late-adopted panel takes pointer focus");

@@ -179,9 +179,27 @@ static void registry_global(void *data, struct wl_registry *r, uint32_t name,
 
 static void registry_global_remove(void *data, struct wl_registry *r,
                                    uint32_t name) {
-    (void)data;
     (void)r;
-    (void)name;
+    struct xwc *c = data;
+    if (c->output && name == c->output_global) {
+        /* the bound output is gone: release the proxy and its event
+         * state so a later output (hotplug) can be bound again; the
+         * size stays as the last known value. (The state is NOT kept
+         * alive here, unlike the same-output mode-change re-announce:
+         * this global is gone for good.) */
+        wl_output_destroy((struct wl_output *)c->output);
+        c->output = NULL;
+        c->output_global = 0;
+        c->n_outputs = 0;
+        free(c->output_state);
+        c->output_state = NULL;
+    }
+    if (name == c->wsi_global)
+        c->wsi_global = 0;
+    if (name == c->ftm_global)
+        c->ftm_global = 0;
+    if (name == c->wsm_global)
+        c->wsm_global = 0;
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -266,6 +284,16 @@ int xwc_connect_pumped(struct xwc *c, const char *socket_name,
     c->pump_ud = pump_ud;
     c->registry = wl_display_get_registry(c->display);
     wl_registry_add_listener(c->registry, &registry_listener, c);
+    if (xwc_sync(c) < 0) {
+        xwc_disconnect(c);
+        return -1;
+    }
+    /* second roundtrip: the enumeration triggers binds (output,
+     * seat), whose events follow in the next batch — without this,
+     * output geometry/capabilities are only visible after the
+     * caller's first dispatch, which surprised clients that read
+     * the output size right after connect (the panel's layout
+     * engine computed its height from a zero-size output) */
     if (xwc_sync(c) < 0) {
         xwc_disconnect(c);
         return -1;
@@ -881,6 +909,15 @@ struct xwc_popup *xwc_popup_create(struct xwc *c, struct xwc_layer *parent,
                                    int anchor_x, int anchor_y,
                                    int anchor_w, int anchor_h, int w, int h,
                                    const struct xwc_callbacks *cb) {
+    return xwc_popup_create_dir(c, parent, anchor_x, anchor_y, anchor_w,
+                                anchor_h, w, h, cb, false);
+}
+
+struct xwc_popup *xwc_popup_create_dir(struct xwc *c, struct xwc_layer *parent,
+                                       int anchor_x, int anchor_y,
+                                       int anchor_w, int anchor_h, int w,
+                                       int h, const struct xwc_callbacks *cb,
+                                       bool upward) {
     if (!c || !c->wm_base || !parent || w < 1 || h < 1)
         return NULL;
 
@@ -914,8 +951,15 @@ struct xwc_popup *xwc_popup_create(struct xwc *c, struct xwc_layer *parent,
     xdg_positioner_set_size(pos, w, h);
     xdg_positioner_set_anchor_rect(pos, anchor_x, anchor_y, anchor_w,
                                    anchor_h);
-    xdg_positioner_set_anchor(pos, XDG_POSITIONER_ANCHOR_BOTTOM_LEFT);
-    xdg_positioner_set_gravity(pos, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+    if (upward) {
+        /* bottom bars: the popup grows up from the anchor rect's top
+         * edge, still left-aligned with the button */
+        xdg_positioner_set_anchor(pos, XDG_POSITIONER_ANCHOR_TOP_LEFT);
+        xdg_positioner_set_gravity(pos, XDG_POSITIONER_GRAVITY_TOP_RIGHT);
+    } else {
+        xdg_positioner_set_anchor(pos, XDG_POSITIONER_ANCHOR_BOTTOM_LEFT);
+        xdg_positioner_set_gravity(pos, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+    }
     xdg_positioner_set_constraint_adjustment(
         pos, XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y |
                  XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |

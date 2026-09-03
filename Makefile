@@ -600,8 +600,8 @@ $(OBJ)/clients/%.o: src/clients/%.c src/clients/*.h src/libxwcl/*.h $(GEN_HEADER
 
 # ---------------------------------------------------------------- tests
 TEST_SRC := $(wildcard tests/suite/*.c)
-build/tests/run-tests: $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a build/lib/libpanelcore.a | build/tests
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a build/lib/libpanelcore.a $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_WLC) $(LDLIBS_X11) $(LDLIBS_LIBINPUT) $(LDLIBS_LIBUDEV) $(LDLIBS_DRM) $(LDLIBS_LIBSEAT) $(LDLIBS_PNG) $(LDLIBS_M)
+build/tests/run-tests: $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a build/lib/libpanelcore.a $(OBJ)/clients/xw-ctl.o | build/tests
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a build/lib/libpanelcore.a $(OBJ)/clients/xw-ctl.o $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_WLC) $(LDLIBS_X11) $(LDLIBS_LIBINPUT) $(LDLIBS_LIBUDEV) $(LDLIBS_DRM) $(LDLIBS_LIBSEAT) $(LDLIBS_PNG) $(LDLIBS_M)
 
 $(OBJ)/tests/%.o: tests/suite/%.c tests/harness/xwtest.h $(LIBXW_DEPS) src/libxwcl/*.h subprojects/panel/*.h $(GEN_HEADERS) | $(OBJ)/tests
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) -Isubprojects/panel $(CFLAGS_WLS) $(CFLAGS_WLC) $(CFLAGS_PIX) $(CFLAGS_XKB) $(HAVE_X11) $(HAVE_LIBINPUT) $(HAVE_LIBSEAT) $(HAVE_DRM) -c $< -o $@

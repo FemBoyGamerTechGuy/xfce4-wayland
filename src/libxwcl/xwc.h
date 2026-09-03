@@ -64,6 +64,7 @@ struct xwc {
     void *keyboard;         /* wl_keyboard */
     void *pointer;          /* wl_pointer */
     void *output;           /* first wl_output */
+    uint32_t output_global; /* registry name of the bound output */
     void *output_state;     /* pending output state (xwc-input.c) */
 
     void *ftm;    /* zwlr_foreign_toplevel_manager_v1 (lazily bound) */
@@ -168,6 +169,13 @@ struct xwc_popup *xwc_popup_create(struct xwc *c, struct xwc_layer *parent,
                                    int anchor_x, int anchor_y,
                                    int anchor_w, int anchor_h, int w, int h,
                                    const struct xwc_callbacks *cb);
+/* the same, choosing the opening direction: false = below the anchor
+ * rect (top bars), true = above it (bottom bars) */
+struct xwc_popup *xwc_popup_create_dir(struct xwc *c, struct xwc_layer *parent,
+                                       int anchor_x, int anchor_y,
+                                       int anchor_w, int anchor_h, int w,
+                                       int h, const struct xwc_callbacks *cb,
+                                       bool upward);
 void xwc_popup_destroy(struct xwc_popup *p);
 uint32_t *xwc_popup_pixels(struct xwc_popup *p, int *stride);
 void xwc_popup_commit(struct xwc_popup *p);
