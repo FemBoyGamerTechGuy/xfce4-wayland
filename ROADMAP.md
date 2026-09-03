@@ -200,8 +200,14 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
   LSan-caught); xwc_dispatch gained a real poll timeout (panel
   clock ticks) and explicit flushing (wl_display_dispatch flushed
   implicitly; poll() does not).
-- PART launcher v0 is a single terminal button (no menu, no
-  .desktop parsing, no icons — text labels only); single output;
+- DONE applications menu (M-panel-menu): the Start button opens an
+  xdg_popup parented to the bar layer with XDG .desktop discovery,
+  ctl-run launching, Escape/outside-press dismissal, idempotent
+  toggle, and full lifecycle diagnostics; v0 caps: 24 items (no
+  scrolling), no icons (text labels only), Terminal=true entries
+  hidden (no terminal wrapper yet).
+- PART remaining launcher/menu v0 limits: no icons, no categories
+  (flat list), no favorites/recent, no search field; single output;
   fixed plugin order; no plugin API.
 - TODO panel plugin API, notification daemon, desktop icons,
   wallpaper, settings GUI, application finder.
