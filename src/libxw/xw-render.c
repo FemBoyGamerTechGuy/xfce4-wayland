@@ -50,6 +50,38 @@ static void draw_cursor(struct xw_output *o, struct xw_seat *seat) {
     if (!seat)
         return;
     int cx = seat->cursor_x - o->x, cy = seat->cursor_y - o->y;
+
+    /* client-provided cursor image: composited at (cursor - hotspot),
+     * honoring the surface's buffer scale. Falls through to the default
+     * arrow when the client set no cursor or its surface has no buffer
+     * yet (the usual first-frame window before the cursor commit). */
+    if (seat->cursor_surface && seat->cursor_surface->buf_w > 0) {
+        struct xw_surface *cs = seat->cursor_surface;
+        pixman_image_t *img = xw_surface_get_image(cs);
+        if (img) {
+            int sc = cs->scale > 0 ? cs->scale : 1;
+            int px = cx - seat->cursor_hot_x;
+            int py = cy - seat->cursor_hot_y;
+            int w = cs->buf_w / sc, h = cs->buf_h / sc;
+            if (sc != 1) {
+                pixman_transform_t t;
+                pixman_transform_init_scale(
+                    &t, pixman_double_to_fixed(1.0 / sc),
+                    pixman_double_to_fixed(1.0 / sc));
+                pixman_image_set_transform(img, &t);
+                pixman_image_composite(PIXMAN_OP_OVER, img, NULL, o->logical,
+                                       0, 0, 0, 0, px, py, w, h);
+                pixman_image_set_transform(img, NULL);
+            } else {
+                pixman_image_composite(PIXMAN_OP_OVER, img, NULL, o->logical,
+                                       0, 0, 0, 0, px, py, w, h);
+            }
+            pixman_image_unref(img);
+            return;
+        }
+    }
+
+    /* default arrow (software cursor) */
     if (cx < -CURSOR_W || cy < -CURSOR_H || cx > o->width || cy > o->height)
         return;
     uint32_t black = 0xff000000, white = 0xffffffff;
@@ -106,6 +138,43 @@ static void blit_surface(struct xw_output *o, struct xw_surface *s, int gx,
     pixman_image_unref(src);
 }
 
+/* render a surface tree: children stacked below the parent's own
+ * buffer first, then the parent blit, then children above it. Within
+ * each group the list order is bottom → top (tail = topmost). Each
+ * child is itself rendered as a full tree (nesting). */
+static void render_subsurface_tree(struct xw_output *o,
+                                    struct xw_subsurface *sub, int pgx,
+                                    int pgy);
+
+static void render_surface_tree(struct xw_output *o, struct xw_surface *s,
+                                 int gx, int gy, int gw, int gh, int src_x,
+                                 int src_y) {
+    /* children below the parent's own buffer */
+    struct xw_subsurface *sub;
+    wl_list_for_each(sub, &s->subsurfaces, parent_link) {
+        if (sub->below_parent)
+            render_subsurface_tree(o, sub, gx, gy);
+    }
+    /* the parent's own image */
+    blit_surface(o, s, gx, gy, gw, gh, src_x, src_y);
+    /* children above the parent's buffer, bottom → top */
+    wl_list_for_each(sub, &s->subsurfaces, parent_link) {
+        if (!sub->below_parent)
+            render_subsurface_tree(o, sub, gx, gy);
+    }
+}
+
+static void render_subsurface_tree(struct xw_output *o,
+                                    struct xw_subsurface *sub, int pgx,
+                                    int pgy) {
+    struct xw_surface *s = sub->surface;
+    if (!s || !s->mapped || (!s->shm && !s->has_single_pixel))
+        return;
+    int sc = s->scale > 0 ? s->scale : 1;
+    int w = s->buf_w / sc, h = s->buf_h / sc;
+    render_surface_tree(o, s, pgx + sub->x, pgy + sub->y, w, h, 0, 0);
+}
+
 static void render_window(struct xw_output *o, struct xw_window *w) {
     if (!w->surface || (!w->surface->shm && !w->surface->has_single_pixel))
         return;
@@ -114,7 +183,7 @@ static void render_window(struct xw_output *o, struct xw_window *w) {
         ox = w->geo_x;
         oy = w->geo_y;
     }
-    blit_surface(o, w->surface, w->x, w->y, w->w, w->h, ox, oy);
+    render_surface_tree(o, w->surface, w->x, w->y, w->w, w->h, ox, oy);
 }
 
 
@@ -123,7 +192,7 @@ static void render_layer(struct xw_output *o, struct xw_layer_surface *ls) {
         return;
     if (!ls->surface->shm && !ls->surface->has_single_pixel)
         return;
-    blit_surface(o, ls->surface, ls->x, ls->y, ls->w, ls->h, 0, 0);
+    render_surface_tree(o, ls->surface, ls->x, ls->y, ls->w, ls->h, 0, 0);
 }
 
 static void render_snap_preview(struct xw_output *o, struct xw_wm *wm,
@@ -205,7 +274,8 @@ void xw_render_output(struct xw_output *o) {
     wl_list_for_each_reverse(p, &c->popups, link) {
         if (!p->mapped || !p->surface)
             continue;
-        blit_surface(o, p->surface, p->anchor_x, p->anchor_y, p->w, p->h, 0, 0);
+        render_surface_tree(o, p->surface, p->anchor_x, p->anchor_y, p->w,
+                            p->h, 0, 0);
     }
 
     /* 5. snap preview of the window being moved */

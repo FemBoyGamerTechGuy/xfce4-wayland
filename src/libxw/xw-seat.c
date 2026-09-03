@@ -49,9 +49,14 @@ static void keyboard_release(struct wl_client *client, struct wl_resource *res) 
 
 /* --------------------------------------------------------- wl_pointer */
 
+static void pointer_set_cursor(struct wl_client *client,
+                               struct wl_resource *res, uint32_t serial,
+                               struct wl_resource *surface, int32_t hotspot_x,
+                               int32_t hotspot_y);
 static void pointer_release(struct wl_client *client, struct wl_resource *res);
 
 static const struct wl_pointer_interface pointer_impl = {
+    .set_cursor = pointer_set_cursor,
     .release = pointer_release,
 };
 
@@ -63,6 +68,65 @@ static void pointer_release(struct wl_client *client, struct wl_resource *res) {
     (void)client;
     wl_resource_destroy(res);
 }
+
+/* wl_pointer.set_cursor — THE request that killed the compositor: the
+ * function pointer was NULL, and libwayland-server aborts the process
+ * on any request dispatched to a NULL listener ("listener function
+ * for opcode 0 of wl_pointer is NULL"). Every real toolkit calls this
+ * right after its window takes focus, so native apps died seconds
+ * after mapping and the session manager restarted the compositor —
+ * the physical "window visible for a fraction of a second" bug. */
+static void pointer_set_cursor(struct wl_client *client,
+                               struct wl_resource *res, uint32_t serial,
+                               struct wl_resource *surface_res,
+                               int32_t hotspot_x, int32_t hotspot_y) {
+    (void)client;
+    (void)serial; /* v0: no serial-based validity window */
+    struct xw_seat *s = wl_resource_get_user_data(res);
+
+    /* erase the old cursor image before swapping */
+    xw_seat_damage_cursor(s->comp);
+
+    if (surface_res) {
+        struct xw_surface *cs = wl_resource_get_user_data(surface_res);
+        if (cs && cs->role == XW_SURFACE_ROLE_NONE) {
+            if (s->cursor_surface && s->cursor_surface != cs)
+                s->cursor_surface->is_cursor = false;
+            s->cursor_surface = cs;
+            s->cursor_hot_x = hotspot_x;
+            s->cursor_hot_y = hotspot_y;
+            cs->is_cursor = true;
+            xw_log(XW_LOG_DEBUG,
+                   "seat: cursor set (surface %u, hotspot %d,%d)",
+                   wl_resource_get_id(cs->res), (int)hotspot_x,
+                   (int)hotspot_y);
+        } else {
+            /* a roled surface cannot be a cursor: ignore the request
+             * (the client keeps running; the default arrow stays) */
+            xw_log(XW_LOG_WARN,
+                   "seat: set_cursor with a roled surface ignored");
+        }
+    } else {
+        if (s->cursor_surface)
+            s->cursor_surface->is_cursor = false;
+        s->cursor_surface = NULL;
+        xw_log(XW_LOG_DEBUG, "seat: cursor hidden");
+    }
+
+    /* paint the new image (or default arrow) over the erased area */
+    xw_seat_damage_cursor(s->comp);
+}
+
+/* ------------------------------------------------------------ wl_touch */
+
+static void touch_release(struct wl_client *client, struct wl_resource *res) {
+    (void)client;
+    wl_resource_destroy(res);
+}
+
+static const struct wl_touch_interface touch_impl = {
+    .release = touch_release,
+};
 
 /* ------------------------------------------------------------ wl_seat */
 
@@ -147,10 +211,21 @@ static void seat_get_keyboard(struct wl_client *client, struct wl_resource *res,
 
 static void seat_get_touch(struct wl_client *client, struct wl_resource *res,
                            uint32_t id) {
-    (void)client;
-    (void)res;
-    (void)id;
-    /* touch unsupported in v0; capabilities never advertise touch */
+    /* Touch is not supported (capabilities never advertise it), but the
+     * resource must EXIST with a real release handler: a client that
+     * creates wl_touch and later sends release would otherwise target
+     * an object the server never made — a fatal invalid-object error
+     * that kills the client. */
+    struct xw_seat *s = wl_resource_get_user_data(res);
+    uint32_t v = wl_resource_get_version(res);
+    struct wl_resource *t =
+        wl_resource_create(client, &wl_touch_interface, v > 8 ? 8 : v, id);
+    if (!t) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    (void)s;
+    wl_resource_set_implementation(t, &touch_impl, s, NULL);
 }
 
 static void seat_release(struct wl_client *client, struct wl_resource *res) {
@@ -258,8 +333,10 @@ static struct xw_surface *surface_at(struct xw_seat *s, int x, int y) {
     /* popups: list tail = topmost */
     struct xw_popup *p;
     wl_list_for_each_reverse(p, &c->popups, link) {
-        if (p->mapped && p->surface && xw_surface_has_input_at(p->surface, x, y))
-            return p->surface;
+        if (p->mapped && p->surface && xw_surface_has_input_at(p->surface, x, y)) {
+            struct xw_surface *sub = xw_subsurface_at(p->surface, x, y);
+            return sub ? sub : p->surface;
+        }
     }
 
     /* layer shell: overlay/top/bottom/background, head = topmost */
@@ -267,12 +344,19 @@ static struct xw_surface *surface_at(struct xw_seat *s, int x, int y) {
         struct xw_layer_surface *ls;
         wl_list_for_each(ls, &c->wm->layers[layer], link) {
             if (ls->mapped && ls->surface &&
-                xw_surface_has_input_at(ls->surface, x, y))
-                return ls->surface;
+                xw_surface_has_input_at(ls->surface, x, y)) {
+                struct xw_surface *sub = xw_subsurface_at(ls->surface, x, y);
+                return sub ? sub : ls->surface;
+            }
         }
     }
 
     struct xw_window *w = xw_wm_window_at(c->wm, x, y, NULL);
+    if (w && w->surface) {
+        struct xw_surface *sub = xw_subsurface_at(w->surface, x, y);
+        if (sub)
+            return sub;
+    }
     return w ? w->surface : NULL;
 }
 
@@ -468,6 +552,24 @@ void xw_seat_forget_surface(struct xw_compositor *c, struct xw_surface *s) {
             seat->drag.origin = NULL;
         if (seat->kb_focus == s)
             xw_seat_set_kb_focus(seat, NULL);
+        if (seat->cursor_surface == s) {
+            xw_seat_damage_cursor(c); /* erase the client image extent */
+            seat->cursor_surface = NULL;
+            xw_seat_damage_cursor(c); /* default arrow region */
+        }
+    }
+}
+
+/* a cursor or subsurface reference must be dropped when the surface
+ * dies (called from the wl_surface destructor before any state freed) */
+void xw_seat_forget_cursor_surface(struct xw_compositor *c,
+                                   struct xw_surface *s) {
+    if (!c || !s)
+        return;
+    struct xw_seat *seat;
+    wl_list_for_each(seat, &c->seats, link) {
+        if (seat->cursor_surface == s)
+            seat->cursor_surface = NULL;
     }
 }
 
@@ -653,8 +755,34 @@ void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
 
 /* -------------------------------------------------------------- pointer */
 
+/* damage the region covered by the current cursor image: the client
+ * cursor's buffer extent (offset by the hotspot) or the default
+ * arrow's 12x17 box. Called on motion (old+new position), on cursor
+ * changes, and before the image is swapped. */
+void xw_seat_damage_cursor(struct xw_compositor *c) {
+    struct xw_seat *s = xw_seat_first(c);
+    if (!s)
+        return;
+    int x = s->cursor_x, y = s->cursor_y, w = 12, h = 17;
+    if (s->cursor_surface && s->cursor_surface->buf_w > 0) {
+        int sc = s->cursor_surface->scale > 0 ? s->cursor_surface->scale : 1;
+        x = s->cursor_x - s->cursor_hot_x;
+        y = s->cursor_y - s->cursor_hot_y;
+        w = s->cursor_surface->buf_w / sc;
+        h = s->cursor_surface->buf_h / sc;
+    }
+    xw_damage_outputs_rect(c, x - 1, y - 1, w + 2, h + 2);
+}
+
 static void damage_cursor(struct xw_compositor *c, int x, int y) {
-    xw_damage_outputs_rect(c, x - 2, y - 2, 16, 21);
+    struct xw_seat *s = xw_seat_first(c);
+    int w = 12, h = 17;
+    if (s && s->cursor_surface && s->cursor_surface->buf_w > 0) {
+        int sc = s->cursor_surface->scale > 0 ? s->cursor_surface->scale : 1;
+        w = s->cursor_surface->buf_w / sc;
+        h = s->cursor_surface->buf_h / sc;
+    }
+    xw_damage_outputs_rect(c, x - 1, y - 1, w + 2, h + 2);
 }
 
 void xw_seat_pointer_motion(struct xw_seat *s, int x, int y) {
