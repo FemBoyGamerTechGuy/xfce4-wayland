@@ -200,17 +200,49 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
   LSan-caught); xwc_dispatch gained a real poll timeout (panel
   clock ticks) and explicit flushing (wl_display_dispatch flushed
   implicitly; poll() does not).
-- DONE applications menu (M-panel-menu): the Start button opens an
-  xdg_popup parented to the bar layer with XDG .desktop discovery,
-  ctl-run launching, Escape/outside-press dismissal, idempotent
-  toggle, and full lifecycle diagnostics; v0 caps: 24 items (no
-  scrolling), no icons (text labels only), Terminal=true entries
-  hidden (no terminal wrapper yet).
-- PART remaining launcher/menu v0 limits: no icons, no categories
-  (flat list), no favorites/recent, no search field; single output;
-  fixed plugin order; no plugin API.
+- DONE applications menu v2 (M-panel-ux): a two-pane popup
+  (categories | applications, the Whisker shape) over the XDG
+  .desktop database — discovery with user-over-system shadowing and
+  mtime-cached rescans, visibility rules (NoDisplay/Hidden/TryExec/
+  OnlyShowIn/NotShowIn), localization (Name[lang]), XFCE-style
+  categories, favorites from the config, live search (name, generic
+  name, comment, id), wheel/arrow scrolling with a scrollbar, XDG
+  icons, and spec-correct Exec parsing (quoting, field codes,
+  Terminal=true wrapping with a per-terminal strategy) launched
+  through the forked ctl-run wire.
+- DONE clock + calendar (M-panel-clock): date+time through a
+  locale-safe format engine (config: format, seconds); clicking the
+  clock opens a one-month calendar popup — month navigation (arrows,
+  wheel, Left/Right keys), today highlighted, Monday-first grid,
+  Escape/outside dismissal.
+- DONE graphical workspace pager (M-panel-pager): each workspace box
+  renders a miniature desktop with window tiles (focused window
+  accented, sticky windows dimmed on every box); the active workspace
+  is outlined; membership arrives through the new
+  xw-workspace-info-v1 protocol (see M6.5 below).
+- DONE taskbar v2 (M-panel-taskbar): icons per window (app_id ->
+  .desktop Icon -> themed icon -> letter tile), active/minimized
+  distinction, XFCE minimize-on-active-click, squeeze to icon-only,
+  and a "+N" overflow popup listing hidden windows.
+- DONE panel layout engine (M-panel-layout): metric-driven bar
+  (height auto from the output's logical size, 16/24 px font rasters,
+  scale-aware icons), the XFCE region order [Start|launchers]
+  [taskbar] [pager][clock][Exit], top/bottom position, panel.conf
+  configuration with complete defaults.
+- PART remaining limits: single output; fixed plugin order; no
+  plugin API; SVG icons not renderable (no vector stack — PNG/XPM
+  only, procedural fallbacks); calendar days display-only (no event
+  list); menu does not cascade flyout submenus (two-pane instead);
+  no recent-apps tracking.
 - TODO panel plugin API, notification daemon, desktop icons,
-  wallpaper, settings GUI, application finder.
+  wallpaper, settings GUI, application finder, per-output panels.
+
+## M6.5 — Desktop-integration protocols of our own
+- DONE xw-workspace-info-v1 (M-panel-ux): a small read-only companion
+  protocol annotating wlr foreign-toplevel handles with their
+  workspace (events: workspace(index), done; -1 = sticky) — the panel
+  pager's data source, keeping the panel a pure protocol client.
+  Vendored in protocols/ (original implementation, MIT).
 
 ## M8 — XWayland compatibility
 - TODO optional XWayland startup for legacy X11 apps (never a

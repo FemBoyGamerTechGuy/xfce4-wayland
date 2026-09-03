@@ -45,7 +45,7 @@ for status and what remains, and [BUILDING.md](BUILDING.md) to build it.
 | Session control CLI | `xw-session-ctl` | Scriptable session commands (logout/restart/shutdown/...) |
 | Exit dialog | `xw-exit` | Graphical session-exit dialog |
 | Demo client | `xw-demo` | Minimal xdg-shell window (tests the desktop: tasklist, stacking, exclusive zone) |
-| Panel | `xw-panel` | Layer-shell desktop bar (own subproject, `subprojects/panel/`): workspace switcher, tasklist, launcher, clock, exit button |
+| Panel | `xw-panel` | Layer-shell desktop bar (own subproject, `subprojects/panel/`): applications menu (XDG .desktop database, categories, search), taskbar with icons + overflow list, graphical workspace pager, clock with calendar popup, launchers, action button |
 | Screen lock | `xw-lock` | ext-session-lock client: passphrase lock screen, auto-lock on idle (Ctrl+Alt+L) |
 
 ## Quick start (development)

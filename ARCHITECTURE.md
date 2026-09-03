@@ -145,7 +145,12 @@ surfaces live in one stacking tree per output group:
   only applied on `ack_configure` — never assumed).
 - **Workspaces** are virtual desktops with a count, names, and per-output
   visibility. Only windows on the active workspace are mapped/rendered.
-  ext-workspace exports them to clients (panel).
+  ext-workspace exports them to clients (panel); per-toplevel workspace
+  membership rides on our companion protocol
+  **xw-workspace-info-v1** (`protocols/xw-workspace-info-v1.xml`): it
+  annotates wlr foreign-toplevel handles with `workspace(index)` events
+  (−1 = sticky), which is exactly what a graphical pager needs — read
+  the wire, never compositor memory.
 - **Focus** follows the XFCE default: click-to-focus, focus-on-map
   (activatable), with Alt+Tab / Alt+Esc MRU cycling. The keyboard focus
   is per-seat and drives wl_keyboard enter/leave.
@@ -276,23 +281,61 @@ Protocol contract notes learned the hard way (all regression-tested):
   re-announces on mode changes (nested resize), and client listener
   state must live as long as the proxy.
 
-One process, one layer-shell surface: a top bar anchored LEFT|RIGHT
-(compositor dictates the width) with a fixed height and an exclusive
-zone of the same value, so windows can never render under it. The
-plugins of v0, left to right: a terminal launcher (ctl `run`), the
-workspace switcher (ext-workspace handles, click to switch), the
-tasklist (wlr-foreign-toplevel handles: click activates, middle/right
-click closes), then right-aligned clock (HH:MM, redrawn when the minute
-flips) and exit button (ctl `exit-dialog`). Layout is recomputed on
-every tasklist/workspace change and on configure; input is plain
-hit-testing against the button table. `libxwcl` exposes the two manager
-bindings (`xwc_tasklist`, `xwc_wspaces`) with lazy proxy binding —
-binding a manager immediately materializes `new_id` announcement
-proxies (workspace group + handles, window handles), so clients that
-never create these objects never pay for them (an eager version leaked
-5 proxies per client, caught by LSan). The panel main loop dispatches
-with a 1-second timeout ceiling: the poll timeout exists precisely so
-timer-driven redraws (the clock) can fire between server events.
+One process, one layer-shell surface: a top or bottom bar anchored
+LEFT|RIGHT (compositor dictates the width) with an exclusive zone equal
+to its height, so windows can never render under it. The v1 module
+map (all in `subprojects/panel/`, archived as `libpanelcore.a` so the
+test suite unit-tests the modules directly):
+
+```
+xw-panel.c      core: metrics, regions, input routing, main loop
+panel-apps.c    XDG .desktop database (discovery, filtering, categories,
+                Exec parsing per the spec, terminal strategy, search)
+panel-menu.c    the applications menu: two-pane popup (categories |
+                applications), search, scroll, favorites
+panel-clock.c   clock format engine + the calendar popup
+panel-pager.c   the graphical workspace pager (miniature desktops)
+panel-taskbar.c the window-button overflow list
+panel-config.c  the panel.conf INI reader + defaults
+panel-util.c    shared trace/ctl/time/metrics/text helpers
+```
+
+**Layout** is metric-driven, not pixel-hardcoded: the bar height
+derives from the output's *logical* size (auto mode, 30 px at 720p
+class up to 52 at 4K; `height=` overrides) so it stays proportional
+when the compositor exposes a scale; fonts pick the 16 or 24 px
+raster, icons and paddings derive from the height. The region order
+is the XFCE one — `[Start|launchers] [taskbar…] [pager][clock][Exit]`
+— with the taskbar consuming the flexible middle; overlap is
+impossible by construction (one flat widget array laid out from both
+ends). Region order and bar height are verified by pixel scans at
+720p/1080p/1440p/4K in the test suite.
+
+**Data sources** stay pure protocol: windows and titles via
+wlr-foreign-toplevel (click active = minimize, click other = focus,
+middle/right = close), workspaces via ext-workspace, per-window
+workspace membership via xw-workspace-info-v1. Application metadata
+comes from the freedesktop desktop-entry files; icons from the XDG
+icon theme search (PNG through optional libpng, XPM in-house, SVG
+skipped — a documented deviation) with procedural fallbacks so the
+panel never depends on an icon theme being installed.
+
+**Popups** (menu, calendar, overflow list) share one pattern: an
+xdg_popup parented to the bar through `zwlr_layer_surface.get_popup`,
+a positioner anchored to the button (upward-opening on bottom bars),
+configure→draw→grab ordering, Escape/outside-press dismissal through
+the seat grab, and a same-click reopen guard for the toggle.
+
+`libxwcl` exposes the manager bindings (`xwc_tasklist`,
+`xwc_wspaces`) with lazy proxy binding — binding a manager immediately
+materializes `new_id` announcement proxies (workspace group + handles,
+window handles), so clients that never create these objects never pay
+for them (an eager version leaked 5 proxies per client, caught by
+LSan). The panel main loop dispatches with a 1-second timeout ceiling:
+the poll timeout exists precisely so timer-driven redraws (the clock)
+can fire between server events. Launch actions go through the
+session's ctl `run` wire (parsed argv, shell-quoted, forked) so no
+click can ever block the dispatch loop.
 
 ## Seat providers and the real DRM/KMS session
 

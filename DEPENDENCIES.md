@@ -35,6 +35,7 @@ rules apply and are documented.
 | **Xvfb** | virtual X server driving the X11-backend process checks | any | MIT | dev/test only | ✔ (tests) | – | – | yes | none |
 | **libdrm** | DRM/KMS backend: device discovery, connector/CRTC/mode enumeration, dumb-buffer scanout, page flips, master management | 2.4.110+ | MIT | both (backend optional) | – | ✔ | – | **yes** (`XW_DRM`) | none |
 | **libseat** | optional seat-provider portability layer: wraps systemd-logind, elogind and seatd behind one API. Not required: the built-in seatd client and direct-VT provider cover the same ground without it | 0.7 | MIT | both (provider optional) | – | ✔ (one seat provider) | – | **yes** (`XW_LIBSEAT`) | none |
+| **libpng** | optional PNG icon decoding in `libxwcl`'s XDG icon pipeline (panel menus, taskbar, calendar arrows). Without it icons fall back to XPM + procedural tiles — the panel never breaks | 1.6 | libpng2/pngClrbk-style (permissive; linking imposes no source obligations) | both (optional) | – | – | – | **yes** (`XW_PNG`) | none |
 | **XWayland** | *(future)* optional compatibility server for legacy X11 applications only — never a foundation of this desktop | 22+ | MIT/X11 | future (Phase 8) | – | – | ✔ | **yes** (planned) | none |
 
 ✔ = required for that mode · – = not used in that mode.

@@ -144,6 +144,7 @@ the configurable install prefix.
 | `XW_LIBINPUT` | `auto` (default) / `1` / `0` | real-input backend (needs the libinput **and** libudev dev sets — see the requirement row above). `auto` builds it when both are found, printing an actionable note naming the missing one otherwise; `1` requires both (hard error naming whichever is missing); `0` never builds it. Switching the backend on/off over a populated build tree requires `make clean` (the build refuses to mix feature sets, exactly like PROFILE switching) |
 | `XW_DRM` | `auto` (default) / `1` / `0` | DRM/KMS backend for real TTY sessions (needs the libdrm **and** libudev dev sets). `auto` builds it when both are found; `1` requires both (hard error); `0` never builds it — headless/nested and all their tests keep working. Switching over a populated tree needs `make clean` |
 | `XW_LIBSEAT` | `auto` (default) / `1` / `0` | external libseat seat provider — **the elogind/logind path on real TTYs needs it**. `auto` builds it when the dev files are found and prints a warning naming the real-TTY consequence when not (no keyboard/mouse on logind systems); `1` requires the libseat dev files (hard error with instructions); `0` builds without and silences the warning. Switching over a populated tree needs `make clean` |
+| `XW_PNG` | `auto` (default) / `1` / `0` | PNG icon decoding in the client library (libpng). `auto` builds it when the dev files are found and prints a note otherwise; `1` requires them (hard error); `0` builds without. Without it the panel still renders XPM icons and its procedural fallbacks — only PNG icons from icon themes go missing. Switching over a populated tree needs `make clean` |
 | `PROFILE` | `release` (default) / `debug` / `asan` | compiler/linker preset, see [profiles](#build-profiles) |
 | `prefix` | path (default `/usr/local`) | installation prefix |
 | `DESTDIR` | path | staged install root (packagers) |
@@ -166,6 +167,39 @@ the configurable install prefix.
 | `XW_LOCK_PASSPHRASE_FILE` | passphrase file for `xw-lock` (default: `~/.config/xfce4-wayland/lock-pass`, first line, `chmod 600` it; see `xw-lock --help`) |
 
 ---
+
+## Panel configuration
+
+The panel reads `$XDG_CONFIG_HOME/xw-panel/panel.conf`
+(default `~/.config/xw-panel/panel.conf`; `$XW_PANEL_CONF` overrides
+the path for tests/embedded setups). No file is required — the
+defaults render a complete bar. An annotated example ships in
+[data/examples/panel.conf](data/examples/panel.conf):
+
+```ini
+[panel]
+# height = auto            # auto (derive from the output) or px, 24..200
+# position = top           # top | bottom
+# launchers = org.example.Terminal,org.example.Editor   # desktop ids
+# favorites = org.example.Browser                       # menu favorites
+# icon-theme = Papirus     # XDG icon theme (XW_ICON_THEME env still wins)
+
+[clock]
+# format = %a %d %b %H:%M  # tokens: %a %b %d %m %H %I %M %S %p %y %Y %%
+# seconds = false          # true ticks every second
+
+[tasklist]
+# style = icons+text       # icons+text | icons | text
+
+[menu]
+# icons = true             # render XDG icons in the applications menu
+```
+
+The bar height auto-mode derives from the output's **logical** size
+(~1/32, clamped to 30–52 px): 30 px at 720p/1080p class, 45 at 1440p,
+52 at 4K without compositor scaling — comfortably usable, never
+microscopic. A compositor-side `wl_output` scale shrinks the logical
+size proportionally, so the bar scales with the display.
 
 ## Build profiles
 

@@ -31,7 +31,7 @@ between them.
 | Component | Sources | Builds | Notes |
 |-----------|---------|--------|-------|
 | compositor | `src/libxw/`, `src/compositor/` | `make compositor` | server library + main; knows nothing about panels, sessions or XFCE |
-| panel | `subprojects/panel/` | `make panel` | layer-shell client; links ONLY `libxwcl` + `xw-ctl` |
+| panel | `subprojects/panel/` | `make panel` | layer-shell client; links ONLY `libxwcl` + `xw-ctl`; modules archived as `libpanelcore.a` (also linked by the test suite) |
 | session manager | `src/session/` | `make session` | starts/stops the compositor and desktop components; owns the ctl socket |
 | session utilities | `src/clients/` | `make clients` | exit dialog, lock, demo — clients of both compositor (protocols) and session (ctl) |
 | client library | `src/libxwcl/` | (library) | shared Wayland client helper: connection, xdg-shell, layer-shell, input, drawing |
@@ -51,7 +51,14 @@ between them.
    `libxwcl` + `xw-ctl` only; no `libxw` object is compiled. The panel
    reaches the compositor exclusively through Wayland protocols
    (`wl_seat`, `zwlr_layer_shell_v1`, `wlr-foreign-toplevel-management`,
-   `ext-workspace`).
+   `ext-workspace`, `xw-workspace-info-v1`). The panel modules:
+   `xw-panel.c` (core: metrics/regions/input/main loop), `panel-apps.c`
+   (XDG .desktop database: discovery/filtering/categories/Exec
+   parsing), `panel-menu.c` (the applications-menu popup),
+   `panel-clock.c` (clock + calendar popup), `panel-pager.c` (the
+   graphical workspace pager), `panel-taskbar.c` (the window-buttons
+   overflow list), `panel-config.c` (panel.conf reader),
+   `panel-util.c` (shared helpers).
 3. **Cross-component actions go through the session manager's ctl
    socket** (a 0700 unix socket at `$XDG_RUNTIME_DIR/xw-session.sock`,
    line protocol: `run <cmd>`, `exit-dialog`, `logout`, `status`, ...).
