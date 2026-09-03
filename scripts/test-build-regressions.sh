@@ -92,14 +92,22 @@ rc=$?
 check "R1: output is deterministic (two runs identical)" '[ "$rc" -eq 0 ]'
 
 nglyphs=$(grep -c '^static const uint8_t xw_bits_' "$TMP/f1.h" 2>/dev/null || echo 0)
-check "R1: header defines all 95 ASCII glyphs (found $nglyphs)" \
-    '[ "$nglyphs" -eq 95 ]'
+check "R1: header defines the Latin coverage glyphs (found $nglyphs)" \
+    '[ "$nglyphs" -ge 600 ]'
 grep -q '^#define XW_FONT_LINE_H' "$TMP/f1.h"
 rc=$?
 check "R1: header carries font metrics" '[ "$rc" -eq 0 ]'
-grep -q 'DejaVuSans-ascii.ttf (bundled asset' "$TMP/f1.h"
+grep -q 'DejaVuSans-latin.ttf (bundled asset' "$TMP/f1.h"
 rc=$?
 check "R1: header records the bundled font provenance" '[ "$rc" -eq 0 ]'
+# the codepoints application names actually use must be rasterized:
+# U+00E9 (e-acute), U+00F6 (o-umlaut) at 16px and U+2026 (ellipsis)
+grep -q 'xw_bits_233\[' "$TMP/f1.h"
+grep -q 'xw_bits_246\[' "$TMP/f1.h"
+grep -q 'xw_bits2p_8230\[' "$TMP/f1.h"
+rc=$?
+check "R1: accented + ellipsis glyphs rasterized (U+00E9 U+00F6 U+2026)" \
+    '[ "$rc" -eq 0 ]'
 
 # missing asset -> immediate, precise diagnostic
 mkdir -p "$TMP/noasset/tools" "$TMP/noasset/build/gen"
@@ -193,7 +201,7 @@ if unshare -rm true >/dev/null 2>&1; then
     hidden="$(cat "$TMP/fontcount" 2>/dev/null || echo '?')"
     check "R3: build + session succeed with fonts hidden ($hidden files left visible)" \
         '[ "$rc" -eq 0 ]'
-    grep -q "genfont: 95 glyphs" "$TMP/fontless.log"
+    grep -q "genfont: 560+64 glyphs" "$TMP/fontless.log"
     rc=$?
     check "R3: font rasterized from the bundled asset" '[ "$rc" -eq 0 ]'
     grep -q "session exited (rc=0)" "$TMP/fontless.log"
