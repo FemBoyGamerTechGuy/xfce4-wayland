@@ -51,28 +51,30 @@ void xwc_draw_hline(uint32_t *pix, int stride, int w, int h, int x, int y,
     xwc_fill_rect(pix, stride, w, h, x, y, len, 1, color);
 }
 
-int xwc_text_width(const char *text) {
-    int x = 0;
-    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
-        if (*p < XW_FONT_FIRST || *p > XW_FONT_LAST)
-            x += XW_FONT_ASCENT / 2;
-        else
-            x += xw_glyph_table[*p - XW_FONT_FIRST].adv;
-    }
-    return x;
+void xwc_draw_vline(uint32_t *pix, int stride, int w, int h, int x, int y,
+                    int len, uint32_t color) {
+    xwc_fill_rect(pix, stride, w, h, x, y, 1, len, color);
 }
 
-int xwc_draw_text(uint32_t *pix, int stride, int w, int h, int x, int y,
-                  const char *text, uint32_t color) {
-    /* y = top of the line box; glyphs sit on the baseline */
+/* ---------------------------------------------------------------- text */
+/* One rasterization of the glyph blitter, parameterized by the table:
+ * glyphs sit on a baseline at pen y + ascent; per-glyph offsets shift
+ * the bitmap relative to the pen. */
+static int draw_text_tbl(uint32_t *pix, int stride, int w, int h, int x,
+                         int y, const char *text, uint32_t color,
+                         const struct xw_glyph *table, int ascent) {
     for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
         if (*p < XW_FONT_FIRST || *p > XW_FONT_LAST) {
-            x += XW_FONT_ASCENT / 2;
+            x += ascent / 2;
             continue;
         }
-        const struct xw_glyph *g = &xw_glyph_table[*p - XW_FONT_FIRST];
+        const struct xw_glyph *g = &table[*p - XW_FONT_FIRST];
+        if (!g->bits) {
+            x += g->adv;
+            continue;
+        }
         for (int j = 0; j < g->h; j++) {
-            int py = y + XW_FONT_ASCENT + g->yoff + j;
+            int py = y + ascent + g->yoff + j;
             if (py < 0 || py >= h)
                 continue;
             for (int i = 0; i < g->w; i++) {
@@ -82,13 +84,69 @@ int xwc_draw_text(uint32_t *pix, int stride, int w, int h, int x, int y,
                 uint8_t alpha = g->bits[j * g->w + i];
                 if (!alpha)
                     continue;
-                uint32_t c = (color & 0x00ffffffu) | ((uint32_t)alpha << 24);
+                uint32_t c =
+                    (color & 0x00ffffffu) | ((uint32_t)alpha << 24);
                 pix[py * stride + px] = blend(pix[py * stride + px], c);
             }
         }
         x += g->adv;
     }
     return x;
+}
+
+static int text_width_tbl(const char *text, const struct xw_glyph *table,
+                          int ascent) {
+    int x = 0;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        if (*p < XW_FONT_FIRST || *p > XW_FONT_LAST)
+            x += ascent / 2;
+        else
+            x += table[*p - XW_FONT_FIRST].adv;
+    }
+    return x;
+}
+
+int xwc_text_width(const char *text) {
+    return text_width_tbl(text, xw_glyph_table, XW_FONT_ASCENT);
+}
+
+int xwc_draw_text(uint32_t *pix, int stride, int w, int h, int x, int y,
+                  const char *text, uint32_t color) {
+    /* y = top of the line box; glyphs sit on the baseline */
+    return draw_text_tbl(pix, stride, w, h, x, y, text, color, xw_glyph_table,
+                         XW_FONT_ASCENT);
+}
+
+int xwc_text_width2(const char *text) {
+    return text_width_tbl(text, xw_glyph_table2, XW_FONT2_ASCENT);
+}
+
+int xwc_draw_text2(uint32_t *pix, int stride, int w, int h, int x, int y,
+                   const char *text, uint32_t color) {
+    return draw_text_tbl(pix, stride, w, h, x, y, text, color,
+                         xw_glyph_table2, XW_FONT2_ASCENT);
+}
+
+/* ---------------------------------------------------------------- icon */
+void xwc_draw_icon(uint32_t *pix, int stride, int w, int h, int x, int y,
+                   const struct xwc_icon *ic, int size) {
+    if (!ic || !ic->pix || size < 1)
+        return;
+    /* center the (already cell-sized) surface in a size x size cell */
+    int ox = x + (size - ic->w) / 2;
+    int oy = y + (size - ic->h) / 2;
+    for (int j = 0; j < ic->h; j++) {
+        int py = oy + j;
+        if (py < 0 || py >= h)
+            continue;
+        for (int i = 0; i < ic->w; i++) {
+            int px = ox + i;
+            if (px < 0 || px >= w)
+                continue;
+            pix[py * stride + px] = blend(pix[py * stride + px],
+                                          ic->pix[j * ic->w + i]);
+        }
+    }
 }
 
 void xwc_draw_box(uint32_t *pix, int stride, int w, int h, int x, int y,

@@ -21,6 +21,9 @@
 #   XW_LIBSEAT=auto|1|0    external libseat seat provider (libseat;
 #                          the built-in seatd-client and direct-VT
 #                          providers need no library)
+#   XW_PNG=auto|1|0        PNG icon decoding in the client library
+#                          (libpng; without it icons fall back to XPM
+#                          and procedural rendering)
 #   PROFILE=release|debug|asan   build profile (switching needs
 #                          `make clean`; the guard enforces it)
 #   prefix=DIR             installation prefix ($HOME/.local works)
@@ -351,6 +354,37 @@ LDLIBS_LIBSEAT :=
 HAVE_LIBSEAT   :=
 endif
 
+# libpng icon decoding — XW_PNG = auto|1|0. Optional: libxwcl's icon
+# pipeline (xwc-icon.c) uses it for PNG icons (hicolor themes are PNG
+# almost everywhere). Without it the panel still renders XPM icons and
+# degrades to text + procedural fallbacks — no crash, no missing panel.
+PNG_FOUND := $(shell pkg-config --exists libpng 2>/dev/null && echo y)
+PNG_VER   := $(shell pkg-config --modversion libpng 2>/dev/null)
+ifeq ($(XW_PNG),1)
+  ifneq ($(PNG_FOUND),y)
+    $(error PNG icon decoding requested (XW_PNG=1) but the libpng development files were not found. Install your distribution's libpng development package (BUILDING.md), or build with XW_PNG=auto/0 — icons then fall back to XPM and procedural rendering.)
+  endif
+  PNG_ON := y
+else ifeq ($(XW_PNG),0)
+  PNG_ON :=
+else
+  PNG_ON := $(PNG_FOUND)
+  ifneq ($(PNG_FOUND),y)
+    $(info png: libpng development files not found — PNG icons will not render (XPM icons and procedural fallbacks still do).)
+    $(info png: install the libpng development package (BUILDING.md) to enable PNG icons, or set XW_PNG=0 to silence this note.)
+  endif
+endif
+
+ifeq ($(PNG_ON),y)
+CFLAGS_PNG := $(shell pkg-config --cflags libpng 2>/dev/null)
+LDLIBS_PNG := $(shell pkg-config --libs libpng 2>/dev/null)
+HAVE_PNG    := -DXW_HAVE_PNG
+else
+CFLAGS_PNG :=
+LDLIBS_PNG :=
+HAVE_PNG    :=
+endif
+
 # libudev is a DIRECT link dependency when EITHER the libinput backend
 # or the DRM backend is built (both create their own udev objects), so
 # it resolves independently of which one pulled it in.
@@ -377,14 +411,14 @@ ifeq ($(XW_PROFILE_GUARD),skip)
 XW_FEATURE_GUARD := skip
 endif
 XW_TREE_FEATURES := $(shell cat build/.features 2>/dev/null)
-XW_FEATURES_NOW  := x11=$(if $(X11_ON),y,n) libinput=$(if $(LIBINPUT_ON),y,n) drm=$(if $(DRM_ON),y,n) libseat=$(if $(LIBSEAT_ON),y,n)
+XW_FEATURES_NOW  := x11=$(if $(X11_ON),y,n) libinput=$(if $(LIBINPUT_ON),y,n) drm=$(if $(DRM_ON),y,n) libseat=$(if $(LIBSEAT_ON),y,n) png=$(if $(PNG_ON),y,n)
 ifneq ($(XW_FEATURE_GUARD),skip)
 ifneq ($(XW_TREE_FEATURES),$(XW_FEATURES_NOW))
 ifneq ($(wildcard build/obj),)
 ifeq ($(XW_TREE_FEATURES),)
 $(error build tree holds objects but no build/.features stamp (built before feature tracking existed, or by a file-target-only build). Run `make clean` once so the tree records its feature set.)
 else
-$(error build tree holds objects for features '$(XW_TREE_FEATURES)' but the current configuration resolves to '$(XW_FEATURES_NOW)'. Switching XW_X11/XW_LIBINPUT/XW_DRM/XW_LIBSEAT across a resolved-state change needs a clean tree: run `make clean` first.)
+$(error build tree holds objects for features '$(XW_TREE_FEATURES)' but the current configuration resolves to '$(XW_FEATURES_NOW)'. Switching XW_X11/XW_LIBINPUT/XW_DRM/XW_LIBSEAT/XW_PNG across a resolved-state change needs a clean tree: run `make clean` first.)
 endif
 endif
 endif
@@ -533,19 +567,19 @@ $(OBJ)/session/%.o: src/session/%.c | $(OBJ)/session
 # compiles anything from libxw — `make panel` works without the
 # compositor and the compositor never references it.
 build/bin/xw-panel: $(OBJ)/panel/xw-panel.o $(OBJ)/clients/xw-ctl.o build/lib/libxwcl.a | build/bin
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/panel/xw-panel.o $(OBJ)/clients/xw-ctl.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/panel/xw-panel.o $(OBJ)/clients/xw-ctl.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_PNG) $(LDLIBS_M)
 
 $(OBJ)/panel/%.o: subprojects/panel/%.c src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/panel
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLC) $(CFLAGS_PIX) -c $< -o $@
 
 build/bin/xw-exit: $(OBJ)/clients/xw-exit.o $(OBJ)/clients/xw-ctl.o $(OBJ)/session/xw-power.o build/lib/libxwcl.a | build/bin
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-exit.o $(OBJ)/clients/xw-ctl.o $(OBJ)/session/xw-power.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-exit.o $(OBJ)/clients/xw-ctl.o $(OBJ)/session/xw-power.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_PNG) $(LDLIBS_M)
 
 build/bin/xw-demo: $(OBJ)/clients/xw-demo.o build/lib/libxwcl.a | build/bin
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-demo.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-demo.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_PNG) $(LDLIBS_M)
 
 build/bin/xw-lock: $(OBJ)/clients/xw-lock.o build/lib/libxwcl.a | build/bin
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-lock.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/clients/xw-lock.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_PNG) $(LDLIBS_M)
 
 $(OBJ)/clients/%.o: src/clients/%.c src/clients/*.h src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/clients
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLC) $(CFLAGS_PIX) -c $< -o $@
@@ -553,7 +587,7 @@ $(OBJ)/clients/%.o: src/clients/%.c src/clients/*.h src/libxwcl/*.h $(GEN_HEADER
 # ---------------------------------------------------------------- tests
 TEST_SRC := $(wildcard tests/suite/*.c)
 build/tests/run-tests: $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a | build/tests
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_WLC) $(LDLIBS_X11) $(LDLIBS_LIBINPUT) $(LDLIBS_LIBUDEV) $(LDLIBS_DRM) $(LDLIBS_LIBSEAT) $(LDLIBS_M)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_WLC) $(LDLIBS_X11) $(LDLIBS_LIBINPUT) $(LDLIBS_LIBUDEV) $(LDLIBS_DRM) $(LDLIBS_LIBSEAT) $(LDLIBS_PNG) $(LDLIBS_M)
 
 $(OBJ)/tests/%.o: tests/suite/%.c tests/harness/xwtest.h $(LIBXW_DEPS) src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/tests
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_WLC) $(CFLAGS_PIX) $(CFLAGS_XKB) $(HAVE_X11) $(HAVE_LIBINPUT) $(HAVE_LIBSEAT) $(HAVE_DRM) -c $< -o $@
@@ -638,7 +672,7 @@ build/.profile:
 # resolved-feature stamp consulted by the feature guard above
 build/.features:
 	@mkdir -p $(@D)
-	@printf 'x11=%s libinput=%s drm=%s libseat=%s\n' '$(if $(X11_ON),y,n)' '$(if $(LIBINPUT_ON),y,n)' '$(if $(DRM_ON),y,n)' '$(if $(LIBSEAT_ON),y,n)' > $@
+	@printf 'x11=%s libinput=%s drm=%s libseat=%s png=%s\n' '$(if $(X11_ON),y,n)' '$(if $(LIBINPUT_ON),y,n)' '$(if $(DRM_ON),y,n)' '$(if $(LIBSEAT_ON),y,n)' '$(if $(PNG_ON),y,n)' > $@
 
 tests: all
 	build/tests/run-tests
@@ -682,18 +716,18 @@ SESSIONS_DIR  ?= $(datadir)/wayland-sessions
 
 INST_BINS := build/bin/xw-compositor $(SESSION_BINS) $(CLIENT_BINS)
 INST_DOCS := README.md BUILDING.md ARCHITECTURE.md ROADMAP.md \
-        TESTING.md DEPENDENCIES.md SECURITY.md \
-        THIRD-PARTY-LICENSES.md TODO.md LICENSE
+	TESTING.md DEPENDENCIES.md SECURITY.md \
+	THIRD-PARTY-LICENSES.md TODO.md LICENSE
 
 install: all
 	install -d $(DESTDIR)$(bindir) $(DESTDIR)$(SESSIONS_DIR) \
-                $(DESTDIR)$(docdir) $(DESTDIR)$(docdir)/examples
+	        $(DESTDIR)$(docdir) $(DESTDIR)$(docdir)/examples
 	for b in $(INST_BINS); do install -m755 "$$b" $(DESTDIR)$(bindir) || exit 1; done
 	install -m644 data/wayland-sessions/xfce4-wayland.desktop \
-                $(DESTDIR)$(SESSIONS_DIR)
+	        $(DESTDIR)$(SESSIONS_DIR)
 	for f in $(INST_DOCS); do install -m644 "$$f" $(DESTDIR)$(docdir) || exit 1; done
 	for f in data/examples/*.conf; do \
-                install -m644 "$$f" $(DESTDIR)$(docdir)/examples || exit 1; done
+	        install -m644 "$$f" $(DESTDIR)$(docdir)/examples || exit 1; done
 	@echo "installed to $(DESTDIR)$(prefix)"
 
 uninstall:

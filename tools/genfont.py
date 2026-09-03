@@ -6,6 +6,11 @@ font stack (fontconfig/freetype/pango) into the runtime dependency set. This
 build-time tool rasterizes ASCII 0x20..0x7E into per-glyph 8-bit alpha
 bitmaps; the generated data is compiled into the client library.
 
+Two sizes are emitted: the base table (default 16 px) used by every client,
+and a second larger table (default 24 px) for tall panels, menu rows and
+calendar headers, where the base raster would look undersized. The two
+tables share one struct type; names differ by the trailing "2".
+
 Font source policy (distro-agnostic by design):
 
   1. Default: the font bundled in this repository, assets/fonts/
@@ -21,9 +26,10 @@ distribution (/usr/share/fonts/truetype/... vs /usr/share/fonts/TTF/...),
 and relying on them made the build fail on systems where the documented
 package list was in fact installed.
 
-Usage: genfont.py -o OUTPUT [--font PATH] [--size PX]
+Usage: genfont.py -o OUTPUT [--font PATH] [--size PX] [--size2 PX]
 
-Output: a C header defining xw_glyph[] and xw_font_meta.
+Output: a C header defining xw_glyph_table/xw_glyph_table2 and the
+XW_FONT_/XW_FONT2_ metrics macros.
 """
 
 import argparse
@@ -36,6 +42,61 @@ BUNDLED_FONT = os.path.join(REPO_ROOT, "assets", "fonts", "DejaVuSans-ascii.ttf"
 
 START, END = 0x20, 0x7E  # printable ASCII
 
+# PIL is imported inside main() (deferred so --help works without Pillow);
+# the module-level names are assigned there for rasterize().
+Image = None
+ImageDraw = None
+
+
+def rasterize(font, tag, out):
+    """Emit glyph data for `font` into `out` (list of C lines).
+
+    Returns the glyph_table rows plus (line_h, ascent) metrics.
+    """
+    glyphs = {}
+    ascent, descent = font.getmetrics()
+    for cp in range(START, END + 1):
+        ch = chr(cp)
+        try:
+            bbox = font.getbbox(ch)
+        except Exception:
+            continue
+        if bbox is None:
+            continue
+        w = max(1, bbox[2] - bbox[0])
+        h = max(1, bbox[3] - bbox[1])
+        img = Image.new("L", (w + 2, h + 2), 0)
+        d = ImageDraw.Draw(img)
+        d.text((-bbox[0] + 1, -bbox[1] + 1), ch, font=font, fill=255)
+        glyphs[cp] = (w + 2, h + 2, img)
+
+    if len(glyphs) < (END - START + 1) // 2:
+        print("error: font provides only %d of %d ASCII glyphs — unusable"
+              % (len(glyphs), END - START + 1), file=sys.stderr)
+        sys.exit(1)
+
+    line_h = ascent + descent
+    glyph_table = []
+    for cp in range(START, END + 1):
+        if cp not in glyphs:
+            glyph_table.append("    {0, 0, 0, 0, 0, NULL}, /* 0x%02x */" % cp)
+            continue
+        w, h, img = glyphs[cp]
+        data = list(img.getdata())
+        out.append("/* 0x%02x %r */" % (cp, chr(cp)))
+        out.append("static const uint8_t xw_bits%s_%d[] = {" % (tag, cp))
+        out.append("    " + ", ".join(str(b) for b in data) + ",")
+        out.append("};")
+        bbox = font.getbbox(chr(cp))
+        # Draw origin: pen at (0, ascent); image holds glyph starting at (xoff, ascent + yoff)
+        xoff = bbox[0] - 1
+        yoff = bbox[1] - 1 - ascent
+        adv = font.getlength(chr(cp))
+        glyph_table.append("    {%d, %d, %d, %d, %d, xw_bits%s_%d},"
+                           % (w, h, xoff, yoff, int(adv + 0.5), tag, cp))
+
+    return glyph_table, line_h, ascent
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -43,10 +104,15 @@ def main() -> int:
     ap.add_argument("--font",
                     help="explicit font file to rasterize (default: the "
                          "font bundled in this repository)")
-    ap.add_argument("--size", type=int, default=16)
+    ap.add_argument("--size", type=int, default=16,
+                    help="base rasterization size in px (default 16)")
+    ap.add_argument("--size2", type=int, default=24,
+                    help="second (larger) rasterization size in px "
+                         "(default 24; 0 disables the second table)")
     args = ap.parse_args()
 
     try:
+        global Image, ImageDraw
         from PIL import Image, ImageDraw, ImageFont
     except ImportError:
         print("error: the Pillow python module is required at build time to\n"
@@ -88,29 +154,6 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
-    glyphs = {}
-    ascent, descent = font.getmetrics()
-    for cp in range(START, END + 1):
-        ch = chr(cp)
-        try:
-            bbox = font.getbbox(ch)
-        except Exception:
-            continue
-        if bbox is None:
-            continue
-        w = max(1, bbox[2] - bbox[0])
-        h = max(1, bbox[3] - bbox[1])
-        img = Image.new("L", (w + 2, h + 2), 0)
-        d = ImageDraw.Draw(img)
-        d.text((-bbox[0] + 1, -bbox[1] + 1), ch, font=font, fill=255)
-        glyphs[cp] = (w + 2, h + 2, img)
-
-    if len(glyphs) < (END - START + 1) // 2:
-        print("error: '%s' provides only %d of %d ASCII glyphs — unusable"
-              % (font_path, len(glyphs), END - START + 1), file=sys.stderr)
-        return 1
-
-    line_h = ascent + descent
     out = ["/* Generated by tools/genfont.py — DO NOT EDIT.",
            " * Rasterized at build time from: " + source_note,
            " * The bundled asset is a subset of DejaVu Sans 2.37 — license",
@@ -123,8 +166,6 @@ def main() -> int:
            "",
            "#define XW_FONT_FIRST 0x20",
            "#define XW_FONT_LAST 0x7e",
-           "#define XW_FONT_LINE_H %d" % line_h,
-           "#define XW_FONT_ASCENT %d" % ascent,
            "",
            "struct xw_glyph {",
            "    uint8_t w, h;",
@@ -134,28 +175,34 @@ def main() -> int:
            "};",
            ""]
 
-    glyph_table = []
-    for cp in range(START, END + 1):
-        if cp not in glyphs:
-            glyph_table.append("    {0, 0, 0, 0, 0, NULL}, /* 0x%02x */" % cp)
-            continue
-        w, h, img = glyphs[cp]
-        data = list(img.getdata())
-        out.append("/* 0x%02x %r */" % (cp, chr(cp)))
-        out.append("static const uint8_t xw_bits_%d[] = {" % cp)
-        out.append("    " + ", ".join(str(b) for b in data) + ",")
-        out.append("};")
-        bbox = font.getbbox(chr(cp))
-        # Draw origin: pen at (0, ascent); image holds glyph starting at (xoff, ascent + yoff)
-        xoff = bbox[0] - 1
-        yoff = bbox[1] - 1 - ascent
-        adv = font.getlength(chr(cp))
-        glyph_table.append("    {%d, %d, %d, %d, %d, xw_bits_%d}," % (w, h, xoff, yoff, int(adv + 0.5), cp))
-
+    table, line_h, ascent = rasterize(font, "", out)
+    out.append("")
+    out.append("#define XW_FONT_LINE_H %d" % line_h)
+    out.append("#define XW_FONT_ASCENT %d" % ascent)
     out.append("")
     out.append("static const struct xw_glyph xw_glyph_table[] = {")
-    out.extend(glyph_table)
+    out.extend(table)
     out.append("};")
+    out.append("")
+
+    n2 = len(table)
+    if args.size2 and args.size2 > 0:
+        try:
+            font2 = ImageFont.truetype(font_path, args.size2)
+        except Exception as e:
+            print("error: could not rasterize size %d from '%s': %s"
+                  % (args.size2, font_path, e), file=sys.stderr)
+            return 1
+        table2, line_h2, ascent2 = rasterize(font2, "2", out)
+        out.append("")
+        out.append("#define XW_FONT2_LINE_H %d" % line_h2)
+        out.append("#define XW_FONT2_ASCENT %d" % ascent2)
+        out.append("")
+        out.append("static const struct xw_glyph xw_glyph_table2[] = {")
+        out.extend(table2)
+        out.append("};")
+        n2 = len(table2)
+
     out.append("")
     out.append("#endif")
 
@@ -164,8 +211,11 @@ def main() -> int:
         os.makedirs(outdir, exist_ok=True)
     with open(args.output, "w") as f:
         f.write("\n".join(out) + "\n")
-    print("genfont: %d glyphs, line height %d, source: %s -> %s"
-          % (len(glyphs), line_h, os.path.basename(font_path), args.output))
+    print("genfont: %d glyphs (line height %d, size %d%s) source: %s -> %s"
+          % (len(table), line_h, args.size,
+             ", second table line height %d (size %d, %d glyphs)"
+             % (line_h2, args.size2, n2) if args.size2 else "",
+             os.path.basename(font_path), args.output))
     return 0
 
 
