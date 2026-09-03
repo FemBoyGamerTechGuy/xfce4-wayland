@@ -36,6 +36,9 @@
 #include "wlr-layer-shell-unstable-v1.h"
 #include <xkbcommon/xkbcommon-keysyms.h>
 
+#include "panel-menu.h"   /* pm_menu_*: the Start menu module */
+#include "panel-pager.h"  /* pm_pager_*: the workspace pager */
+
 /* ------------------------------------------------------------------ */
 /* Terminal resolution for the no-applications fallback — the shared
  * implementation lives in the apps database (panel-apps.c). */
@@ -106,11 +109,11 @@ static int start_button_w(const struct panel *p) {
 }
 
 static int ws_box_w(const struct panel *p) {
-    int w = (int)(p->m.H * 1.5);
-    if (w < 44)
-        w = 44;
-    if (w > 84)
-        w = 84;
+    int w = (int)(p->m.H * 1.7);
+    if (w < 48)
+        w = 48;
+    if (w > 96)
+        w = 96;
     return w;
 }
 
@@ -403,7 +406,13 @@ static void draw_btn(struct panel *p, uint32_t *pix, int stride, int bw,
         return;
     }
 
-    /* centered text: ws boxes, clock */
+    if (b->kind == BTN_WS) {
+        /* the graphical pager owns the workspace boxes */
+        pm_pager_draw_box(p, pix, stride, bw, bh, b->x, y, b->w, h,
+                          (int)(intptr_t)b->data, b->active, b->hover);
+        return;
+    }
+    /* centered text: clock */
     uint32_t c_fg = b->kind == BTN_CLOCK ? COL_TEXT_DIM : fg;
     int tx = b->x + (b->w - panel_text_width(p, b->label)) / 2;
     panel_draw_text(p, pix, stride, bw, bh, tx, ty, b->label, c_fg);
@@ -470,8 +479,6 @@ static const char *btn_kind_name(int kind) {
 /* The Start/Applications menu (panel-menu.c owns the module from the
  * next commit; the geometry plumbing lives here so the region order
  * is testable already). */
-
-#include "panel-menu.h" /* pm_menu_*: the Start menu module */
 
 /* ------------------------------------------------------------ actions */
 

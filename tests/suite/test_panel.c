@@ -64,7 +64,6 @@ static pid_t spawn_panel(struct xwt_ctx *t, const char *log_suffix) {
         setenv("WAYLAND_DISPLAY", t->socket_name, 1);
         setenv("XDG_RUNTIME_DIR", g_runtimedir(), 1);
         setenv("XW_PANEL_TRACE", "1", 1);
-        setenv("WAYLAND_DEBUG", "1", 1);
         char path[128];
         snprintf(path, sizeof(path), "/tmp/xw-panel-child%s.log", log_suffix);
         int logfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -1365,6 +1364,141 @@ static void test_panel_menu_v2(struct xwt_ctx *t) {
     unlink(conf);
 }
 
+
+/* the graphical pager: workspace boxes carry window miniatures. A
+ * window moved to workspace 2 lights a tile in box 2's interior (the
+ * tile color, not the box chrome); the active workspace box is the
+ * highlighted one; clicking a box still switches workspaces. */
+static void test_panel_pager(struct xwt_ctx *t) {
+    pid_t pid = spawn_panel(t, "-pager");
+    XWT_ASSERT(pid > 0);
+    PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
+
+    /* two windows; both land on the current workspace (0) */
+    struct xwc_win *a = xwt_window_solid(t, 0xff112233, 200, 100, "PagerA");
+    struct xwc_win *b = xwt_window_solid(t, 0xff445566, 200, 100, "PagerB");
+    XWT_ASSERT(a && b);
+    XWT_WAIT(t, t->comp->wm->focused && t->comp->wm->focused->ws == 0);
+
+    /* find the ws boxes by the run scan (right region, before clock) */
+    struct bar_run runs[MAX_RUNS];
+    int n = 0;
+    int exit_i = -1;
+    for (int i = 0; i < 400 && exit_i < 0; i++) {
+        xwt_pump(t);
+        n = bar_scan_runs(t, runs);
+        for (int k = n - 1; k >= 0; k--)
+            if (runs[k].color == 0xffa33434 || runs[k].color == 0xffc94b4b) {
+                exit_i = k;
+                break;
+            }
+    }
+    /* the ws boxes are the runs immediately left of the clock; task
+     * buttons may sit between the start button and them */
+    int clock_i = exit_i - 1;
+    int n_ws = t->comp->wm->ws_count;
+    int first_ws = clock_i - n_ws;
+    XWT_ASSERT(first_ws >= 1);
+    int box1_x0 = runs[first_ws].x0, box1_x1 = runs[first_ws].x1;
+    int box2_x0 = runs[first_ws + 1].x0, box2_x1 = runs[first_ws + 1].x1;
+
+    /* 1. tiles render in box 1 (both windows live on workspace 0) */
+    bool tile = false;
+    for (int i = 0; i < 400 && !tile; i++) {
+        xwt_pump(t);
+        for (int x = box1_x0 + 6; x < box1_x1 - 6 && !tile; x++)
+            for (int yy = 4; yy < first_top_layer(t)->h - 4; yy++)
+                if (pixel_at(t, x, yy) == 0xff55627a ||
+                    pixel_at(t, x, yy) == 0xff3584e4) {
+                    tile = true;
+                    break;
+                }
+        if (!tile)
+            usleep(10000);
+    }
+    XWT_CHECK(tile, "window tiles rendered inside workspace box 1");
+
+    /* 2. move window A to workspace 2 (1): its tile appears in box 2 */
+    struct xw_window *wa = t->comp->wm->focused;
+    XWT_ASSERT(wa);
+    xw_wm_window_to_workspace(t->comp->wm, wa, 1);
+    bool tile2 = false;
+    for (int i = 0; i < 400 && !tile2; i++) {
+        xwt_pump(t);
+        for (int x = box2_x0 + 6; x < box2_x1 - 6 && !tile2; x++)
+            for (int yy = 4; yy < first_top_layer(t)->h - 4; yy++)
+                if (pixel_at(t, x, yy) == 0xff55627a ||
+                    pixel_at(t, x, yy) == 0xff3584e4) {
+                    tile2 = true;
+                    break;
+                }
+        if (!tile2)
+            usleep(10000);
+    }
+    XWT_CHECK(tile2, "moved window lights a tile in box 2");
+    /* and box 1 still shows the other window */
+    tile = false;
+    for (int x = box1_x0 + 6; x < box1_x1 - 6 && !tile; x++)
+        for (int yy = 4; yy < first_top_layer(t)->h - 4; yy++)
+            if (pixel_at(t, x, yy) == 0xff55627a ||
+                pixel_at(t, x, yy) == 0xff3584e4)
+                tile = true;
+    XWT_CHECK(tile, "box 1 keeps its remaining window tile");
+
+    /* 3. switching to workspace 2 re-lights the active box: the box 2
+     * border region gains the active border color */
+    xw_compositor_inject_pointer_motion(t->comp, (box2_x0 + box2_x1) / 2, 15);
+    pump_ms(t, 80);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, t->comp->wm->ws_current == 1);
+    XWT_CHECK(t->comp->wm->ws_current == 1,
+              "clicking a pager box switches workspaces");
+    bool active_border = false;
+    for (int i = 0; i < 300 && !active_border; i++) {
+        xwt_pump(t);
+        for (int x = box2_x0; x < box2_x1 && !active_border; x++) {
+            if (pixel_at(t, x, 3) == 0xff88b0ef ||
+                pixel_at(t, x, first_top_layer(t)->h - 4) == 0xff88b0ef)
+                active_border = true;
+        }
+        if (!active_border)
+            usleep(10000);
+    }
+    XWT_CHECK(active_border, "the active workspace box is outlined");
+
+    /* 4. sticky windows tile every box (dimmed) */
+    struct xw_window *wb = NULL;
+    wl_list_for_each(wb, &t->comp->wm->windows, link) {
+        if (strcmp(wb->title, "PagerB") == 0)
+            break;
+    }
+    XWT_ASSERT(wb);
+    wb->ws = -1;
+    xw_workspace_info_notify(t->comp, wb);
+    bool sticky_tile = false;
+    for (int i = 0; i < 400 && !sticky_tile; i++) {
+        xwt_pump(t);
+        /* box 3 has no windows of its own: a sticky tile appears */
+        for (int x = runs[first_ws + 2].x0 + 6;
+             x < runs[first_ws + 2].x1 - 6 && !sticky_tile; x++)
+            for (int yy = 4; yy < first_top_layer(t)->h - 4; yy++)
+                if (pixel_at(t, x, yy) == 0xff454f60) {
+                    sticky_tile = true;
+                    break;
+                }
+        if (!sticky_tile)
+            usleep(10000);
+    }
+    XWT_CHECK(sticky_tile, "sticky window tiles every box (dimmed)");
+
+    XWT_CHECK(kill(pid, 0) == 0, "panel alive after the pager flow");
+    xwc_win_destroy(a);
+    xwc_win_destroy(b);
+    reap(&pid);
+}
+
 /* compositor shutdown while the menu is open: the panel must exit
  * cleanly (no crash, exit status 0) */
 static void test_panel_menu_compositor_shutdown(struct xwt_ctx *t) {
@@ -1696,6 +1830,7 @@ static const struct xwt_test tests[] = {
     {"panel-start-repeated", test_panel_start_repeated},
     {"panel-menu", test_panel_menu},
     {"panel-menu-v2", test_panel_menu_v2},
+    {"panel-pager", test_panel_pager},
     {"panel-menu-compositor-shutdown", test_panel_menu_compositor_shutdown},
     {"panel-clock-click", test_panel_clock_click},
     {"layer-before-outputs", test_layer_before_outputs},
