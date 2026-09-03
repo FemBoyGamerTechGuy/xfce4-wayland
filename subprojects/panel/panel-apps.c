@@ -619,7 +619,8 @@ static void ep_push_str(struct exec_parser *p, const char *s) {
 }
 
 int xwapp_exec_argv(const char *exec, const char *icon, const char *name,
-                    char args[][XWAPP_ARG_MAX], int max) {
+                    const char *desktop_path, char args[][XWAPP_ARG_MAX],
+                    int max) {
     if (!exec || !*exec)
         return -1;
     struct exec_parser p = {0};
@@ -696,8 +697,16 @@ int xwapp_exec_argv(const char *exec, const char *icon, const char *name,
                 if (name && *name)
                     ep_push_str(&p, name);
                 break;
-            case 'k': /* %k -> desktop file path; the menu knows it not
-                         (v0: dropped like file codes) */
+            case 'k': /* %k -> the .desktop file's location; the spec
+                         allows file: URIs — local files pass as plain
+                         paths (the common reading, and what file
+                         managers hand to apps) */
+                if (desktop_path && *desktop_path &&
+                    p.n_tok < XWAPP_ARG_MAX) {
+                    ep_flush(&p);
+                    ep_push_str(&p, desktop_path);
+                    ep_flush(&p);
+                }
                 break;
             default:
                 /* unknown code: keep it verbatim (spec: invalid fields
@@ -805,7 +814,8 @@ int xwapp_launch_argv(const struct xwapp *a, char args[][XWAPP_ARG_MAX],
         return -1;
     char argv[XWAPP_MAX_ARGS][XWAPP_ARG_MAX];
     int n = xwapp_exec_argv(a->exec, a->icon[0] ? a->icon : NULL, a->name,
-                            argv, XWAPP_MAX_ARGS);
+                            a->path[0] ? a->path : NULL, argv,
+                            XWAPP_MAX_ARGS);
     if (n < 1) {
         snprintf(err, err_n, "malformed Exec line");
         return -1;
@@ -834,7 +844,8 @@ int xwapp_launch_argv(const struct xwapp *a, char args[][XWAPP_ARG_MAX],
     }
     /* the terminal may itself carry arguments (XW_TERMINAL="foot -c x") */
     char targs[XWAPP_MAX_ARGS][XWAPP_ARG_MAX];
-    int nt = xwapp_exec_argv(term, NULL, NULL, targs, XWAPP_MAX_ARGS);
+    int nt = xwapp_exec_argv(term, NULL, NULL, NULL, targs,
+                             XWAPP_MAX_ARGS);
     if (nt < 1)
         nt = 0;
     int i = 0;

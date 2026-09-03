@@ -114,10 +114,13 @@ int xwapp_search(const struct xwapp_db *db, const char *needle, int *out,
  * outside quotes), applying the field codes:
  *   %% -> literal %, %f %F %u %U -> dropped (no file context),
  *   %i -> --icon <icon>, %c -> the (localized) name,
+ *   %k -> the .desktop file path (as a file:// URI when non-local,
+ *   plain path otherwise; NULL/"" drops it like the file codes),
  *   deprecated codes (%d %D %n %N %v %m) -> dropped per the spec.
  * Returns the argument count, or -1 on malformed quoting. */
 int xwapp_exec_argv(const char *exec, const char *icon, const char *name,
-                    char args[][XWAPP_ARG_MAX], int max);
+                    const char *desktop_path, char args[][XWAPP_ARG_MAX],
+                    int max);
 
 /* the full launch vector for an app: xwapp_exec_argv plus the
  * terminal wrapper when Terminal=true (see terminal_strategy below).

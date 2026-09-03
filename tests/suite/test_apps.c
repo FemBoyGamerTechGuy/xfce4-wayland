@@ -316,7 +316,7 @@ static void test_apps_exec(struct xwt_ctx *t) {
     char args[XWAPP_MAX_ARGS][XWAPP_ARG_MAX];
 
     /* plain split */
-    int n = xwapp_exec_argv("/usr/bin/foo --flag arg1", NULL, NULL, args,
+    int n = xwapp_exec_argv("/usr/bin/foo --flag arg1", NULL, NULL, NULL, args,
                             XWAPP_MAX_ARGS);
     XWT_CHECK(n == 3 && strcmp(args[0], "/usr/bin/foo") == 0 &&
                   strcmp(args[1], "--flag") == 0 &&
@@ -324,27 +324,27 @@ static void test_apps_exec(struct xwt_ctx *t) {
               "plain split (n=%d)", n);
 
     /* quoted argument with spaces stays one arg */
-    n = xwapp_exec_argv("foo \"one two three\" x", NULL, NULL, args,
+    n = xwapp_exec_argv("foo \"one two three\" x", NULL, NULL, NULL, args,
                         XWAPP_MAX_ARGS);
     XWT_CHECK(n == 3 && strcmp(args[1], "one two three") == 0,
               "quoted spaces kept together");
 
     /* escaped quote inside quotes */
-    n = xwapp_exec_argv("foo \"a \\\"quoted\\\" word\"", NULL, NULL, args,
+    n = xwapp_exec_argv("foo \"a \\\"quoted\\\" word\"", NULL, NULL, NULL, args,
                         XWAPP_MAX_ARGS);
     XWT_CHECK(n == 2 && strcmp(args[1], "a \"quoted\" word") == 0,
               "escaped quote unescaped (got '%s')", n > 1 ? args[1] : "?");
 
     /* backslash-space outside quotes */
-    n = xwapp_exec_argv("foo one\\ two", NULL, NULL, args, XWAPP_MAX_ARGS);
+    n = xwapp_exec_argv("foo one\\ two", NULL, NULL, NULL, args, XWAPP_MAX_ARGS);
     XWT_CHECK(n == 2 && strcmp(args[1], "one two") == 0,
               "escaped space outside quotes");
 
     /* field codes: files/urls dropped, %i and %c substituted, %% kept */
-    n = xwapp_exec_argv("foo %f %F %u %U", NULL, NULL, args,
+    n = xwapp_exec_argv("foo %f %F %u %U", NULL, NULL, NULL, args,
                         XWAPP_MAX_ARGS);
     XWT_CHECK(n == 1, "file codes dropped (n=%d)", n);
-    n = xwapp_exec_argv("foo -o %i -t %c", "myicon", "My Name", args,
+    n = xwapp_exec_argv("foo -o %i -t %c", "myicon", "My Name", NULL, args,
                         XWAPP_MAX_ARGS);
     XWT_CHECK(n == 6 && strcmp(args[1], "-o") == 0 &&
                   strcmp(args[2], "--icon") == 0 &&
@@ -352,15 +352,23 @@ static void test_apps_exec(struct xwt_ctx *t) {
                   strcmp(args[4], "-t") == 0 &&
                   strcmp(args[5], "My Name") == 0,
               "%%i and %%c substituted (n=%d)", n);
-    n = xwapp_exec_argv("foo 100%%", NULL, NULL, args, XWAPP_MAX_ARGS);
+    n = xwapp_exec_argv("foo 100%%", NULL, NULL, NULL, args, XWAPP_MAX_ARGS);
     XWT_CHECK(n == 2 && strcmp(args[1], "100%") == 0, "%% literal");
-    n = xwapp_exec_argv("foo %d %D %n %N %v %m bar", NULL, NULL, args,
+    n = xwapp_exec_argv("foo %d %D %n %N %v %m bar", NULL, NULL, NULL, args,
                         XWAPP_MAX_ARGS);
     XWT_CHECK(n == 2 && strcmp(args[1], "bar") == 0,
               "deprecated codes dropped (n=%d)", n);
 
+    /* %k -> the .desktop file path (present/absent) */
+    n = xwapp_exec_argv("foo %k", NULL, NULL, "/usr/share/app/x.desktop",
+                        args, XWAPP_MAX_ARGS);
+    XWT_CHECK(n == 2 && strcmp(args[1], "/usr/share/app/x.desktop") == 0,
+              "%%k substitutes the desktop file path (n=%d)", n);
+    n = xwapp_exec_argv("foo %k", NULL, NULL, NULL, args, XWAPP_MAX_ARGS);
+    XWT_CHECK(n == 1, "%%k dropped without a path (n=%d)", n);
+
     /* unterminated quote: rejected */
-    XWT_CHECK(xwapp_exec_argv("foo \"unclosed", NULL, NULL, args,
+    XWT_CHECK(xwapp_exec_argv("foo \"unclosed", NULL, NULL, NULL, args,
                               XWAPP_MAX_ARGS) == -1,
               "unterminated quote rejected");
 

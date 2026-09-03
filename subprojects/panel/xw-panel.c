@@ -500,7 +500,7 @@ static void do_launcher_fallback(struct panel *p) {
                     "launching the fallback terminal '%s'\n",
             p->terminal_cmd);
     char args[XWAPP_MAX_ARGS][XWAPP_ARG_MAX];
-    int n = xwapp_exec_argv(p->terminal_cmd, NULL, NULL, args,
+    int n = xwapp_exec_argv(p->terminal_cmd, NULL, NULL, NULL, args,
                             XWAPP_MAX_ARGS);
     char err[192];
     if (n < 1 || !panel_spawn_argv(args, n, NULL, err, sizeof(err))) {
