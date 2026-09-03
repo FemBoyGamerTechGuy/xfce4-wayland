@@ -1886,3 +1886,72 @@ Stage Summary:
   from a default-level log (first pointer event, first enter
   delivered, focus transitions with surface identity, panel button
   hits and activated actions).
+
+---
+
+## 2026-09-03 — panel-menu round: the VT trap, Ctrl+C, and the Start menu
+
+Task: fix "Start does nothing / repeated Start crashes the panel",
+"Ctrl+Alt+F1..F12 dead once the compositor runs", "Ctrl+C no longer
+stops the session", "the session traps the user on the TTY" — and
+make Start an applications menu.
+
+- VT trap root cause: `xw_seat_session_ack_disable()` was implemented,
+  documented and unit tested but NEVER CALLED by production code. On
+  a switch away the providers dropped DRM master and returned without
+  acknowledging — the kernel sat parked in VT_RELDISP wait (direct),
+  seatd held its VT handoff, libseat never got
+  `libseat_disable_seat()`. Fix: the DRM backend's disable callback
+  acks synchronously after releasing resources, and a consumer-less
+  disable auto-acks. Compositor-side Ctrl+Alt+F1..F12 handling added
+  (weston pattern, before shortcuts and the lock gate).
+- Ctrl+C: two real holes found and fixed. (1) xw-session had default
+  SIGHUP disposition — a terminal gone killed it instantly, leaving
+  the compositor orphaned on a graphics console; now SIGHUP =
+  clean shutdown, plus an emergency console restore
+  (KD_TEXT/VT_AUTO, logged) after compositor signal deaths. (2) The
+  compositor blocks SIGINT/TERM/HUP/CHLD for signalfd — and the mask
+  survives fork+exec, so EVERY process it spawned (terminals from the
+  shortcuts, ctl-launched apps) inherited it and ignored Ctrl+C;
+  xw_spawn_command, the panel and the async ctl helper now reset the
+  mask before exec. Found by reading /proc/<pid>/status SigBlk of a
+  leaked test panel.
+- Start menu: the old behavior was a blocking ctl round trip inside
+  the Wayland button handler (500ms session poll cycle => frozen
+  panel per click; queued serial freezes under rapid clicking) plus a
+  terminal fallback that was dead on the user's box. Now: xdg_popup
+  parented to the bar layer, XDG .desktop discovery, ctl-run
+  launching (fire-and-forget fork), Escape/outside-press dismissal,
+  idempotent Start toggle (same-click suppression window), Enter
+  launches the hovered item, terminal fallback when no .desktop apps
+  exist. libxwcl gained xwc_popup_* (no blocking sync — a sync inside
+  an event handler wedges the client on signals; libwayland retries
+  EINTR internally).
+- Compositor popup-grab semantics fixed: the grab now moves POINTER
+  focus to the popup (item clicks used to be delivered to the
+  pre-grab surface); outside-press dismissal under a grab does a raw
+  input-region hit test (surface_at() short-circuits to the grab
+  surface, so outside presses could never be told apart); leave is
+  sent on every surface change (same-client bar->menu transitions
+  used to send a second enter without a leave).
+- Diagnostics: menu lifecycle lines unconditionally on stderr (start
+  clicked / opening+count / already open / created+geometry /
+  closing+why / item selected+command); VT release/ack/switch chain
+  readable from one default-level log.
+- Tests: 75/75 in-process (menu matrix, start-repeated, ack auto-ack,
+  VT switch keys, mask regression), 144/144 process-level (session 10:
+  SIGINT/SIGHUP clean exit, crash loop, no leaked children), 50/50
+  build regressions, ASan+UBSan+LSan clean, debug+release profiles
+  green. NVIDIA flip watchdog untouched.
+- Honest limits: could not reproduce a hard segfault for "repeated
+  Start crashes xw-panel" — the reproducible defects behind the
+  report were the blocking-ctl freeze class, the popup-grab
+  misrouting, and the inherited signal mask (all fixed + regression
+  tested); an ASan run of the repeated-click matrix stays clean.
+  Hardware-only: real VT switching, termios restore on a real VT.
+
+Next: hardware verification on the user's NVIDIA box (one DRM
+session: Ctrl+Alt+F2 away + back, Ctrl+C from the launching TTY,
+Start menu open/launch, repeated Start clicking), then continue the
+XFCE parity list (ROADMAP: icons, categories, favorites, clock
+popup).
