@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="xw_window_control_v1">
+  <copyright>
+    Copyright © 2026 the xfce4-wayland authors
+
+    Permission to use, copy, modify, distribute, and sell this software and
+    its documentation for any purpose is hereby granted without fee, provided
+    that the above copyright notice appears in all copies and that both the
+    copyright notice and this permission notice appear in supporting
+    documentation, and that the name of the copyright holders not be used in
+    advertising or publicity pertaining to distribution of the software
+    without specific, prior written permission.
+
+    THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
+    SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+    FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER
+    RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF
+    CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+    CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  </copyright>
+
+  <description summary="private channel between the compositor and the
+    Xwayland window manager helper">
+    This private protocol lets the compositor drive the X11 window manager
+    helper (xw-xwm, a separate session process that speaks the X protocol
+    on the compositor's behalf). The compositor deliberately contains no
+    X11 code; geometry and close requests that would normally go through
+    an embedded XWM are forwarded over this channel instead.
+
+    Windows are identified by the xwayland_shell_v1 serial (the same
+    64-bit value Xwayland sends both to the compositor via
+    xwayland_surface_v1.set_serial and to the WM via the
+    WL_SURFACE_SERIAL X client message), which both sides can correlate
+    without any further state sharing.
+
+    The intended client of this protocol is the session's xw-xwm helper.
+    Other clients may bind it; they gain no privileged ability (geometry
+    and close flow one way, compositor to WM).
+  </description>
+
+  <interface name="xw_window_control_manager_v1" version="1">
+    <description summary="window control events for the X WM helper">
+      The compositor emits these events whenever an Xwayland-managed
+      window changes geometry or is asked to close. The helper mirrors
+      the geometry onto the X11 window (keeping X input coordinates
+      aligned with the compositor placement) and performs the actual
+      X11 close (WM_DELETE_WINDOW, else destroy).
+    </description>
+
+    <event name="geometry">
+      <description summary="an Xwayland window moved or resized">
+        The window identified by serial_hi/serial_lo is now at x,y with
+        size width,height in compositor layout coordinates. Emitted at
+        map time, after interactive move/resize, and on maximize,
+        unmaximize, fullscreen, tile and similar geometry changes.
+      </description>
+      <arg name="serial_hi" type="uint" summary="upper 32 bits of the xwayland surface serial"/>
+      <arg name="serial_lo" type="uint" summary="lower 32 bits of the xwayland surface serial"/>
+      <arg name="x" type="int" summary="new x position (layout coordinates)"/>
+      <arg name="y" type="int" summary="new y position (layout coordinates)"/>
+      <arg name="width" type="int" summary="new width"/>
+      <arg name="height" type="int" summary="new height"/>
+    </event>
+
+    <event name="close">
+      <description summary="the window was asked to close">
+        The compositor already unmapped the window; the helper should now
+        deliver WM_DELETE_WINDOW (or destroy the window) on the X side so
+        the client actually terminates.
+      </description>
+      <arg name="serial_hi" type="uint" summary="upper 32 bits of the xwayland surface serial"/>
+      <arg name="serial_lo" type="uint" summary="lower 32 bits of the xwayland surface serial"/>
+    </event>
+
+    <request name="destroy" type="destructor">
+      <description summary="unbind the manager"/>
+    </request>
+  </interface>
+</protocol>
