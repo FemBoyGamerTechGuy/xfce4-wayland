@@ -155,7 +155,7 @@ requires a running udev instance; run
 what was verified (device, kernel, distro) in WORKLOG.md — that is
 what keeps "verified at Level 3" honest.
 
-## What is covered today (63 Level-1 tests + 103 Level-2 checks + 50-59 build-regression checks)
+## What is covered today (75 Level-1 tests + 144 Level-2 checks + 50-59 build-regression checks)
 
 The nested-session regression (session 5 below) is the reason several
 of these numbers exist: an invisible panel that looked like a working
@@ -307,6 +307,44 @@ matrix and the honest failure taxonomy:
   (`seat-mock`), then fails honestly at the DRM stage (no `/dev/dri`
   in CI) — the full seat path runs, only the hardware part cannot
 - the direct provider's no-VT diagnostic and exit code
+
+
+### VT lifecycle and signal behavior (the "never trap the user" contract)
+
+The properties that keep a real session recoverable are regression
+tested on three levels:
+
+- **the ack that un-blocks the VT switch** (`seat-seatd-disable-
+  lifecycle`, `seat-seatd-disable-autoack`): a disable event that
+  arrives as background traffic behind a blocking request is
+  delivered synchronously; acknowledging completes the provider's
+  disable/ack/enable dance; and — the trap regression — a disable
+  with *no registered consumer* acknowledges by itself, so the seat
+  daemon's VT handoff can never wait forever
+- **compositor-side VT switch keys** (`seat-vt-switch-keys`): with a
+  seat session present, Ctrl+Alt+F2 is consumed (a focused client
+  never receives the F2 press; the Ctrl/Alt modifier keys themselves
+  pass through — they are ordinary keys while held) and the switch
+  request round-trips to the seat provider; plain F2 is delivered to
+  clients like any key
+- **session signal lifecycle** (`scripts/test-session.sh`, session
+  10): SIGINT (the Ctrl+C path) and SIGHUP (controlling terminal
+  gone) end the session cleanly — exit 0, control socket removed, no
+  orphaned children; a compositor that dies by signal is restarted
+  exactly the bounded number of times, each death reported as
+  `killed by signal N`, the emergency console-restore attempt is
+  visible in the log (a documented no-op on non-VT containers), and
+  the session exits nonzero instead of looping forever
+- **the inherited signal mask** (`panel-menu-compositor-shutdown` and
+  the compositor spawner): processes forked+execed from a signalfd
+  parent get the mask reset — the panel exits cleanly on SIGTERM with
+  a menu open (it used to ignore every signal silently because
+  SIGTERM was blocked across exec)
+
+What is hardware-only (documented, not automatable honestly):
+Ctrl+Alt+F1..F12 actually flipping the console, switching back, and
+termios restoration on a real VT. The manual checklist below covers
+those on a machine with a VT.
 
 ### Manual hardware checklist (not automatable honestly)
 

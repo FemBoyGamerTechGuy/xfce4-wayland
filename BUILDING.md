@@ -451,6 +451,99 @@ sessions with elogind (missing `pam_elogind`/`pam_systemd`) — that is
 the machine configuration to fix, or use seatd / the `input` group
 instead.
 
+
+### TTY ownership, VT switching, signals, and recovery
+
+Who owns what during a real session, and how to get your machine back
+from any state — the guarantees this code gives you.
+
+**Ownership timeline.** Your shell owns the TTY before launch;
+`xw-session` (and every child it spawns: compositor, panel, d-bus,
+autostarts) stays in the shell's foreground process group — Ctrl+C
+still reaches all of them. The compositor, through its seat provider,
+takes the *display* rights for the session's duration and gives them
+back on exit:
+
+| Provider | Who owns the VT handoff | What the compositor must do on a switch away |
+|---|---|---|
+| `direct` | the compositor itself: `VT_SETMODE(VT_PROCESS)` on its controlling TTY; the kernel signals it (`SIGUSR1`) and waits for `VT_RELDISP` | drop DRM master, suspend input, then acknowledge — the ack *is* the permission for the switch |
+| `seatd` | the seatd daemon (same kernel mechanism, owned by root) | drop DRM master, suspend input, then send the `DISABLE_SEAT` ack |
+| `elogind`/`logind` | the login manager | drop DRM master, suspend input, then `libseat_disable_seat()` |
+
+The acknowledgment step is load-bearing: the kernel (or the seat
+daemon) *parks* the switch until it arrives, so a compositor that
+releases its resources but never acks would leave Ctrl+Alt+F1..F12
+dead and the user trapped in the graphical session. The ack is issued
+synchronously at the end of the seat-disable callback, and a disable
+with no registered consumer acks by itself, so no provider state can
+ever wedge the console. The whole chain reads from one
+`--backend=drm --verbose` log: `VT switch away requested` →
+`session inactive: dropping DRM master` → `VT release acknowledged`
+→ (switch completes) → `our vt became active again` → `session
+active: re-acquiring DRM master`.
+
+**Switching away and back.** Ctrl+Alt+F1..F12 work through two
+independent paths, both always armed on the DRM backend:
+
+1. the kernel's own handling (the console keyboard stays in
+   translated mode — this project reads input through evdev/libinput,
+   it never puts the TTY keyboard into raw mode, so the kernel keeps
+   interpreting the VT-switch combo itself), and
+2. the compositor's own key handling (the weston pattern): the
+   Ctrl+Alt+Fn combo is intercepted in the seat's key path — before
+   shortcuts and even before the session-lock gate, because VT
+   switching is a system-level escape that works on locked screens
+   too — and translated into a `VT_ACTIVATE` (direct) /
+   `SWITCH_SESSION` (seatd) / `libseat_switch_session` (logind)
+   request. Key presses it consumes never reach clients.
+
+Switching away suspends the compositor (master dropped, input
+suspended, no presentation); switching back re-acquires master,
+re-asserts graphics mode and repaints everything (another VT may have
+drawn on the screen meanwhile). All of it is logged.
+
+**Signals.**
+
+| Signal | Who acts | Behavior |
+|---|---|---|
+| `SIGINT` (Ctrl+C on the launching TTY) | session manager **and** compositor and panel (same process group) | clean shutdown: CRTC/terminal state restored, sockets removed, exit 0. Apps launched *by the compositor* get default dispositions and an empty signal mask — Ctrl+C works inside them too |
+| `SIGTERM` | all components | same clean shutdown (this is what the exit button/logout ultimately uses) |
+| `SIGHUP` (terminal gone: shell exited, login recycled) | session manager, compositor, panel | clean shutdown — never the default instant death that orphans a graphics-mode console |
+| `SIGCHLD` | session manager | supervision: crashes are restarted (bounded), exits reported |
+| `SIGUSR1`/`SIGUSR2` | compositor's direct provider | the kernel's VT release/acquire handshake (above) |
+
+One inherited-mask trap is explicitly handled in every child this
+project spawns: the compositor blocks `SIGINT/TERM/HUP/CHLD` for its
+`signalfd` event sources, and a blocked mask survives `fork()` *and*
+`exec()`. `xw_spawn_command`, the panel, and the async ctl helper all
+reset the mask and dispositions before `exec`, so terminals and apps
+launched from the session respond to Ctrl+C normally.
+
+**Recovery paths.** There is always one, and it is documented here
+rather than depending on luck:
+
+* *Compositor crashes* — the session manager detects the signal death,
+  attempts an emergency console restore (`KDSETMODE(KD_TEXT)` always;
+  `VT_SETMODE(VT_AUTO)` when the session is ending; every step logged),
+  restarts the compositor up to 5 times, then exits honestly with a
+  nonzero code. You see text mode and the log, not a black screen.
+* *Session wedged, keyboard alive* — Ctrl+Alt+F2..F12 switches to
+  another VT (two armed paths, above); from there
+  `pkill -TERM xw-session` (or `-9`, the kernel reclaims the VT from a
+  dead `VT_PROCESS` owner) recovers the console.
+* *Everything dead* — SysRq (Alt+SysRq+R then F,K or B, or REISUB) —
+  kernel-level, independent of any userspace.
+* After any unclean exit: if the TTY is left in graphics mode (black
+  screen with a blinking cursor), switching VTs away and back usually
+  re-initializes it; the direct provider's own clean-exit path
+  (termios, `KDSETMODE`, `VT_SETMODE` all restored) makes this a
+  should-never-happen case, and the crash path above covers the rest.
+
+What this project deliberately does **not** do: no disabling of VT
+switching, no global swallowing of Ctrl+Alt+Fn, no `system()`, no
+killing of unrelated processes, no root requirement, and no
+display-manager or distribution assumptions.
+
 ### The most common real-TTY failure: libseat missing at build time
 
 If the desktop renders (cursor visible, panel drawn) but the keyboard
