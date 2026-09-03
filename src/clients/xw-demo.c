@@ -3,14 +3,17 @@
  * "normal application" for desktop testing (panel tasklist, stacking,
  * exclusive zone, window rules) — and as a template for real clients.
  *
- * Usage: xw-demo [--socket NAME] [COLOR [WIDTH HEIGHT [TITLE]]]
+ * Usage: xw-demo [--socket NAME] [--delay-ms N] [COLOR [WIDTH HEIGHT [TITLE]]]
  *   COLOR: 0xRRGGBB or 0xAARRGGBB (default steel blue)
+ *   --delay-ms: connect, then sleep N ms BEFORE creating the window —
+ *   the deliberate slow starter for launch-timeout regression tests
  */
 #include "xwc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 struct demo {
     struct xwc c;
@@ -51,10 +54,13 @@ int main(int argc, char **argv) {
     uint32_t color = 0xff5e81ac;
     int w = 480, h = 320;
     const char *title = "Demo";
+    long delay_ms = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) {
             socket_name = argv[++i];
+        } else if (strcmp(argv[i], "--delay-ms") == 0 && i + 1 < argc) {
+            delay_ms = atol(argv[++i]);
         } else if (argv[i][0] != '-' && i >= 1) {
             char *end = NULL;
             unsigned long v = strtoul(argv[i], &end, 0);
@@ -82,6 +88,18 @@ int main(int argc, char **argv) {
 
     if (xwc_connect(&d.c, socket_name) < 0)
         return 1;
+
+    /* deliberate slow start: connected, no window yet — the session
+     * must NOT interpret this as a failure (no timeouts exist, but this
+     * pins the behavior for regressions) */
+    if (delay_ms > 0) {
+        fprintf(stderr, "xw-demo: slow start: sleeping %ldms before "
+                        "creating the window\n",
+                delay_ms);
+        struct timespec ts = {.tv_sec = delay_ms / 1000,
+                              .tv_nsec = (delay_ms % 1000) * 1000000};
+        nanosleep(&ts, NULL);
+    }
 
     struct xwc_callbacks cb = {
         .configure = on_configure,

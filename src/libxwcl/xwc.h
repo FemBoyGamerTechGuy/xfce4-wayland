@@ -133,7 +133,8 @@ void xwc_win_fullscreen(struct xwc_win *w, bool on);
 void xwc_win_minimize(struct xwc_win *w);
 /* xdg toplevel resource (for foreign-toplevel / activation requests) */
 void *xwc_win_toplevel(struct xwc_win *w);
-/* wl_surface resource (xdg-activation target, raw protocol tests) */
+/* the window's wl_surface proxy (raw protocol composition: subsurfaces
+ * on top of a normal window, cursor roles, …) */
 void *xwc_win_surface(struct xwc_win *w);
 /* xdg_surface resource (popup parents, raw protocol tests) */
 void *xwc_win_xdg_surface(struct xwc_win *w);
