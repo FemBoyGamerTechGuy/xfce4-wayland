@@ -1431,37 +1431,114 @@ static void test_panel_clock_click(struct xwt_ctx *t) {
     XWT_ASSERT(pid > 0);
     PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
 
-    /* locate the exit button (red fill) — the clock is its left
-     * neighbor; click inside the clock, clear of the gap */
-    int red_x = -1;
-    for (int i = 0; i < 2000 && red_x < 0; i++) {
+    /* locate the clock: the widget run left of the exit button */
+    struct bar_run runs[MAX_RUNS];
+    int exit_i = -1;
+    for (int i = 0; i < 400 && exit_i < 0; i++) {
         xwt_pump(t);
-        for (int x = 800; x < 1280; x++) {
-            if (pixel_at(t, x, 14) == 0xffa33434) {
-                red_x = x;
+        int n = bar_scan_runs(t, runs);
+        for (int k = n - 1; k >= 0; k--)
+            if (runs[k].color == 0xffa33434 || runs[k].color == 0xffc94b4b) {
+                exit_i = k;
                 break;
             }
-        }
-        if (red_x < 0)
+        if (exit_i < 0)
             usleep(10000);
     }
-    XWT_ASSERT(red_x > 0);
-    int clock_x = red_x - 30;
+    XWT_ASSERT(exit_i >= 2);
+    int clock_x = (runs[exit_i - 1].x0 + runs[exit_i - 1].x1) / 2;
     int ws_before = t->comp->wm->ws_current;
 
-    xw_compositor_inject_pointer_motion(t->comp, clock_x, 14);
+    /* 1. clicking the clock opens the calendar popup */
+    xw_compositor_inject_pointer_motion(t->comp, clock_x, 15);
     pump_ms(t, 60);
     xw_compositor_inject_pointer_button(t->comp, 0x110, true);
     xwt_pump(t);
     xw_compositor_inject_pointer_button(t->comp, 0x110, false);
-    pump_ms(t, 200);
+    PANEL_WAIT(t, the_menu(t) && the_menu(t)->mapped);
+    struct xw_popup *cal = the_menu(t);
+    XWT_CHECK(cal && cal->mapped, "calendar popup mapped");
+    XWT_CHECK(cal && cal->parent == first_top_layer(t)->surface,
+              "calendar parented to the bar layer");
+    XWT_CHECK(cal && cal->anchor_x >= 900 && cal->anchor_y == 30,
+              "calendar anchored under the clock button (%d,%d)",
+              cal ? cal->anchor_x : -1, cal ? cal->anchor_y : -1);
 
-    XWT_CHECK(kill(pid, 0) == 0, "panel alive after clock click (v0)");
+    /* 2. today is highlighted: the accent fill exists in the grid */
+    bool today_lit = false;
+    for (int i = 0; i < 300 && !today_lit; i++) {
+        xwt_pump(t);
+        for (int y = 34; y < cal->anchor_y + cal->h && !today_lit; y += 2)
+            for (int x = cal->anchor_x; x < cal->anchor_x + cal->w; x += 2)
+                if (pixel_at(t, x, y) == 0xff3584e4) {
+                    today_lit = true;
+                    break;
+                }
+        if (!today_lit)
+            usleep(10000);
+    }
+    XWT_CHECK(today_lit, "today's cell highlighted");
+
+    /* 3. the prev-month arrow changes the header (month text moves) */
+    uint64_t hash_before = 0;
+    for (int x = cal->anchor_x + 40; x < cal->anchor_x + cal->w - 40; x++)
+        hash_before += pixel_at(t, x, cal->anchor_y + 16) +
+                       pixel_at(t, x, cal->anchor_y + 18);
+    xw_compositor_inject_pointer_motion(t->comp, cal->anchor_x + 16,
+                                        cal->anchor_y + 17);
+    pump_ms(t, 80);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    pump_ms(t, 120);
+    uint64_t hash_after = 0;
+    for (int x = cal->anchor_x + 40; x < cal->anchor_x + cal->w - 40; x++)
+        hash_after += pixel_at(t, x, cal->anchor_y + 16) +
+                       pixel_at(t, x, cal->anchor_y + 18);
+    XWT_CHECK(hash_before != hash_after,
+              "prev-month navigation changed the header");
+
+    /* 4. Escape closes the calendar */
+    xw_compositor_inject_key(t->comp, K_ESC, true);
+    xwt_pump(t);
+    xw_compositor_inject_key(t->comp, K_ESC, false);
+    PANEL_WAIT(t, n_top_popups(t) == 0);
+    XWT_CHECK(n_top_popups(t) == 0, "Escape closed the calendar");
+
+    /* 5. reopen + wheel scrolls months; outside click closes */
+    xw_compositor_inject_pointer_motion(t->comp, clock_x, 15);
+    pump_ms(t, 300);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, n_top_popups(t) == 1);
+    cal = the_menu(t);
+    XWT_ASSERT(cal);
+    hash_before = 0;
+    for (int x = cal->anchor_x + 40; x < cal->anchor_x + cal->w - 40; x++)
+        hash_before += pixel_at(t, x, cal->anchor_y + 16) +
+                       pixel_at(t, x, cal->anchor_y + 18);
+    xw_compositor_inject_pointer_axis(t->comp, 0, 8.0);
+    pump_ms(t, 120);
+    hash_after = 0;
+    for (int x = cal->anchor_x + 40; x < cal->anchor_x + cal->w - 40; x++)
+        hash_after += pixel_at(t, x, cal->anchor_y + 16) +
+                       pixel_at(t, x, cal->anchor_y + 18);
+    XWT_CHECK(hash_before != hash_after, "wheel scrolls the month");
+    xw_compositor_inject_pointer_motion(t->comp, 800, 400);
+    pump_ms(t, 60);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, n_top_popups(t) == 0);
+    XWT_CHECK(n_top_popups(t) == 0, "outside click dismissed the calendar");
+
+    /* the clock click never fired session actions or moved workspaces */
     XWT_CHECK(t->comp->wm->ws_current == ws_before,
-              "clock click changed nothing (display-only v0)");
+              "clock clicks changed no workspace");
     struct pollfd pfd = {.fd = lfd, .events = POLLIN};
-    XWT_CHECK(poll(&pfd, 1, 200) == 0,
-              "clock click fired no session action");
+    XWT_CHECK(poll(&pfd, 1, 200) == 0, "clock clicks fired no session action");
+    XWT_CHECK(kill(pid, 0) == 0, "panel alive after the calendar flow");
 
     reap(&pid);
     unlink(ctl_path);

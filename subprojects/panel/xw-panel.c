@@ -87,17 +87,6 @@ static struct panel *g_panel; /* signal handler context */
 
 #define trace_log(...) panel_trace(__VA_ARGS__)
 
-int panel_text_width(const struct panel *p, const char *s) {
-    return p->m.big_font ? xwc_text_width2(s) : xwc_text_width(s);
-}
-
-int panel_draw_text(const struct panel *p, uint32_t *pix, int stride, int w,
-                    int h, int x, int y, const char *s, uint32_t color) {
-    return p->m.big_font
-               ? xwc_draw_text2(pix, stride, w, h, x, y, s, color)
-               : xwc_draw_text(pix, stride, w, h, x, y, s, color);
-}
-
 /* -------------------------------------------------------------- metrics */
 
 /* -------------------------------------------------------------- layout */
