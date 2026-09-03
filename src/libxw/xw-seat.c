@@ -165,6 +165,19 @@ static const struct wl_seat_interface seat_impl = {
     .release = seat_release,
 };
 
+/* the wl_seat resource's destructor: unlink from the seat's list.
+ * Without it, a resource freed by wl_display_destroy_clients (client
+ * teardown runs BEFORE seat teardown in xw_compositor_destroy) left a
+ * dangling link in s->resources; xw_seat_destroy's cleanup walk then
+ * wl_list_remove'd freed memory — a use-after-free WRITE that
+ * corrupted the allocator (surfaced as glibc "double free or
+ * corruption" aborts and MALLOC_PERTURB_ segfaults once the heap
+ * layout shifted). The keyboard/pointer/data-device resources already
+ * had exactly this destructor; the wl_seat binding was the gap. */
+static void seat_resource_destroy(struct wl_resource *res) {
+    wl_list_remove(wl_resource_get_link(res));
+}
+
 static void bind_seat(struct wl_client *client, void *data, uint32_t version,
                       uint32_t id) {
     struct xw_seat *s = data;
@@ -176,7 +189,8 @@ static void bind_seat(struct wl_client *client, void *data, uint32_t version,
         wl_client_post_no_memory(client);
         return;
     }
-    wl_resource_set_implementation(res, &seat_impl, s, NULL);
+    wl_resource_set_implementation(res, &seat_impl, s,
+                                   seat_resource_destroy);
     wl_list_insert(s->resources.prev, wl_resource_get_link(res));
     wl_seat_send_capabilities(res, WL_SEAT_CAPABILITY_POINTER |
                                        WL_SEAT_CAPABILITY_KEYBOARD);
@@ -999,14 +1013,17 @@ void xw_seat_destroy(struct xw_seat *s) {
         wl_global_destroy(s->global);
     /* idle notifications bound to this seat die with it (no events) */
     xw_idle_seat_destroyed(s->comp, s);
-    /* client-side resources (keyboards/pointers/data devices) are destroyed
-     * with their clients; just unlink ours */
-    while (!wl_list_empty(&s->keyboards))
-        wl_list_remove(s->keyboards.next);
-    while (!wl_list_empty(&s->pointers))
-        wl_list_remove(s->pointers.next);
-    while (!wl_list_empty(&s->resources))
-        wl_list_remove(s->resources.next);
+    /* client-side resources (seat bindings, keyboards, pointers, data
+     * devices) are destroyed with their clients — their destructors
+     * unlink them from these lists, so by the time the compositor
+     * tears a seat down (always after wl_display_destroy_clients) the
+     * lists are empty. Nothing may wl_list_remove here: after the
+     * client teardown those link nodes live in freed memory. */
+    if (!wl_list_empty(&s->keyboards) || !wl_list_empty(&s->pointers) ||
+        !wl_list_empty(&s->resources))
+        xw_log(XW_LOG_WARN,
+               "seat: resource lists not empty at destroy (leaked "
+               "client bindings?)");
     if (s->repeat_src)
         wl_event_source_remove(s->repeat_src);
     if (s->keymap_fd >= 0)
