@@ -12,13 +12,18 @@ static char s_runtimedir[128];
 
 const char *g_runtimedir(void) { return s_runtimedir; }
 
-#define XWT_MAX_TESTS 96
+#define XWT_MAX_TESTS 160
 static struct xwt_test g_tests[XWT_MAX_TESTS];
 static int g_n_tests;
 
 void xwt_register(const struct xwt_test *tests, int n) {
     for (int i = 0; i < n && g_n_tests < XWT_MAX_TESTS; i++)
         g_tests[g_n_tests++] = tests[i];
+    if (n > XWT_MAX_TESTS)
+        fprintf(stderr,
+                "xwtest: WARNING: test registration dropped %d tests "
+                "(raise XWT_MAX_TESTS)\n",
+                n - XWT_MAX_TESTS);
 }
 
 static void xwt_pump_server(void *ud) {

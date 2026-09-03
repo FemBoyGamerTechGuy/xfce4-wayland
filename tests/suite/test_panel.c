@@ -63,6 +63,8 @@ static pid_t spawn_panel(struct xwt_ctx *t, const char *log_suffix) {
     if (pid == 0) {
         setenv("WAYLAND_DISPLAY", t->socket_name, 1);
         setenv("XDG_RUNTIME_DIR", g_runtimedir(), 1);
+        setenv("XW_PANEL_TRACE", "1", 1);
+        setenv("WAYLAND_DEBUG", "1", 1);
         char path[128];
         snprintf(path, sizeof(path), "/tmp/xw-panel-child%s.log", log_suffix);
         int logfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -947,23 +949,25 @@ static void test_panel_menu(struct xwt_ctx *t) {
               "menu parented to the bar layer surface");
     XWT_CHECK(pu->anchor_x == 3 && pu->anchor_y == 30,
               "menu anchored under the Start button (3,%d)", pu->anchor_y);
-    /* 3 sorted entries (Alpha/Beta/Gamma; NoDisplay and Type=Link
-     * filtered); row height = font line + 10, 2px pad */
-    XWT_CHECK(pu->h == 2 + 3 * (XWC_LINE_H + 10),
-              "menu height = 3 items (%d)", pu->h);
-    XWT_CHECK(pu->w == 300, "menu width 300 (%d)", pu->w);
-    /* menu pixels actually rendered below the bar (item 1's row:
-     * item 0 carries the hover fill once the pointer is inside) */
-    PANEL_WAIT(t, pixel_at(t, 150, 30 + 2 + 29 + 14) == 0xff262b33);
-    XWT_CHECK(pixel_at(t, 150, 30 + 2 + 29 + 14) == 0xff262b33,
-              "menu background rendered (below item 0's row)");
+    /* two-pane menu: categories (All + Other for the un-categorized
+     * fixture) left, applications right; rows = cats + 2, header row,
+     * 2px pads; width = 2 + 176 + 336 + 2 */
+    const int ROW = XWC_LINE_H + 10;
+    XWT_CHECK(pu->h == 4 + ROW + 4 * ROW, "menu height (%d)", pu->h);
+    XWT_CHECK(pu->w == 516, "menu width 516 (%d)", pu->w);
+    /* the app pane starts at x = 2 + 176 inside the popup; item 0's
+     * row is below the search header (popup y=30 + 2 + 29 + 14) */
+    const int APP0_X = 3 + 2 + 176 + 60;
+    const int APP0_Y = 30 + 2 + 29 + 14;
+    PANEL_WAIT(t, pixel_at(t, 500, 30 + 2 + 29 + 14) == 0xff2b313b);
+    XWT_CHECK(pixel_at(t, 500, 30 + 2 + 29 + 14) == 0xff2b313b,
+              "app pane background rendered");
 
-    /* 2. hover: motion over item 0 lights the highlight (checked at
-     * x=150: the software cursor sprite sits exactly on the pointer
-     * position and would cover a pixel taken at the pointer itself) */
-    xw_compositor_inject_pointer_motion(t->comp, 150, 30 + 2 + 14);
-    PANEL_WAIT(t, pixel_at(t, 200, 30 + 2 + 14) == 0xff3584e4);
-    XWT_CHECK(pixel_at(t, 200, 30 + 2 + 14) == 0xff3584e4,
+    /* 2. hover: motion over item 0 lights the highlight (checked
+     * off-axis: the software cursor sprite covers the pointer pixel) */
+    xw_compositor_inject_pointer_motion(t->comp, APP0_X, APP0_Y);
+    PANEL_WAIT(t, pixel_at(t, APP0_X + 60, APP0_Y) == 0xff3584e4);
+    XWT_CHECK(pixel_at(t, APP0_X + 60, APP0_Y) == 0xff3584e4,
               "menu item hover highlight rendered");
     XWT_CHECK(seat->grab_surface == pu->surface,
               "the menu holds the seat grab (all pointer events)");
@@ -992,7 +996,7 @@ static void test_panel_menu(struct xwt_ctx *t) {
     PANEL_WAIT(t, n_top_popups(t) == 1);
     /* item 0 (Alpha, sorted): click its center; the panel forks the
      * async ctl round trip — service the fake socket for it */
-    xw_compositor_inject_pointer_motion(t->comp, 150, 30 + 2 + 14);
+    xw_compositor_inject_pointer_motion(t->comp, APP0_X, APP0_Y);
     pump_ms(t, 60);
     xw_compositor_inject_pointer_button(t->comp, 0x110, true);
     xwt_pump(t);
@@ -1010,6 +1014,69 @@ static void test_panel_menu(struct xwt_ctx *t) {
     PANEL_WAIT(t, n_top_popups(t) == 0);
     XWT_CHECK(n_top_popups(t) == 0, "menu closed after item selection");
     XWT_CHECK(kill(pid, 0) == 0, "panel alive after launching an item");
+
+    /* 4b. search: typing filters the app pane; Enter launches the
+     * first hit; the fixture apps are Alpha/Beta/Gamma */
+    xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
+    pump_ms(t, 300);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, n_top_popups(t) == 1);
+    PANEL_WAIT(t, seat && seat->grab_surface == the_menu(t)->surface);
+    XWT_CHECK(true, "menu holds the seat grab before typing");
+    /* inject_key takes raw linux keycodes (K_* style): letters from
+     * the evdev code space */
+    static const int KEY_OF_LETTER[26] = {
+        30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24,
+        25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44};
+    const char *word = "beta";
+    for (const char *c = word; *c; c++) {
+        uint32_t code = KEY_OF_LETTER[*c - 'a'];
+        xw_compositor_inject_key(t->comp, code, true);
+        xwt_pump(t);
+        xw_compositor_inject_key(t->comp, code, false);
+        pump_ms(t, 40);
+    }
+    /* only Beta matches: hover lands on row 0 of the filtered pane */
+    xw_compositor_inject_key(t->comp, 28 /* KEY_ENTER */, true);
+    xwt_pump(t);
+    xw_compositor_inject_key(t->comp, 28, false);
+    char line3[128] = {0};
+    bool got3 = false;
+    for (int i = 0; i < 400 && !got3; i++) {
+        xwt_pump(t);
+        handled_ctl_line(lfd, line3, sizeof(line3), &got3);
+        usleep(10000);
+    }
+    XWT_CHECK(got3 && strcmp(line3, "run beta --flag") == 0,
+              "search + Enter launches the filtered item (got '%s')",
+              got3 ? line3 : "(none)");
+    PANEL_WAIT(t, n_top_popups(t) == 0);
+    XWT_CHECK(n_top_popups(t) == 0, "menu closed after search launch");
+
+    /* 4c. Escape clears the search first, closes the menu second */
+    xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
+    pump_ms(t, 300);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, n_top_popups(t) == 1);
+    PANEL_WAIT(t, seat && seat->grab_surface == the_menu(t)->surface);
+    xw_compositor_inject_key(t->comp, 34 /* KEY_G */, true);
+    xwt_pump(t);
+    xw_compositor_inject_key(t->comp, 34, false);
+    pump_ms(t, 40);
+    xw_compositor_inject_key(t->comp, K_ESC, true); /* clear search */
+    xwt_pump(t);
+    xw_compositor_inject_key(t->comp, K_ESC, false);
+    pump_ms(t, 100);
+    XWT_CHECK(n_top_popups(t) == 1, "first Escape cleared the search only");
+    xw_compositor_inject_key(t->comp, K_ESC, true); /* close */
+    xwt_pump(t);
+    xw_compositor_inject_key(t->comp, K_ESC, false);
+    PANEL_WAIT(t, n_top_popups(t) == 0);
+    XWT_CHECK(n_top_popups(t) == 0, "second Escape closed the menu");
 
     /* 5. outside click dismisses (press on the desktop background) */
     xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
@@ -1072,6 +1139,230 @@ static void test_panel_menu(struct xwt_ctx *t) {
     reap(&pid);
     unlink(ctl_path);
     close(lfd);
+}
+
+
+/* the v2 menu: categories, favorites, and scrolling. A fixture with
+ * categorized entries + a favorites config drives the two-pane flow:
+ * click a category row -> the app pane re-lists; favorites resolve
+ * from the config; the wheel scrolls long lists. */
+static void fake_appdir2(char *out, size_t outn) {
+    snprintf(out, outn, "%s/apps2-%d", g_runtimedir(), (int)getpid());
+    mkdir(out, 0755);
+    char appsub[340];
+    snprintf(appsub, sizeof(appsub), "%.320s/applications", out);
+    mkdir(appsub, 0755);
+    static const char *const entries[] = {
+        "[Desktop Entry]\nType=Application\nName=Web Browser\n"
+        "Exec=/bin/browser\nCategories=Network;WebBrowser;\n"
+        "Icon=web\n",
+        "[Desktop Entry]\nType=Application\nName=Text Editor\n"
+        "Exec=/bin/editor\nCategories=Utility;TextEditor;\n",
+        "[Desktop Entry]\nType=Application\nName=File Manager\n"
+        "Exec=/bin/fm\nCategories=System;FileManager;\n",
+        "[Desktop Entry]\nType=Application\nName=Sound Mixer\n"
+        "Exec=/bin/mixer\nCategories=AudioVideo;\n",
+    };
+    static const char *const files[] = {"web-browser.desktop", "text-editor.desktop",
+                                        "file-manager.desktop", "sound-mixer.desktop"};
+    for (size_t i = 0; i < 4; i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", appsub, files[i]);
+        FILE *f = fopen(path, "w");
+        if (f) {
+            fputs(entries[i], f);
+            fclose(f);
+        }
+    }
+    /* 40 filler entries in Accessories: forces the app pane to
+     * overflow and scroll */
+    for (int i = 0; i < 40; i++) {
+        char path[512], name[64];
+        snprintf(name, sizeof(name), "Filler %02d", i);
+        snprintf(path, sizeof(path), "%s/filler-%02d.desktop", appsub, i);
+        FILE *f = fopen(path, "w");
+        if (f) {
+            fprintf(f, "[Desktop Entry]\nType=Application\nName=%s\n"
+                       "Exec=/bin/filler%d\nCategories=Utility;\n",
+                    name, i);
+            fclose(f);
+        }
+    }
+}
+
+static void test_panel_menu_v2(struct xwt_ctx *t) {
+    char appdir[300];
+    fake_appdir2(appdir, sizeof(appdir));
+    char empty[300];
+    snprintf(empty, sizeof(empty), "%s/empty2-%d", g_runtimedir(),
+             (int)getpid());
+    mkdir(empty, 0755);
+    setenv("XDG_DATA_HOME", appdir, 1);
+    setenv("XDG_DATA_DIRS", empty, 1);
+
+    /* favorites: the browser */
+    char conf[256];
+    snprintf(conf, sizeof(conf), "%s/panel-fav.conf", g_runtimedir());
+    FILE *cf = fopen(conf, "w");
+    XWT_ASSERT(cf);
+    fputs("[panel]\nfavorites=web-browser\n", cf);
+    fclose(cf);
+
+    char ctl_path[192];
+    snprintf(ctl_path, sizeof(ctl_path), "%s/xw-session.sock",
+             g_runtimedir());
+    unlink(ctl_path);
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    int ncpy = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", ctl_path);
+    XWT_ASSERT(ncpy >= 0 && (size_t)ncpy < sizeof(addr.sun_path));
+    XWT_ASSERT(bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    XWT_ASSERT(listen(lfd, 8) == 0);
+
+    pid_t pid = fork();
+    XWT_ASSERT(pid >= 0);
+    if (pid == 0) {
+        setenv("XW_PANEL_CONF", conf, 1);
+        setenv("WAYLAND_DISPLAY", t->socket_name, 1);
+        setenv("XDG_RUNTIME_DIR", g_runtimedir(), 1);
+        setenv("XW_PANEL_TRACE", "1", 1);
+        int logfd = open("/tmp/xw-panel-child-menu2.log",
+                         O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (logfd >= 0)
+            dup2(logfd, STDERR_FILENO);
+        execl(panel_path(), "xw-panel", NULL);
+        _exit(127);
+    }
+    XWT_ASSERT(pid > 0);
+    unsetenv("XDG_DATA_HOME");
+    unsetenv("XDG_DATA_DIRS");
+    PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
+    struct xw_seat *seat = xw_seat_first(t->comp);
+    XWT_ASSERT(seat);
+
+    const int ROW = XWC_LINE_H + 10;
+    const int PANE_X = 3 + 2;            /* popup x + pad */
+    const int APP_X = 3 + 2 + 176;       /* app pane left edge */
+
+    /* open the menu; default selection = Favorites (first category) */
+    xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
+    pump_ms(t, 60);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, the_menu(t) && the_menu(t)->mapped);
+    PANEL_WAIT(t, seat->grab_surface == the_menu(t)->surface);
+    struct xw_popup *pu = the_menu(t);
+    XWT_ASSERT(pu);
+    /* rows: favorites(1) + all + accessories + internet + multimedia +
+     * system + 2 pad rows = cats+2; 44 apps overflow the pane */
+    XWT_CHECK(pu->h > 8 * ROW, "menu tall enough to scroll (%d)", pu->h);
+
+    /* 1. Favorites is the default pane: one app (the browser) */
+    xw_compositor_inject_pointer_motion(t->comp, APP_X + 60,
+                                        30 + 2 + ROW + ROW / 2);
+    pump_ms(t, 80);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    char line[128] = {0};
+    bool got = false;
+    for (int i = 0; i < 300 && !got; i++) {
+        xwt_pump(t);
+        handled_ctl_line(lfd, line, sizeof(line), &got);
+        usleep(10000);
+    }
+    XWT_CHECK(got && strcmp(line, "run /bin/browser") == 0,
+              "favorites launch the pinned app (got '%s')",
+              got ? line : "(none)");
+    PANEL_WAIT(t, n_top_popups(t) == 0);
+
+    /* 2. categories: click the Internet row, the pane re-lists */
+    xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
+    pump_ms(t, 300);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, n_top_popups(t) == 1);
+    PANEL_WAIT(t, seat->grab_surface == the_menu(t)->surface);
+    /* category rows start below the search header; display order:
+     * Favorites 0, All 1, Accessories 2, Multimedia 3, Internet 4 */
+    int cat_row = 4;
+    xw_compositor_inject_pointer_motion(
+        t->comp, PANE_X + 40, 30 + 2 + ROW + cat_row * ROW + ROW / 2);
+    pump_ms(t, 80);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    pump_ms(t, 100);
+    XWT_CHECK(n_top_popups(t) == 1, "category click keeps the menu open");
+    /* the Internet pane lists exactly one app: the browser */
+    xw_compositor_inject_pointer_motion(t->comp, APP_X + 60,
+                                        30 + 2 + ROW + ROW / 2);
+    pump_ms(t, 80);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    char line2[128] = {0};
+    bool got2 = false;
+    for (int i = 0; i < 300 && !got2; i++) {
+        xwt_pump(t);
+        handled_ctl_line(lfd, line2, sizeof(line2), &got2);
+        usleep(10000);
+    }
+    XWT_CHECK(got2 && strcmp(line2, "run /bin/browser") == 0,
+              "Internet category lists the browser (got '%s')",
+              got2 ? line2 : "(none)");
+    PANEL_WAIT(t, n_top_popups(t) == 0);
+
+    /* 3. scrolling: All has 44 apps; the wheel scrolls the pane and
+     * the click hits a later entry than the alphabetical first */
+    xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
+    pump_ms(t, 300);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, n_top_popups(t) == 1);
+    PANEL_WAIT(t, seat->grab_surface == the_menu(t)->surface);
+    /* select "All" (row 1) */
+    xw_compositor_inject_pointer_motion(
+        t->comp, PANE_X + 40, 30 + 2 + ROW + 1 * ROW + ROW / 2);
+    pump_ms(t, 80);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    pump_ms(t, 100);
+    /* wheel down over the app pane: several notches */
+    for (int i = 0; i < 6; i++) {
+        xw_compositor_inject_pointer_axis(t->comp, 0, 10.0);
+        pump_ms(t, 60);
+    }
+    /* the row-0 click now launches a filler (scrolled), not the
+     * browser (alphabetically first among the fixture apps) */
+    xw_compositor_inject_pointer_motion(t->comp, APP_X + 60,
+                                        30 + 2 + ROW + ROW / 2);
+    pump_ms(t, 80);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    char line3[128] = {0};
+    bool got3 = false;
+    for (int i = 0; i < 300 && !got3; i++) {
+        xwt_pump(t);
+        handled_ctl_line(lfd, line3, sizeof(line3), &got3);
+        usleep(10000);
+    }
+    XWT_CHECK(got3 && strncmp(line3, "run /bin/filler", 15) == 0,
+              "scrolled pane launches a later entry (got '%s')",
+              got3 ? line3 : "(none)");
+    PANEL_WAIT(t, n_top_popups(t) == 0);
+    XWT_CHECK(kill(pid, 0) == 0, "panel alive after the v2 menu flow");
+
+    reap(&pid);
+    unlink(ctl_path);
+    close(lfd);
+    unlink(conf);
 }
 
 /* compositor shutdown while the menu is open: the panel must exit
@@ -1327,6 +1618,7 @@ static const struct xwt_test tests[] = {
     {"panel-launcher", test_panel_launcher},
     {"panel-start-repeated", test_panel_start_repeated},
     {"panel-menu", test_panel_menu},
+    {"panel-menu-v2", test_panel_menu_v2},
     {"panel-menu-compositor-shutdown", test_panel_menu_compositor_shutdown},
     {"panel-clock-click", test_panel_clock_click},
     {"layer-before-outputs", test_layer_before_outputs},

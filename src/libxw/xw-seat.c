@@ -737,6 +737,16 @@ void xw_seat_pointer_button(struct xw_seat *s, uint32_t linux_button,
             (void)sx;
             (void)sy;
         }
+        if (s->grab_surface &&
+            s->grab_surface->role == XW_SURFACE_ROLE_XDG_POPUP) {
+            /* xdg_popup grabs outlive the opening click: per xdg-shell
+             * the grab persists until the popup is dismissed (popup_done
+             * or an explicit re-grab). Tearing it down on the opener's
+             * release used to strand the menu: the keyboard focus was
+             * re-routed mid-interaction and typed keys (menu search)
+             * died at a NULL kb focus. */
+            return;
+        }
         if (!s->ptr_grab_is_drag) {
             /* end interactive move/resize (if any) */
             struct xw_window *iw = xw_wm_interactive_window(c->wm);
