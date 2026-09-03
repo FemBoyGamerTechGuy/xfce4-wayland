@@ -133,12 +133,13 @@ bool xwapp_argv_to_shell(const char args[][XWAPP_ARG_MAX], int n, char *out,
 
 /* terminal resolution, exposed for tests and the fallback launcher:
  * $XW_TERMINAL wins when it names a runnable program; otherwise the
- * first available common terminal. `for_wrap` picks the execution
- * style used to host Terminal=true commands. */
+ * first available common terminal. `style` picks the execution
+ * convention used to host Terminal=true commands. */
 enum {
     XWAPP_TERM_E_REST,   /* TERM -e CMD ARGS... (xterm, st, konsole..) */
     XWAPP_TERM_DASHDASH, /* TERM -- CMD ARGS... (gnome-terminal, wezterm) */
-    XWAPP_TERM_POSITIONAL /* TERM CMD ARGS... (kitty, foot) */
+    XWAPP_TERM_POSITIONAL, /* TERM CMD ARGS... (kitty, foot) */
+    XWAPP_TERM_X,        /* TERM -x CMD ARGS... (xfce4-terminal, terminator) */
 };
 bool xwapp_resolve_terminal(char *out, size_t n, int *style);
 bool xwapp_path_has(const char *name);

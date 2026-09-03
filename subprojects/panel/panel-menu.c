@@ -306,29 +306,16 @@ static void menu_draw(void) {
 
 /* ------------------------------------------------------------- actions */
 
+/* Launch the selected application. Everything the launch needs is
+ * copied first (panel_launch_app), the process is spawned directly
+ * (posix_spawn, no shell, no ctl relay), and only then is the menu
+ * closed — the callback's data is never freed under it. A refused
+ * launch (malformed Exec, missing executable) keeps the menu open and
+ * reports visibly on the bar. */
 void pm_menu_launch_app(struct panel *p, const struct xwapp *app) {
-    char args[XWAPP_MAX_ARGS][XWAPP_ARG_MAX];
-    char err[192];
-    int n = xwapp_launch_argv(app, args, XWAPP_MAX_ARGS, err, sizeof(err));
-    if (n < 1) {
-        fprintf(stderr, "xw-panel: cannot launch '%s': %s\n", app->name,
-                err[0] ? err : "unusable entry");
-        return;
-    }
-    char line[1024];
-    if (!xwapp_argv_to_shell((const char(*)[XWAPP_ARG_MAX])args, n, line,
-                             sizeof(line))) {
-        fprintf(stderr, "xw-panel: cannot launch '%s': command line too "
-                        "long\n",
-                app->name);
-        return;
-    }
-    char cmd[1100];
-    snprintf(cmd, sizeof(cmd), "run %.1020s", line);
-    fprintf(stderr, "xw-panel: launching '%s' (ctl \"%.80s...\")\n", app->name,
-            line);
-    panel_ctl_send(cmd);
-    pm_menu_shutdown(p);
+    bool ok = panel_launch_app(p, app);
+    if (ok)
+        pm_menu_shutdown(p);
 }
 
 static void menu_close(struct panel *p, const char *why) {

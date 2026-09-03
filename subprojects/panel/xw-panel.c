@@ -425,6 +425,27 @@ static void draw(struct panel *p) {
     xwc_fill_rect(pix, stride, w, h, 0, 0, w, h, COL_BAR_BG);
     for (int i = 0; i < n_btns; i++)
         draw_btn(p, pix, stride, w, h, &btns[i]);
+
+    /* launch status line (panel-launch.c): a transient message right of
+     * the start region for ~2.5s — successes in dim text, failures in
+     * red. Cleared by the clock-driven redraw once it ages out. */
+    if (p->launch_err[0] && n_btns > 0) {
+        int64_t age = panel_mono_ms() - p->launch_err_ms;
+        if (age >= 0 && age < 2500) {
+            bool failure = strncmp(p->launch_err, "launched", 8) != 0;
+            char msg[100];
+            panel_text_fit(p, msg, sizeof(msg), p->launch_err, 420);
+            int sx = btns[n_btns > 1 ? 1 : 0].x + btns[n_btns > 1 ? 1 : 0].w;
+            if (sx + panel_text_width(p, msg) < w - 4)
+                panel_draw_text(p, pix, stride, w, h, sx + 6,
+                                btn_y(p) + (btn_h(p) - p->m.font_h) / 2 + 1,
+                                msg, failure ? 0xffe06c75 : COL_TEXT_DIM);
+        } else if (age >= 2500) {
+            p->launch_err[0] = 0; /* aged out; one redraw to clear */
+            p->redraw = true;
+        }
+    }
+
     xwc_layer_commit(p->layer);
     p->redraw = false;
 }
@@ -488,13 +509,28 @@ static void do_exit_button(struct panel *p) {
 
 static void do_launcher_fallback(struct panel *p) {
     /* no .desktop applications at all: the resolved terminal is the
-     * one thing Start can still do */
-    char cmd[320];
+     * one thing Start can still do. Spawned directly like every other
+     * launch (no shell, no ctl relay). */
     resolve_terminal(p->terminal_cmd, sizeof(p->terminal_cmd));
-    snprintf(cmd, sizeof(cmd), "run %s", p->terminal_cmd);
     fprintf(stderr, "xw-panel: start clicked — no applications found, "
-                    "launching the fallback terminal (ctl '%s')\n", cmd);
-    panel_ctl_send(cmd);
+                    "launching the fallback terminal '%s'\n",
+            p->terminal_cmd);
+    char args[XWAPP_MAX_ARGS][XWAPP_ARG_MAX];
+    int n = xwapp_exec_argv(p->terminal_cmd, NULL, NULL, args,
+                            XWAPP_MAX_ARGS);
+    char err[192];
+    if (n < 1 || !panel_spawn_argv(args, n, NULL, err, sizeof(err))) {
+        fprintf(stderr, "xw-panel: fallback terminal failed: %s\n",
+                n < 1 ? "unusable command" : err);
+        snprintf(p->launch_err, sizeof(p->launch_err),
+                 "cannot launch a terminal");
+        p->launch_err_ms = panel_mono_ms();
+        p->redraw = true;
+    } else {
+        snprintf(p->launch_err, sizeof(p->launch_err), "launched terminal");
+        p->launch_err_ms = panel_mono_ms();
+        p->redraw = true;
+    }
 }
 
 static void on_button(struct xwc_win *win, uint32_t button, bool down, int x,
@@ -736,6 +772,10 @@ int main(int argc, char **argv) {
             snprintf(p.clock, sizeof(p.clock), "%s", now);
             request_layout(&p);
         }
+        /* the launch status line ages out on its own timer */
+        if (p.launch_err[0] &&
+            panel_mono_ms() - p.launch_err_ms >= 2500)
+            p.redraw = true;
         if (p.redraw && p.layer)
             draw(&p);
     }
@@ -745,6 +785,7 @@ int main(int argc, char **argv) {
     pm_menu_shutdown(&p);
     pm_clock_shutdown(&p);
     pm_taskover_shutdown(&p);
+    panel_launch_shutdown();
     xwc_layer_destroy(p.layer);
     xwc_tasklist_destroy(p.tl);
     xwc_wspaces_destroy(p.wsp);

@@ -76,6 +76,20 @@ int64_t panel_mono_ms(void);
  * dispatch loop (forks, like every menu/exit action) */
 bool panel_ctl_send(const char *cmd);
 
+/* ------------------------------------------------------- launching */
+/* panel-launch.c: direct (no shell, no ctl relay) application launch
+ * from an already-parsed desktop-entry argv. Returns false with a
+ * reason in err. The child is a normal process reaped by the panel's
+ * SIGCHLD loop; the panel never blocks on it. */
+bool panel_spawn_argv(char args[][XWAPP_ARG_MAX], int n, pid_t *pid_out,
+                      char *err, size_t err_n);
+/* the menu-facing launcher with the full diagnostics and the visible
+ * on-bar status line (p->launch_err). Copies the launch data before
+ * spawning — the caller may tear the menu down afterwards. */
+bool panel_launch_app(struct panel *p, const struct xwapp *app);
+/* release the launcher's resources (stdio /dev/null fd) */
+void panel_launch_shutdown(void);
+
 /* module structs (private to their files, referenced opaquely here) */
 struct pm_menu;
 struct pm_clock;
@@ -102,6 +116,11 @@ struct panel {
     int bar_w, bar_h;  /* current surface geometry */
     bool redraw;
     bool quit;
+
+    /* launch status line (panel-launch.c): the message drawn next to
+     * the Start button; launch_err_ms timestamps it (0/old = hidden) */
+    char launch_err[96];
+    int64_t launch_err_ms;
 
     char terminal_cmd[256]; /* fallback launcher resolution */
 

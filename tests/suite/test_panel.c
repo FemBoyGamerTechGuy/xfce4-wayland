@@ -696,31 +696,34 @@ static void test_late_pointer_enter_replay(struct xwt_ctx *t) {
 }
 
 /* the launcher button: resolves a terminal ($XW_TERMINAL wins) and
- * sends the ctl 'run <terminal>' line to the session manager */
+ * spawns it DIRECTLY (no ctl relay, no shell) — the fallback terminal
+ * must appear as a real process */
 static void test_panel_launcher(struct xwt_ctx *t) {
-    char ctl_path[192];
-    snprintf(ctl_path, sizeof(ctl_path), "%s/xw-session.sock",
-             g_runtimedir());
-    unlink(ctl_path);
-    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    struct sockaddr_un addr = {0};
-    addr.sun_family = AF_UNIX;
-    int ncpy = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", ctl_path);
-    XWT_ASSERT(ncpy >= 0 && (size_t)ncpy < sizeof(addr.sun_path));
-    XWT_ASSERT(bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
-    XWT_ASSERT(listen(lfd, 4) == 0);
-
     /* no applications anywhere: the Start button's fallback is the
-     * resolved terminal (the pre-menu launcher behavior) */
+     * resolved terminal (the pre-menu launcher behavior). The stub
+     * "terminal" writes a marker file when it runs. */
     char empty[300];
     snprintf(empty, sizeof(empty), "%s/noapps-%d", g_runtimedir(),
              (int)getpid());
     mkdir(empty, 0755);
+    char stub[340], marker[340];
+    snprintf(stub, sizeof(stub), "%s/termstub", empty);
+    snprintf(marker, sizeof(marker), "%s/term-ran", empty);
+    unlink(marker);
+    FILE *tf = fopen(stub, "w");
+    XWT_ASSERT(tf);
+    fputs("#!/bin/sh\n/bin/touch \"$XW_TERM_MARKER\"\n", tf);
+    fclose(tf);
+    chmod(stub, 0755);
     setenv("XDG_DATA_HOME", empty, 1);
     setenv("XDG_DATA_DIRS", empty, 1);
-    setenv("XW_TERMINAL", "/bin/true", 1); /* inherited by the panel */
+    setenv("XW_TERMINAL", stub, 1); /* inherited by the panel */
+    char menv[360];
+    snprintf(menv, sizeof(menv), "%s", marker);
+    setenv("XW_TERM_MARKER", menv, 1);
     pid_t pid = spawn_panel(t, "-launcher");
     unsetenv("XW_TERMINAL");
+    unsetenv("XW_TERM_MARKER");
     unsetenv("XDG_DATA_HOME");
     unsetenv("XDG_DATA_DIRS");
     XWT_ASSERT(pid > 0);
@@ -734,34 +737,18 @@ static void test_panel_launcher(struct xwt_ctx *t) {
     xwt_pump(t);
     xw_compositor_inject_pointer_button(t->comp, 0x110, false);
 
-    char line[128] = {0};
-    bool got = false;
-    for (int i = 0; i < 600 && !got; i++) {
+    /* the fallback terminal really ran (marker appeared) */
+    bool ran = false;
+    for (int i = 0; i < 300 && !ran; i++) {
         xwt_pump(t);
-        struct pollfd pfd = {.fd = lfd, .events = POLLIN};
-        if (poll(&pfd, 1, 0) == 1) {
-            int cfd = accept(lfd, NULL, NULL);
-            if (cfd >= 0) {
-                ssize_t n = read(cfd, line, sizeof(line) - 1);
-                if (n > 0) {
-                    line[n] = 0;
-                    got = true;
-                    dprintf(cfd, "ok spawned\n");
-                }
-                close(cfd);
-            }
-        }
+        ran = access(marker, F_OK) == 0;
         usleep(10000);
     }
-    XWT_CHECK(got && strncmp(line, "run /bin/true", 13) == 0,
-              "launcher sent the resolved terminal (got '%.60s')",
-              got ? line : "(none)");
+    XWT_CHECK(ran, "fallback terminal spawned directly (marker)");
 
     pump_ms(t, 100);
     XWT_CHECK(kill(pid, 0) == 0, "panel alive after launcher click");
     reap(&pid);
-    unlink(ctl_path);
-    close(lfd);
 }
 
 /* ------------------------------------------------------------------ */
@@ -802,13 +789,15 @@ static void fake_appdir(char *out, size_t outn) {
     char appsub[340];
     snprintf(appsub, sizeof(appsub), "%.320s/applications", out);
     mkdir(appsub, 0755);
+    /* each app executes a REAL command (a marker touch) so launch
+     * assertions can wait for the actual process to run */
     static const char *const entries[] = {
-        "[Desktop Entry]\nType=Application\nName=Alpha\nExec=/bin/alpha %f\n",
-        "[Desktop Entry]\nType=Application\nName=Beta\nExec=beta --flag\n",
-        "[Desktop Entry]\nType=Application\nName=Gamma\nExec=gamma\n",
+        "[Desktop Entry]\nType=Application\nName=Alpha\nExec=/bin/touch @DIR@/mark-alpha %f\n",
+        "[Desktop Entry]\nType=Application\nName=Beta\nExec=/bin/touch -m @DIR@/mark-beta\n",
+        "[Desktop Entry]\nType=Application\nName=Gamma\nExec=/bin/touch @DIR@/mark-gamma\n",
         /* filtered out: NoDisplay */
         "[Desktop Entry]\nType=Application\nName=Hidden App\n"
-        "Exec=/bin/hidden\nNoDisplay=true\n",
+        "Exec=/bin/touch @DIR@/mark-hidden\nNoDisplay=true\n",
         /* filtered out: wrong type */
         "[Desktop Entry]\nType=Link\nName=Web\nURL=https://xw\n",
     };
@@ -816,11 +805,18 @@ static void fake_appdir(char *out, size_t outn) {
                                         "gamma.desktop", "hidden.desktop",
                                         "web.desktop"};
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
-        char path[512];
+        char path[512], body[600];
+        snprintf(body, sizeof(body), "%s", entries[i]);
+        for (char *tok = strstr(body, "@DIR@"); tok;
+             tok = strstr(body, "@DIR@")) {
+            size_t dlen = strlen(out), rest = strlen(tok + 5) + 1;
+            memmove(tok + dlen, tok + 5, rest);
+            memcpy(tok, out, dlen);
+        }
         snprintf(path, sizeof(path), "%s/%s", appsub, files[i]);
         FILE *f = fopen(path, "w");
         if (f) {
-            fputs(entries[i], f);
+            fputs(body, f);
             fclose(f);
         }
     }
@@ -993,23 +989,23 @@ static void test_panel_menu(struct xwt_ctx *t) {
     xwt_pump(t);
     xw_compositor_inject_pointer_button(t->comp, 0x110, false);
     PANEL_WAIT(t, n_top_popups(t) == 1);
-    /* item 0 (Alpha, sorted): click its center; the panel forks the
-     * async ctl round trip — service the fake socket for it */
+    /* item 0 (Alpha, sorted): click its center; the panel spawns the
+     * real process directly (marker file proves it ran) */
     xw_compositor_inject_pointer_motion(t->comp, APP0_X, APP0_Y);
     pump_ms(t, 60);
     xw_compositor_inject_pointer_button(t->comp, 0x110, true);
     xwt_pump(t);
     xw_compositor_inject_pointer_button(t->comp, 0x110, false);
 
-    char line[128] = {0};
-    bool got = false;
-    for (int i = 0; i < 400 && !got; i++) {
+    char marker[340];
+    snprintf(marker, sizeof(marker), "%s/mark-alpha", appdir);
+    bool marked = false;
+    for (int i = 0; i < 400 && !marked; i++) {
         xwt_pump(t);
-        handled_ctl_line(lfd, line, sizeof(line), &got);
+        marked = access(marker, F_OK) == 0;
         usleep(10000);
     }
-    XWT_CHECK(got && strncmp(line, "run /bin/alpha", 14) == 0,
-              "menu item launched via ctl (got '%s')", got ? line : "(none)");
+    XWT_CHECK(marked, "menu item launched (marker created)");
     PANEL_WAIT(t, n_top_popups(t) == 0);
     XWT_CHECK(n_top_popups(t) == 0, "menu closed after item selection");
     XWT_CHECK(kill(pid, 0) == 0, "panel alive after launching an item");
@@ -1052,16 +1048,15 @@ static void test_panel_menu(struct xwt_ctx *t) {
     xw_compositor_inject_key(t->comp, 28 /* KEY_ENTER */, true);
     xwt_pump(t);
     xw_compositor_inject_key(t->comp, 28, false);
-    char line3[128] = {0};
-    bool got3 = false;
-    for (int i = 0; i < 400 && !got3; i++) {
+    char marker3[340];
+    snprintf(marker3, sizeof(marker3), "%s/mark-beta", appdir);
+    bool marked3 = false;
+    for (int i = 0; i < 400 && !marked3; i++) {
         xwt_pump(t);
-        handled_ctl_line(lfd, line3, sizeof(line3), &got3);
+        marked3 = access(marker3, F_OK) == 0;
         usleep(10000);
     }
-    XWT_CHECK(got3 && strcmp(line3, "run beta --flag") == 0,
-              "search + Enter launches the filtered item (got '%s')",
-              got3 ? line3 : "(none)");
+    XWT_CHECK(marked3, "search + Enter launches the filtered item (marker)");
     PANEL_WAIT(t, n_top_popups(t) == 0);
     XWT_CHECK(n_top_popups(t) == 0, "menu closed after search launch");
 
@@ -1162,25 +1157,33 @@ static void fake_appdir2(char *out, size_t outn) {
     char appsub[340];
     snprintf(appsub, sizeof(appsub), "%.320s/applications", out);
     mkdir(appsub, 0755);
+    /* real commands: each app touches a marker file */
     static const char *const entries[] = {
         "[Desktop Entry]\nType=Application\nName=Web Browser\n"
-        "Exec=/bin/browser\nCategories=Network;WebBrowser;\n"
+        "Exec=/bin/touch @DIR@/mark-browser\nCategories=Network;WebBrowser;\n"
         "Icon=web\n",
         "[Desktop Entry]\nType=Application\nName=Text Editor\n"
-        "Exec=/bin/editor\nCategories=Utility;TextEditor;\n",
+        "Exec=/bin/touch @DIR@/mark-editor\nCategories=Utility;TextEditor;\n",
         "[Desktop Entry]\nType=Application\nName=File Manager\n"
-        "Exec=/bin/fm\nCategories=System;FileManager;\n",
+        "Exec=/bin/touch @DIR@/mark-fm\nCategories=System;FileManager;\n",
         "[Desktop Entry]\nType=Application\nName=Sound Mixer\n"
-        "Exec=/bin/mixer\nCategories=AudioVideo;\n",
+        "Exec=/bin/touch @DIR@/mark-mixer\nCategories=AudioVideo;\n",
     };
     static const char *const files[] = {"web-browser.desktop", "text-editor.desktop",
                                         "file-manager.desktop", "sound-mixer.desktop"};
     for (size_t i = 0; i < 4; i++) {
-        char path[512];
+        char path[512], body[600];
+        snprintf(body, sizeof(body), "%s", entries[i]);
+        for (char *tok = strstr(body, "@DIR@"); tok;
+             tok = strstr(body, "@DIR@")) {
+            size_t dlen = strlen(out), rest = strlen(tok + 5) + 1;
+            memmove(tok + dlen, tok + 5, rest);
+            memcpy(tok, out, dlen);
+        }
         snprintf(path, sizeof(path), "%s/%s", appsub, files[i]);
         FILE *f = fopen(path, "w");
         if (f) {
-            fputs(entries[i], f);
+            fputs(body, f);
             fclose(f);
         }
     }
@@ -1193,8 +1196,9 @@ static void fake_appdir2(char *out, size_t outn) {
         FILE *f = fopen(path, "w");
         if (f) {
             fprintf(f, "[Desktop Entry]\nType=Application\nName=%s\n"
-                       "Exec=/bin/filler%d\nCategories=Utility;\n",
-                    name, i);
+                       "Exec=/bin/touch %s/mark-filler-%02d\n"
+                       "Categories=Utility;\n",
+                    name, out, i);
             fclose(f);
         }
     }
@@ -1276,16 +1280,15 @@ static void test_panel_menu_v2(struct xwt_ctx *t) {
     xw_compositor_inject_pointer_button(t->comp, 0x110, true);
     xwt_pump(t);
     xw_compositor_inject_pointer_button(t->comp, 0x110, false);
-    char line[128] = {0};
-    bool got = false;
-    for (int i = 0; i < 300 && !got; i++) {
+    char marker[340];
+    snprintf(marker, sizeof(marker), "%s/mark-browser", appdir);
+    bool marked = false;
+    for (int i = 0; i < 300 && !marked; i++) {
         xwt_pump(t);
-        handled_ctl_line(lfd, line, sizeof(line), &got);
+        marked = access(marker, F_OK) == 0;
         usleep(10000);
     }
-    XWT_CHECK(got && strcmp(line, "run /bin/browser") == 0,
-              "favorites launch the pinned app (got '%s')",
-              got ? line : "(none)");
+    XWT_CHECK(marked, "favorites launch the pinned app (marker)");
     PANEL_WAIT(t, n_top_popups(t) == 0);
 
     /* 2. categories: click the Internet row, the pane re-lists */
@@ -1314,16 +1317,16 @@ static void test_panel_menu_v2(struct xwt_ctx *t) {
     xw_compositor_inject_pointer_button(t->comp, 0x110, true);
     xwt_pump(t);
     xw_compositor_inject_pointer_button(t->comp, 0x110, false);
-    char line2[128] = {0};
-    bool got2 = false;
-    for (int i = 0; i < 300 && !got2; i++) {
+    char marker2[340];
+    snprintf(marker2, sizeof(marker2), "%s/mark-browser", appdir);
+    unlink(marker2);
+    bool marked2 = false;
+    for (int i = 0; i < 300 && !marked2; i++) {
         xwt_pump(t);
-        handled_ctl_line(lfd, line2, sizeof(line2), &got2);
+        marked2 = access(marker2, F_OK) == 0;
         usleep(10000);
     }
-    XWT_CHECK(got2 && strcmp(line2, "run /bin/browser") == 0,
-              "Internet category lists the browser (got '%s')",
-              got2 ? line2 : "(none)");
+    XWT_CHECK(marked2, "Internet category launches the browser (marker)");
     PANEL_WAIT(t, n_top_popups(t) == 0);
 
     /* 3. scrolling: All has 44 apps; the wheel scrolls the pane and
@@ -1356,16 +1359,26 @@ static void test_panel_menu_v2(struct xwt_ctx *t) {
     xw_compositor_inject_pointer_button(t->comp, 0x110, true);
     xwt_pump(t);
     xw_compositor_inject_pointer_button(t->comp, 0x110, false);
-    char line3[128] = {0};
-    bool got3 = false;
-    for (int i = 0; i < 300 && !got3; i++) {
+    bool marked3 = false;
+    char filler_marker[64] = {0};
+    for (int i = 0; i < 300 && !marked3; i++) {
         xwt_pump(t);
-        handled_ctl_line(lfd, line3, sizeof(line3), &got3);
+        /* any filler marker proves the scrolled pane launched a
+         * later entry (not the alphabetical first) */
+        for (int k = 0; k < 40; k++) {
+            char m[380];
+            snprintf(m, sizeof(m), "%s/mark-filler-%02d", appdir, k);
+            if (access(m, F_OK) == 0) {
+                marked3 = true;
+                snprintf(filler_marker, sizeof(filler_marker),
+                         "mark-filler-%02d", k);
+                break;
+            }
+        }
         usleep(10000);
     }
-    XWT_CHECK(got3 && strncmp(line3, "run /bin/filler", 15) == 0,
-              "scrolled pane launches a later entry (got '%s')",
-              got3 ? line3 : "(none)");
+    XWT_CHECK(marked3, "scrolled pane launches a later entry (%s)",
+              filler_marker);
     PANEL_WAIT(t, n_top_popups(t) == 0);
     XWT_CHECK(kill(pid, 0) == 0, "panel alive after the v2 menu flow");
 
@@ -1994,63 +2007,66 @@ struct mx_fixture {
 };
 
 static const struct mx_fixture mx_fixtures[] = {
+    /* every runnable fixture launches /bin/touch on a marker file the
+     * test waits for; the panel's new direct launcher (posix_spawn,
+     * no shell, no session relay) creates the real process. */
     {"a-simple.desktop",
-     "[Desktop Entry]\nType=Application\nName=A Simple\nExec=/bin/simple\n"
+     "[Desktop Entry]\nType=Application\nName=A Simple\nExec=/bin/touch @DIR@/mark-a\n"
      "Categories=Utility;\n",
-     "run /bin/simple"},
+     "mark-a"},
     {"b-args.desktop",
      "[Desktop Entry]\nType=Application\nName=B Argline\n"
-     "Exec=/bin/args --flag -x 42\nCategories=Utility;\n",
-     "run /bin/args --flag -x 42"},
+     "Exec=/bin/touch -m @DIR@/mark-b\nCategories=Utility;\n",
+     "mark-b"},
     {"c-quoted.desktop",
      "[Desktop Entry]\nType=Application\nName=C Quoted Str\n"
-     "Exec=quotedapp \"one two\" three\\ four\nCategories=Utility;\n",
-     "run quotedapp 'one two' 'three four'"},
+     "Exec=/bin/touch \"@DIR@/mark c\"\nCategories=Utility;\n",
+     "mark c"},
     {"d-fields.desktop",
      "[Desktop Entry]\nType=Application\nName=D Fieldcodes\n"
-     "Exec=fieldapp %f %U %i %c\nIcon=dicon\nCategories=Utility;\n",
-     "run fieldapp --icon dicon 'D Fieldcodes'"},
+     "Exec=/bin/touch @DIR@/mark-d %f %U %k %c\nIcon=dicon\nCategories=Utility;\n",
+     "mark-d"},
     {"e-terminal.desktop",
-     "[Desktop Entry]\nType=Application\nName=E Terminal\nExec=vimalike %F\n"
+     "[Desktop Entry]\nType=Application\nName=E Terminal\nExec=/bin/touch @DIR@/mark-e\n"
      "Terminal=true\nCategories=Utility;\n",
-     "run /bin/sh -e vimalike"},
+     "mark-e"},
     {"f-long.desktop",
      "[Desktop Entry]\nType=Application\n"
      "Name=F Very Long Application Name That Overflows The Pane\n"
-     "Exec=longapp\nCategories=Utility;\n",
-     "run longapp"},
+     "Exec=/bin/touch @DIR@/mark-f\nCategories=Utility;\n",
+     "mark-f"},
     {"g-iconpng.desktop",
-     "[Desktop Entry]\nType=Application\nName=G Iconpng\nExec=gicon\n"
+     "[Desktop Entry]\nType=Application\nName=G Iconpng\nExec=/bin/touch @DIR@/mark-g\n"
      "Icon=testicon\nCategories=Utility;\n",
-     "run gicon"},
+     "mark-g"},
     {"h-iconabs.desktop",
-     "[Desktop Entry]\nType=Application\nName=H Iconabs\nExec=hicon\n"
-     "Icon=%s/icons/hicolor/48x48/apps/testicon.png\nCategories=Utility;\n",
-     "run hicon"},
+     "[Desktop Entry]\nType=Application\nName=H Iconabs\nExec=/bin/touch @DIR@/mark-h\n"
+     "Icon=@ICONABS@\nCategories=Utility;\n",
+     "mark-h"},
     {"i-iconext.desktop",
-     "[Desktop Entry]\nType=Application\nName=I Iconext\nExec=iicon\n"
+     "[Desktop Entry]\nType=Application\nName=I Iconext\nExec=/bin/touch @DIR@/mark-i\n"
      "Icon=testicon.png\nCategories=Utility;\n",
-     "run iicon"},
+     "mark-i"},
     {"j-svgonly.desktop",
-     "[Desktop Entry]\nType=Application\nName=J Svgonly\nExec=jsvg\n"
+     "[Desktop Entry]\nType=Application\nName=J Svgonly\nExec=/bin/touch @DIR@/mark-j\n"
      "Icon=chatgpt\nCategories=Utility;\n",
-     "run jsvg"},
+     "mark-j"},
     {"k-noicon.desktop",
-     "[Desktop Entry]\nType=Application\nName=K Missingicon\nExec=knoicon\n"
+     "[Desktop Entry]\nType=Application\nName=K Missingicon\nExec=/bin/touch @DIR@/mark-k\n"
      "Categories=Utility;\n",
-     "run knoicon"},
+     "mark-k"},
     {"l-nonexistent.desktop",
      "[Desktop Entry]\nType=Application\nName=L Nonexistent\n"
-     "Exec=/nonexistent/definitely-not-here\nCategories=Utility;\n",
-     "run /nonexistent/definitely-not-here"},
+     "Exec=/nonexistent/definitely-not-here @DIR@/mark-l\nCategories=Utility;\n",
+     NULL},
     {"m-malformed.desktop",
      "[Desktop Entry]\nType=Application\nName=M Malformed\n"
      "Exec=badexec \"unterminated\nCategories=Utility;\n",
      NULL},
     {"z-unicode.desktop",
-     "[Desktop Entry]\nType=Application\nName=Zz \xc3\x9c\xc3\xa9 Caf\xc3\xa9\n"
-     "Exec=utfapp\nIcon=testicon\nCategories=Utility;\n",
-     "run utfapp"},
+     "[Desktop Entry]\nType=Application\nName=Zz \xc3\xc3© Caf\xc3©\n"
+     "Exec=/bin/touch @DIR@/mark-z\nIcon=testicon\nCategories=Utility;\n",
+     "mark-z"},
 };
 
 static void test_panel_launch_matrix(struct xwt_ctx *t) {
@@ -2096,18 +2112,52 @@ static void test_panel_launch_matrix(struct xwt_ctx *t) {
         fclose(sf);
     }
 
-    /* the .desktop fixtures (h-iconabs needs the absolute icon path) */
+    /* the .desktop fixtures: each runnable entry touches a marker file
+     * (panel-launch.c spawns the real process directly). e-terminal
+     * uses a stub "terminal" that drops its -e flag and touches the
+     * remaining argument, so the Terminal=true path is exercised end
+     * to end. h-iconabs carries an absolute Icon path. */
     char empty[300];
     snprintf(empty, sizeof(empty), "%s/mxempty-%d", g_runtimedir(),
              (int)getpid());
     mkdir(empty, 0755);
+
+    /* the terminal stub: a stand-in terminal that drops its -e flag
+     * and executes the joined command string (what a real -e terminal
+     * does with the command it is asked to host) */
+    char termstub[400];
+    snprintf(termstub, sizeof(termstub), "%s/termstub", appdir);
+    FILE *tf = fopen(termstub, "w");
+    XWT_ASSERT(tf);
+    fputs("#!/bin/sh\n"
+          "[ \"$1\" = \"-e\" ] && shift\n"
+          "exec /bin/sh -c \"$*\"\n",
+          tf);
+    fclose(tf);
+    chmod(termstub, 0755);
+
+    char iconabs[600];
+    snprintf(iconabs, sizeof(iconabs), "%s/testicon.png", themedir);
+    /* token substitution (printf %s would eat the Exec field codes
+     * %f %U %i %c as format specifiers and write garbage) */
     for (size_t i = 0; i < sizeof(mx_fixtures) / sizeof(mx_fixtures[0]); i++) {
-        char path[512], body[1024];
+        char path[512], body[1200];
         const struct mx_fixture *fx = &mx_fixtures[i];
-        if (strstr(fx->body, "%s/icons/"))
-            snprintf(body, sizeof(body), fx->body, appdir);
-        else
-            snprintf(body, sizeof(body), "%s", fx->body);
+        snprintf(body, sizeof(body), "%s", fx->body);
+        for (int round = 0; round < 3; round++) {
+            char *tok = strstr(body, "@DIR@");
+            if (tok) {
+                memmove(tok + strlen(appdir), tok + 5,
+                        strlen(tok + 5) + 1);
+                memcpy(tok, appdir, strlen(appdir));
+            }
+            tok = strstr(body, "@ICONABS@");
+            if (tok) {
+                memmove(tok + strlen(iconabs), tok + 9,
+                        strlen(tok + 9) + 1);
+                memcpy(tok, iconabs, strlen(iconabs));
+            }
+        }
         snprintf(path, sizeof(path), "%s/%s", appsub, fx->file);
         FILE *f = fopen(path, "w");
         XWT_ASSERT(f);
@@ -2116,20 +2166,7 @@ static void test_panel_launch_matrix(struct xwt_ctx *t) {
     }
     setenv("XDG_DATA_HOME", appdir, 1);
     setenv("XDG_DATA_DIRS", empty, 1);
-    setenv("XW_TERMINAL", "/bin/sh", 1); /* deterministic Terminal=true wrap */
-
-    /* the fake session manager socket */
-    char ctl_path[192];
-    snprintf(ctl_path, sizeof(ctl_path), "%s/xw-session.sock",
-             g_runtimedir());
-    unlink(ctl_path);
-    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    struct sockaddr_un addr = {0};
-    addr.sun_family = AF_UNIX;
-    int ncpy = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", ctl_path);
-    XWT_ASSERT(ncpy >= 0 && (size_t)ncpy < sizeof(addr.sun_path));
-    XWT_ASSERT(bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
-    XWT_ASSERT(listen(lfd, 8) == 0);
+    setenv("XW_TERMINAL", termstub, 1); /* deterministic Terminal=true wrap */
 
     pid_t pid = spawn_panel(t, "-launchmx");
     unsetenv("XDG_DATA_HOME");
@@ -2141,19 +2178,12 @@ static void test_panel_launch_matrix(struct xwt_ctx *t) {
     int alive_st = 0;
     XWT_CHECK(panel_alive(pid, &alive_st), "panel alive at start");
 
-    /* drain any pending ctl connections (leftover async round trips) */
-    for (int i = 0; i < 3; i++) {
-        char drain[256];
-        bool any = false;
-        handled_ctl_line(lfd, drain, sizeof(drain), &any);
-        pump_ms(t, 60);
-    }
-
     /* launch every runnable fixture. Navigation is by SEARCH (type the
-     * name, Enter launches the first hit) — geometry-free, exercises the
-     * same launch path a row click uses. After every launch: the ctl
-     * line must carry the expected command, the menu must close, and
-     * the panel process must still be alive (waitpid detects a crash). */
+     * name, Enter launches the first hit) — geometry-free, exercises
+     * the same launch path a row click uses. After every launch: the
+     * marker file must appear (the REAL process ran), the menu must
+     * close, and the panel process must still be alive (waitpid
+     * detects a crash). */
     struct mx_nav {
         const char *order;   /* fixture prefix */
         const char *search;  /* what to type */
@@ -2164,8 +2194,7 @@ static void test_panel_launch_matrix(struct xwt_ctx *t) {
         {"e-terminal", "terminal"}, {"f-long", "very long"},
         {"g-iconpng", "iconpng"}, {"h-iconabs", "iconabs"},
         {"i-iconext", "iconext"}, {"j-svgonly", "svgonly"},
-        {"k-noicon", "missingicon"}, {"l-nonexistent", "nonexistent"},
-        {"z-unicode", "nicode"},
+        {"k-noicon", "missingicon"}, {"z-unicode", "nicode"},
     };
     static const int KEY_OF_LETTER[26] = {
         30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24,
@@ -2181,7 +2210,20 @@ static void test_panel_launch_matrix(struct xwt_ctx *t) {
                 pump_ms(t, 30);                                                  \
             }                                                                    \
         } while (0)
+
     for (size_t i = 0; i < sizeof(nav) / sizeof(nav[0]); i++) {
+        const struct mx_fixture *fx = NULL;
+        for (size_t k = 0; k < sizeof(mx_fixtures) / sizeof(mx_fixtures[0]);
+             k++)
+            if (strncmp(mx_fixtures[k].file, nav[i].order,
+                        strlen(nav[i].order)) == 0)
+                fx = &mx_fixtures[k];
+        XWT_ASSERT(fx && fx->expect_ctl);
+        /* clean the marker for this fixture */
+        char marker[400];
+        snprintf(marker, sizeof(marker), "%s/%s", appdir, fx->expect_ctl);
+        unlink(marker);
+
         /* open (the 300ms pacing clears the dismissal suppression) */
         xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
         pump_ms(t, 300);
@@ -2195,7 +2237,6 @@ static void test_panel_launch_matrix(struct xwt_ctx *t) {
         PANEL_WAIT(t, xw_seat_first(t->comp) &&
                            xw_seat_first(t->comp)->grab_surface ==
                                the_menu(t)->surface);
-        /* type the search word */
         MX_TYPE_WORD(t, nav[i].search);
         pump_ms(t, 60);
         /* Enter launches the first (only) hit */
@@ -2203,23 +2244,15 @@ static void test_panel_launch_matrix(struct xwt_ctx *t) {
         xwt_pump(t);
         xw_compositor_inject_key(t->comp, 28, false);
 
-        char line[256] = {0};
-        bool got = false;
-        for (int w = 0; w < 400 && !got; w++) {
+        /* the REAL child process must create the marker */
+        bool marked = false;
+        for (int w = 0; w < 300 && !marked; w++) {
             xwt_pump(t);
-            handled_ctl_line(lfd, line, sizeof(line), &got);
+            marked = access(marker, F_OK) == 0;
             usleep(10000);
         }
-        const struct mx_fixture *fx = NULL;
-        for (size_t k = 0; k < sizeof(mx_fixtures) / sizeof(mx_fixtures[0]);
-             k++)
-            if (strncmp(mx_fixtures[k].file, nav[i].order,
-                        strlen(nav[i].order)) == 0)
-                fx = &mx_fixtures[k];
-        XWT_ASSERT(fx);
-        XWT_CHECK(got && strcmp(line, fx->expect_ctl) == 0,
-                  "%s -> ctl '%s' (expected '%s')", nav[i].order,
-                  got ? line : "(none)", fx->expect_ctl);
+        XWT_CHECK(marked, "%s: marker created by the launched process (%s)",
+                  nav[i].order, marker);
         PANEL_WAIT(t, n_top_popups(t) == 0);
         XWT_CHECK(n_top_popups(t) == 0, "%s: menu closed after launch",
                   nav[i].order);
@@ -2231,7 +2264,38 @@ static void test_panel_launch_matrix(struct xwt_ctx *t) {
     XWT_CHECK(panel_alive(pid, &alive_st),
               "panel alive after launching every fixture");
 
-    /* the malformed Exec: refused — menu stays open, panel alive */
+    /* the nonexistent executable: refused BEFORE spawning (visible
+     * failure on the bar), menu stays open, panel alive, no crash */
+    xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
+    pump_ms(t, 300);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, n_top_popups(t) == 1);
+    PANEL_WAIT(t, xw_seat_first(t->comp) &&
+                       xw_seat_first(t->comp)->grab_surface ==
+                           the_menu(t)->surface);
+    MX_TYPE_WORD(t, "nonexistent");
+    pump_ms(t, 60);
+    xw_compositor_inject_key(t->comp, 28, true);
+    xwt_pump(t);
+    xw_compositor_inject_key(t->comp, 28, false);
+    pump_ms(t, 400);
+    XWT_CHECK(n_top_popups(t) == 1,
+              "nonexistent executable refused, menu stayed open");
+    XWT_CHECK(panel_alive(pid, &alive_st),
+              "panel alive after refused launch");
+    /* the bar carries the failure message (drawn in red next to Start) */
+    xw_compositor_inject_key(t->comp, K_ESC, true);
+    xwt_pump(t);
+    xw_compositor_inject_key(t->comp, K_ESC, false);
+    pump_ms(t, 80);
+    xw_compositor_inject_key(t->comp, K_ESC, true);
+    xwt_pump(t);
+    xw_compositor_inject_key(t->comp, K_ESC, false);
+    PANEL_WAIT(t, n_top_popups(t) == 0);
+
+    /* the malformed Exec: refused at parse time — same contract */
     xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
     pump_ms(t, 300);
     xw_compositor_inject_pointer_button(t->comp, 0x110, true);
@@ -2260,8 +2324,12 @@ static void test_panel_launch_matrix(struct xwt_ctx *t) {
     }
     PANEL_WAIT(t, n_top_popups(t) == 0);
 
-    /* rapid relaunch burst: 8 launch cycles back to back */
+    /* rapid relaunch burst: 8 launch cycles back to back, each spawning
+     * a real process; the panel must reap them all without blocking */
     for (int round = 0; round < 8; round++) {
+        char marker[400];
+        snprintf(marker, sizeof(marker), "%s/mark-a", appdir);
+        unlink(marker);
         xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
         pump_ms(t, 220);
         xw_compositor_inject_pointer_button(t->comp, 0x110, true);
@@ -2276,13 +2344,14 @@ static void test_panel_launch_matrix(struct xwt_ctx *t) {
         xw_compositor_inject_key(t->comp, 28, true);
         xwt_pump(t);
         xw_compositor_inject_key(t->comp, 28, false);
-        char line[256] = {0};
-        bool got = false;
-        for (int w = 0; w < 200 && !got; w++) {
+        bool marked = false;
+        for (int w = 0; w < 200 && !marked; w++) {
             xwt_pump(t);
-            handled_ctl_line(lfd, line, sizeof(line), &got);
+            marked = access(marker, F_OK) == 0;
             usleep(10000);
         }
+        if (!marked)
+            XWT_CHECK(false, "burst round %d: marker missing", round);
         if (!panel_alive(pid, &alive_st)) {
             XWT_CHECK(false, "PANEL CRASHED in rapid relaunch round %d",
                       round);
@@ -2292,8 +2361,6 @@ static void test_panel_launch_matrix(struct xwt_ctx *t) {
     XWT_CHECK(panel_alive(pid, &alive_st), "panel alive after the burst");
 
     reap(&pid);
-    unlink(ctl_path);
-    close(lfd);
 }
 
 static const struct xwt_test tests[] = {

@@ -737,7 +737,8 @@ static const struct {
     {"wezterm", XWAPP_TERM_DASHDASH},
     {"kitty", XWAPP_TERM_POSITIONAL},
     {"foot", XWAPP_TERM_POSITIONAL},
-    {"xfce4-terminal", XWAPP_TERM_E_REST},
+    {"xfce4-terminal", XWAPP_TERM_X},
+    {"terminator", XWAPP_TERM_X},
     {"konsole", XWAPP_TERM_E_REST},
     {"alacritty", XWAPP_TERM_E_REST},
     {"lxterminal", XWAPP_TERM_E_REST},
@@ -748,7 +749,6 @@ static const struct {
     {"xterm", XWAPP_TERM_E_REST},
     {"qterminal", XWAPP_TERM_E_REST},
     {"tilix", XWAPP_TERM_E_REST},
-    {"terminator", XWAPP_TERM_E_REST},
     {"x-terminal-emulator", XWAPP_TERM_E_REST},
 };
 
@@ -816,12 +816,15 @@ int xwapp_launch_argv(const struct xwapp *a, char args[][XWAPP_ARG_MAX],
             copy_str(args[i], XWAPP_ARG_MAX, argv[i]);
         return m;
     }
-    /* Terminal=true: host the command in a terminal. The command is
-     * joined into one sh-safe string (most terminals take a single
-     * command string, and nested quoting per-argument confuses -e) */
-    char inner[1024];
-    xwapp_argv_to_shell((const char(*)[XWAPP_ARG_MAX])argv, n, inner,
-                        sizeof(inner));
+    /* Terminal=true: host the command in a terminal.
+     *
+     * -x / -- / positional styles take the application argv DIRECTLY
+     *   (no shell anywhere in the chain — the args are already
+     *   spec-parsed tokens).
+     * - -e style terminals (xterm family) historically want the whole
+     *   command as ONE string; the already-tokenized argv is joined
+     *   with proper quoting for that single argument (the TERMINAL
+     *   word-splits it itself; no shell is involved). */
     char term[256];
     int style = XWAPP_TERM_E_REST;
     if (!xwapp_resolve_terminal(term, sizeof(term), &style)) {
@@ -839,21 +842,28 @@ int xwapp_launch_argv(const struct xwapp *a, char args[][XWAPP_ARG_MAX],
         copy_str(args[i++], XWAPP_ARG_MAX, targs[k]);
     if (i >= max)
         return -1;
-    if (style == XWAPP_TERM_DASHDASH)
+    if (style == XWAPP_TERM_DASHDASH) {
         copy_str(args[i++], XWAPP_ARG_MAX, "--");
-    else if (style == XWAPP_TERM_E_REST)
+    } else if (style == XWAPP_TERM_X) {
+        copy_str(args[i++], XWAPP_ARG_MAX, "-x");
+    } else if (style == XWAPP_TERM_E_REST) {
         copy_str(args[i++], XWAPP_ARG_MAX, "-e");
-    /* positional style: the command goes right after the terminal */
-    if (style == XWAPP_TERM_POSITIONAL) {
-        /* kitty/foot run "cmd arg..." directly; pass the joined line to
-         * the shell so redirections/quoting work like Terminal=true
-         * expects */
-        copy_str(args[i++], XWAPP_ARG_MAX, "/bin/sh");
-        if (i < max)
-            copy_str(args[i++], XWAPP_ARG_MAX, "-c");
     }
-    if (i < max)
-        copy_str(args[i++], XWAPP_ARG_MAX, inner);
+    if (style == XWAPP_TERM_E_REST) {
+        /* single command string for the -e family */
+        char inner[1024];
+        if (!xwapp_argv_to_shell((const char(*)[XWAPP_ARG_MAX])argv, n,
+                                 inner, sizeof(inner))) {
+            snprintf(err, err_n, "command line too long for the terminal");
+            return -1;
+        }
+        if (i < max)
+            copy_str(args[i++], XWAPP_ARG_MAX, inner);
+        return i;
+    }
+    /* X and POSITIONAL styles: the application argv goes straight in */
+    for (int k = 0; k < n && i < max; k++)
+        copy_str(args[i++], XWAPP_ARG_MAX, argv[k]);
     return i;
 }
 

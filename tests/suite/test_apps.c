@@ -4,6 +4,7 @@
  * desktop-entry spec, the terminal strategy and search. */
 #include "xwtest.h"
 
+#include "panel.h" /* panel_spawn_argv (panel-launch.c) */
 #include "panel-apps.h"
 
 #include <stdarg.h>
@@ -11,6 +12,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* ------------------------------------------------------------ helpers */
@@ -400,14 +402,22 @@ static void test_apps_terminal(struct xwt_ctx *t) {
                   "wrap order correct (joined command string)");
     }
 
-    /* kitty-style wrapper (positional, via the style table) */
+    /* kitty-style wrapper (positional): the app argv goes DIRECTLY
+     * after the terminal — no shell in the chain */
     setenv("XW_TERMINAL", "/bin/kitty", 1);
     n = xwapp_launch_argv(&a, args, XWAPP_MAX_ARGS, err, sizeof(err));
-    XWT_CHECK(n == 4 && strcmp(args[0], "/bin/kitty") == 0 &&
-                  strcmp(args[1], "/bin/sh") == 0 &&
-                  strcmp(args[2], "-c") == 0 &&
-                  strcmp(args[3], "/bin/consoleapp --flag") == 0,
-              "positional terminal wraps via sh -c (n=%d)", n);
+    XWT_CHECK(n == 3 && strcmp(args[0], "/bin/kitty") == 0 &&
+                  strcmp(args[1], "/bin/consoleapp") == 0 &&
+                  strcmp(args[2], "--flag") == 0,
+              "positional terminal takes the argv directly (n=%d)", n);
+
+    /* xfce4-terminal style (-x): direct argv as well */
+    setenv("XW_TERMINAL", "/bin/xfce4-terminal", 1);
+    n = xwapp_launch_argv(&a, args, XWAPP_MAX_ARGS, err, sizeof(err));
+    XWT_CHECK(n == 4 && strcmp(args[0], "/bin/xfce4-terminal") == 0 &&
+                  strcmp(args[1], "-x") == 0 &&
+                  strcmp(args[2], "/bin/consoleapp") == 0,
+              "-x terminal takes the argv directly (n=%d)", n);
 
     /* an app argument needing quotes survives the sh join */
     snprintf(a.exec, sizeof(a.exec), "/bin/app \"quoted arg\"");
@@ -423,6 +433,71 @@ static void test_apps_terminal(struct xwt_ctx *t) {
     n = xwapp_launch_argv(&a, args, XWAPP_MAX_ARGS, err, sizeof(err));
     XWT_CHECK(n == -1 && strstr(err, "no terminal"),
               "Terminal=true without a terminal fails visibly ('%s')", err);
+}
+
+/* panel_spawn_argv: the direct launcher — a real process appears
+ * (marker file), PATH lookup works, and every failure mode returns
+ * false with a reason instead of crashing. */
+static void test_apps_spawn(struct xwt_ctx *t) {
+    (void)t;
+    char args[XWAPP_MAX_ARGS][XWAPP_ARG_MAX];
+    char err[192];
+    char marker[512];
+    snprintf(marker, sizeof(marker), "/tmp/xwt-spawn-%d.marker", (int)getpid());
+    unlink(marker);
+
+    /* direct absolute path with an argument */
+    snprintf(args[0], XWAPP_ARG_MAX, "/bin/touch");
+    snprintf(args[1], XWAPP_ARG_MAX, "%.190s", marker);
+    pid_t pid = -1;
+    XWT_CHECK(panel_spawn_argv(args, 2, &pid, err, sizeof(err)),
+              "spawn /bin/touch (%s)", err);
+    XWT_CHECK(pid > 0, "child pid reported");
+    for (int i = 0; i < 100 && access(marker, F_OK) != 0; i++)
+        usleep(10000);
+    XWT_CHECK(access(marker, F_OK) == 0, "the marker file appeared");
+    int st = 0;
+    for (int i = 0; i < 200; i++) {
+        if (waitpid(pid, &st, WNOHANG) == pid)
+            break;
+        usleep(10000);
+    }
+    XWT_CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0,
+              "child exited cleanly");
+
+    /* PATH lookup by name (an explicit PATH: earlier tests point PATH
+     * at scratch directories) */
+    char saved_path[1024] = "";
+    if (getenv("PATH"))
+        snprintf(saved_path, sizeof(saved_path), "%s", getenv("PATH"));
+    setenv("PATH", "/usr/bin:/bin", 1);
+    snprintf(args[0], XWAPP_ARG_MAX, "touch");
+    snprintf(args[1], XWAPP_ARG_MAX, "%.190s", marker);
+    unlink(marker);
+    pid = -1;
+    XWT_CHECK(panel_spawn_argv(args, 2, &pid, err, sizeof(err)),
+              "spawn 'touch' via PATH (%s)", err);
+    for (int i = 0; i < 100 && access(marker, F_OK) != 0; i++)
+        usleep(10000);
+    XWT_CHECK(access(marker, F_OK) == 0, "PATH-resolved marker appeared");
+    waitpid(pid, &st, 0);
+    if (saved_path[0])
+        setenv("PATH", saved_path, 1);
+
+    /* nonexistent absolute path: visible failure */
+    snprintf(args[0], XWAPP_ARG_MAX, "/nonexistent/definitely-not-here");
+    err[0] = 0;
+    XWT_CHECK(!panel_spawn_argv(args, 1, NULL, err, sizeof(err)) &&
+                  strstr(err, "not found"),
+              "nonexistent path fails visibly ('%s')", err);
+
+    /* empty command */
+    args[0][0] = 0;
+    XWT_CHECK(!panel_spawn_argv(args, 1, NULL, err, sizeof(err)) &&
+                  strstr(err, "empty"),
+              "empty command rejected ('%s')", err);
+
+    unlink(marker);
 }
 
 static void test_apps_search(struct xwt_ctx *t) {
@@ -469,6 +544,7 @@ static const struct xwt_test tests[] = {
     {"apps-categories", test_apps_categories},
     {"apps-exec", test_apps_exec},
     {"apps-terminal", test_apps_terminal},
+    {"apps-spawn", test_apps_spawn},
     {"apps-search", test_apps_search},
 };
 
