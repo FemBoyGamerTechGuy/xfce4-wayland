@@ -130,6 +130,9 @@ static const struct wl_surface_interface surface_impl = {
 
 /* ------------------------------------------------------------- surface api */
 
+static void set_committed_buffer(struct xw_surface *s,
+                                 struct wl_resource *b);
+
 struct wl_resource *xw_surface_create(struct wl_client *client,
                                       struct xw_compositor *c, uint32_t id,
                                       uint32_t version) {
@@ -151,9 +154,13 @@ struct wl_resource *xw_surface_create(struct wl_client *client,
     pixman_region_init(&s->input);
     pixman_region_init(&s->pending_damage);
     wl_list_init(&s->frames);
+    wl_list_init(&s->subsurfaces);
     wl_list_insert(c->surfaces.prev, &s->link);
     wl_resource_set_implementation(res, &surface_impl, s,
                                    xw_surface_resource_destroyed);
+    pid_t pid = 0;
+    wl_client_get_credentials(client, &pid, NULL, NULL);
+    xw_log(XW_LOG_DEBUG, "surface %u created (client pid %d)", id, (int)pid);
     return res;
 }
 
@@ -163,16 +170,58 @@ void xw_surface_resource_destroyed(struct wl_resource *res) {
      * surface dying under the cursor must not leave a dangling
      * ptr_focus behind (use-after-free on the next pointer event) */
     xw_seat_forget_surface(s->comp, s);
+    xw_seat_forget_cursor_surface(s->comp, s);
+    /* subsurface children outlive the parent surface only as roleless
+     * wl_surfaces: tear their role down now (the parent position is
+     * still valid for the final damage pass) */
+    if (!wl_list_empty(&s->subsurfaces))
+        xw_subsurface_parent_destroyed(s);
     xw_role_destroy(s);
     struct xw_frame *f, *f2;
     wl_list_for_each_safe(f, f2, &s->frames, link) {
         wl_list_remove(&f->link);
         free(f); /* the wl_callback resource is already being destroyed */
     }
+    /* release the buffer we still hold (if the client did not destroy
+     * it first — the destroy listener cleared the pointer then) */
+    set_committed_buffer(s, NULL);
     wl_list_remove(&s->link);
     pixman_region_fini(&s->input);
     pixman_region_fini(&s->pending_damage);
     free(s);
+}
+
+/* ------------------------------------------------- buffer ownership */
+
+/* The client destroyed a buffer this surface still references: drop the
+ * pointer WITHOUT sending release (the object is gone; the destroy
+ * signal fires before internal destructors run). */
+static void committed_buffer_destroyed(struct wl_listener *l, void *data) {
+    (void)data;
+    struct xw_surface *s =
+        wl_container_of(l, s, committed_buffer_destroy);
+    s->committed_buffer = NULL;
+}
+
+/* Swap the surface's committed buffer. The PREVIOUS buffer gets
+ * wl_buffer.release the moment it stops being referenced: clients that
+ * rotate a pool of 2+ shm buffers (foot, GTK, XWayland) treat release
+ * as the reuse permission and simply stop committing once every pool
+ * buffer is outstanding — a frozen application with no error anywhere.
+ * NULL detaches. */
+static void set_committed_buffer(struct xw_surface *s,
+                                 struct wl_resource *b) {
+    if (s->committed_buffer == b)
+        return;
+    if (s->committed_buffer) {
+        wl_list_remove(&s->committed_buffer_destroy.link);
+        wl_buffer_send_release(s->committed_buffer);
+    }
+    s->committed_buffer = b;
+    if (b) {
+        s->committed_buffer_destroy.notify = committed_buffer_destroyed;
+        wl_resource_add_destroy_listener(b, &s->committed_buffer_destroy);
+    }
 }
 
 static void apply_buffer(struct xw_surface *s) {
@@ -180,23 +229,30 @@ static void apply_buffer(struct xw_surface *s) {
     s->pending_buffer = NULL;
     s->shm = NULL;
     s->has_single_pixel = false;
-    if (!b)
-        return;
-    struct wl_shm_buffer *shm = wl_shm_buffer_get(b);
-    if (shm) {
-        s->shm = shm;
-        s->buf_w = wl_shm_buffer_get_width(shm);
-        s->buf_h = wl_shm_buffer_get_height(shm);
-        return;
+    if (b) {
+        set_committed_buffer(s, b);
+        struct wl_shm_buffer *shm = wl_shm_buffer_get(b);
+        if (shm) {
+            s->shm = shm;
+            s->buf_w = wl_shm_buffer_get_width(shm);
+            s->buf_h = wl_shm_buffer_get_height(shm);
+            return;
+        }
+        /* not shm: our single-pixel buffer (implementation data = color) */
+        void *ud = wl_resource_get_user_data(b);
+        if (ud) {
+            memcpy(&s->single_pixel.color, ud, sizeof(uint32_t));
+            s->has_single_pixel = true;
+            s->buf_w = 1;
+            s->buf_h = 1;
+            return;
+        }
+    } else {
+        set_committed_buffer(s, NULL);
     }
-    /* not shm: our single-pixel buffer (implementation data = color value) */
-    void *ud = wl_resource_get_user_data(b);
-    if (ud) {
-        memcpy(&s->single_pixel.color, ud, sizeof(uint32_t));
-        s->has_single_pixel = true;
-        s->buf_w = 1;
-        s->buf_h = 1;
-    }
+    /* an unrecognized or NULL buffer: no content */
+    s->buf_w = 0;
+    s->buf_h = 0;
 }
 
 static void damage_surface_extent(struct xw_surface *s, int old_x, int old_y,
@@ -225,15 +281,33 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res) {
     apply_buffer(s);
 
     if (s->role == XW_SURFACE_ROLE_NONE) {
-        /* role-less commits only update buffer state; nothing is mapped */
+        if (s->is_cursor) {
+            /* cursor surfaces commit rolelessly: the new image (or the
+             * detach) must erase the old cursor pixels and deliver
+             * frame callbacks (animated cursors drive off them) */
+            xw_seat_damage_cursor(s->comp);
+            s->mapped = s->buf_w > 0 && s->buf_h > 0;
+            xw_seat_damage_cursor(s->comp);
+        }
+        /* role-less commits only update buffer state; nothing else is
+         * mapped */
         pixman_region_clear(&s->pending_damage);
         return;
     }
     xw_role_commit(s);
 
+    if (s->role == XW_SURFACE_ROLE_XDG_TOPLEVEL)
+        xw_subsurface_parent_committed(s);
+
     if (had_extent || (s->buf_w > 0 && s->buf_h > 0))
         damage_surface_extent(s, old_x, old_y, old_w, old_h);
     pixman_region_clear(&s->pending_damage);
+
+    if (s->shm && s->buf_w > 0) {
+        xw_log(XW_LOG_DEBUG, "surface %u: commit buffer %dx%d stride %u",
+               wl_resource_get_id(res), s->buf_w, s->buf_h,
+               wl_shm_buffer_get_stride(s->shm));
+    }
 }
 
 /* --------------------------------------------------------- role helpers */
@@ -262,6 +336,8 @@ void xw_surface_get_pos(struct xw_surface *s, int *x, int *y, int *w, int *h) {
         if (y) *y = ls->y;
         if (w) *w = ls->w;
         if (h) *h = ls->h;
+    } else if (s->role == XW_SURFACE_ROLE_SUBSURFACE) {
+        xw_subsurface_get_pos(s, x, y, w, h);
     }
 }
 
