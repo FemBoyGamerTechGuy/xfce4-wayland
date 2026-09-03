@@ -4,6 +4,7 @@
 #include "xw-ctl.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,4 +50,29 @@ bool xw_ctl_send(const char *cmd, char *reply, size_t reply_len) {
     if (nl)
         *nl = 0;
     return strncmp(reply, "ok", 2) == 0;
+}
+
+bool xw_ctl_send_async(const char *cmd) {
+    if (!cmd || !*cmd)
+        return false;
+    pid_t pid = fork();
+    if (pid < 0)
+        return false;
+    if (pid == 0) {
+        /* child: own the blocking round trip; the parent's Wayland
+         * connection is untouched (the child only ever talks to the
+         * session manager's unix socket). Reset the signal state:
+         * the parent may run with a signalfd-inherited blocked mask
+         * that would survive exec and break the child's own teardown */
+        sigset_t empty;
+        sigemptyset(&empty);
+        sigprocmask(SIG_SETMASK, &empty, NULL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        char reply[256];
+        xw_ctl_send(cmd, reply, sizeof(reply));
+        _exit(0);
+    }
+    return true;
 }

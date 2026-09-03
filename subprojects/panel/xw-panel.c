@@ -23,16 +23,20 @@
 #include "xwc.h"
 #include "clients/xw-ctl.h" /* client-side ctl wire (src/clients, via -Isrc) */
 
+#include <dirent.h>
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <stdarg.h>
 #include <limits.h>
 
 #include "wlr-layer-shell-unstable-v1.h"
+#include <xkbcommon/xkbcommon-keysyms.h>
 
 /* ------------------------------------------------------------------ */
 /* Terminal resolution — deliberately a local copy of the compositor's
@@ -165,6 +169,14 @@ struct panel {
     char terminal_cmd[256];
     bool redraw;      /* coalesced redraw request */
     bool quit;
+
+    /* the applications menu (xdg_popup parented to the bar layer) */
+    struct xwc_popup *menu; /* NULL = closed */
+    int menu_hover;          /* hovered item index, -1 = none */
+    int menu_w, menu_h;      /* current popup geometry */
+    int64_t menu_closed_ms;  /* dismissal timestamp: a Start press in
+                                the same click that dismissed the menu
+                                must not reopen it (toggle) */
 };
 
 static struct panel *g_panel; /* signal handler context */
@@ -367,6 +379,386 @@ static struct btn *btn_at(struct panel *p, int x, int y) {
 #define BTN_MIDDLE 0x112
 #define BTN_RIGHT 0x111
 
+/* ------------------------------------------------------------ menu */
+
+/* The Start/Applications menu: an xdg_popup parented to the bar layer
+ * (xfce4-panel's applications-menu parity). Items come from XDG
+ * .desktop entries; selecting one launches it through the session
+ * manager's ctl "run" (same wire the old terminal-launcher used).
+ * Open/close is idempotent; Escape and any outside press dismiss it
+ * (outside-press dismissal is compositor-side: it sends popup_done,
+ * the close callback runs). */
+
+#define MENU_MAX_ITEMS 24 /* v0 cap: no scrolling yet (ROADMAP) */
+#define MENU_W 230
+#define MENU_ITEM_H 26
+#define MENU_PAD 4
+
+struct menu_item {
+    char name[72];
+    char exec[192];
+};
+
+static struct menu_item g_menu_items[MENU_MAX_ITEMS];
+static int g_menu_n_items;
+
+#define COL_MENU_BG 0xff262b33
+#define COL_MENU_BORDER 0xff3c4454
+#define COL_MENU_HOVER 0xff3584e4
+#define COL_MENU_SEP 0xff384050
+
+/* one .desktop field (first match in [Desktop Entry]); a local copy
+ * of the session manager's reader — the panel links no session code */
+static char *menu_desktop_field(const char *path, const char *key) {
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return NULL;
+    char line[1024];
+    bool in_entry = false;
+    size_t klen = strlen(key);
+    char *result = NULL;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '[') {
+            in_entry = strncmp(line, "[Desktop Entry]", 15) == 0;
+            continue;
+        }
+        if (!in_entry)
+            continue;
+        if (strncmp(line, key, klen) == 0 && line[klen] == '=') {
+            char *val = line + klen + 1;
+            char *nl = strchr(val, '\n');
+            if (nl)
+                *nl = 0;
+            result = strdup(val);
+            break;
+        }
+    }
+    fclose(f);
+    return result;
+}
+
+/* strip XDG field codes (%f %F %u %U %i %c %k ...) from an Exec line */
+static void menu_clean_exec(char *exec) {
+    char *r = exec, *w = exec;
+    bool spaced = false;
+    while (*r) {
+        if (*r == '%') {
+            r++; /* the code character */
+            if (*r)
+                r++; /* %f, %%%, ...: skip both */
+            spaced = true; /* the removed placeholder was an argument */
+            continue;
+        }
+        if (*r == ' ') {
+            if (spaced) { /* collapse runs left by removed codes */
+                r++;
+                continue;
+            }
+            spaced = true;
+        } else {
+            spaced = false;
+        }
+        *w++ = *r++;
+    }
+    *w = 0;
+    /* trim a trailing separator left by trailing field codes */
+    while (w > exec && (w[-1] == ' '))
+        *--w = 0;
+}
+
+/* scan one applications dir; dedup by desktop-file basename (the
+ * user dir overrides the system one, same rule as XDG autostart) */
+static void menu_scan_dir(const char *dir, char seen[][72], int *n_seen,
+                          int seen_cap) {
+    DIR *d = opendir(dir);
+    if (!d)
+        return;
+    struct dirent *de;
+    while ((de = readdir(d)) && g_menu_n_items < MENU_MAX_ITEMS) {
+        if (de->d_name[0] == '.' || !strstr(de->d_name, ".desktop"))
+            continue;
+        /* user entry wins: a same-named system entry is skipped */
+        bool dup = false;
+        for (int i = 0; i < *n_seen; i++) {
+            if (strcmp(seen[i], de->d_name) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+        char *type = menu_desktop_field(path, "Type");
+        char *name = menu_desktop_field(path, "Name");
+        char *exec = menu_desktop_field(path, "Exec");
+            char *nodisp = menu_desktop_field(path, "NoDisplay");
+        char *hidden = menu_desktop_field(path, "Hidden");
+        char *only = menu_desktop_field(path, "OnlyShowIn");
+        char *notshow = menu_desktop_field(path, "NotShowIn");
+        char *term = menu_desktop_field(path, "Terminal");
+
+        bool ok = type && strcmp(type, "Application") == 0 && name && name[0] &&
+                  exec && exec[0] &&
+                  !(nodisp && strcmp(nodisp, "true") == 0) &&
+                  !(hidden && strcmp(hidden, "true") == 0);
+        /* xfce4-panel shows OnlyShowIn entries only when they name
+         * XFCE; NotShowIn containing XFCE hides the entry */
+        if (ok && only && *only && !strstr(only, "XFCE"))
+            ok = false;
+        if (ok && notshow && strstr(notshow, "XFCE"))
+            ok = false;
+        /* Terminal=true needs a terminal wrapper to host the command;
+         * v0 has none (documented deviation, ROADMAP.md) — hide
+         * instead of failing at launch time */
+        if (ok && term && strcmp(term, "true") == 0)
+            ok = false;
+
+        if (ok) {
+            struct menu_item *it = &g_menu_items[g_menu_n_items++];
+            snprintf(it->name, sizeof(it->name), "%.68s", name);
+            snprintf(it->exec, sizeof(it->exec), "%.188s", exec);
+            menu_clean_exec(it->exec);
+            if (*n_seen < seen_cap)
+                snprintf(seen[(*n_seen)++], 72, "%.68s", de->d_name);
+        }
+        free(type);
+        free(name);
+        free(exec);
+        free(nodisp);
+        free(hidden);
+        free(only);
+        free(notshow);
+        free(term);
+    }
+    closedir(d);
+}
+
+static int menu_item_cmp(const void *a, const void *b) {
+    return strcasecmp(((const struct menu_item *)a)->name,
+                      ((const struct menu_item *)b)->name);
+}
+
+static void menu_scan_apps(void) {
+    g_menu_n_items = 0;
+    static char seen[256][72];
+    int n_seen = 0;
+
+    /* XDG data dirs, user first (overrides same-named system entries) */
+    char user_dir[512];
+    const char *home = getenv("HOME");
+    const char *xdg_data = getenv("XDG_DATA_HOME");
+    if (xdg_data && *xdg_data)
+        snprintf(user_dir, sizeof(user_dir), "%.480s/applications", xdg_data);
+    else if (home)
+        snprintf(user_dir, sizeof(user_dir),
+                 "%.240s/.local/share/applications", home);
+    if (user_dir[0])
+        menu_scan_dir(user_dir, seen, &n_seen, 256);
+
+    const char *dirs = getenv("XDG_DATA_DIRS");
+    if (!dirs || !*dirs)
+        dirs = "/usr/local/share:/usr/share";
+    char dcopy[512];
+    snprintf(dcopy, sizeof(dcopy), "%.500s", dirs);
+    char *save = NULL;
+    for (char *tok = strtok_r(dcopy, ":", &save); tok;
+         tok = strtok_r(NULL, ":", &save)) {
+        char sys_dir[560];
+        snprintf(sys_dir, sizeof(sys_dir), "%.520s/applications", tok);
+        menu_scan_dir(sys_dir, seen, &n_seen, 256);
+    }
+
+    qsort(g_menu_items, (size_t)g_menu_n_items, sizeof(g_menu_items[0]),
+          menu_item_cmp);
+}
+
+static int64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void menu_close(struct panel *p, const char *why) {
+    if (!p->menu)
+        return;
+    fprintf(stderr,
+            "xw-panel: menu closing (%s) — menu surface destroyed\n", why);
+    xwc_popup_destroy(p->menu);
+    p->menu = NULL;
+    p->menu_hover = -1;
+    p->menu_closed_ms = mono_ms();
+}
+
+static void menu_draw(struct panel *p) {
+    int stride = 0;
+    uint32_t *pix = xwc_popup_pixels(p->menu, &stride);
+    if (!pix || stride < 1)
+        return;
+    int w = stride, h = p->menu_h;
+    /* bordered panel-style box: the interior stays the menu background
+     * (fill=0 would paint it black — draw_box always fills) */
+    xwc_draw_box(pix, stride, w, h, 0, 0, w, h, COL_MENU_BG, COL_MENU_BORDER);
+
+    int ty_off = (MENU_ITEM_H - XWC_LINE_H) / 2;
+    for (int i = 0; i < g_menu_n_items; i++) {
+        int iy = MENU_PAD + i * MENU_ITEM_H;
+        if (i == p->menu_hover)
+            xwc_fill_rect(pix, stride, w, h, 1, iy, w - 2, MENU_ITEM_H,
+                          COL_MENU_HOVER);
+        else if (i > 0)
+            xwc_draw_hline(pix, stride, w, h, 8, iy, w - 16, COL_MENU_SEP);
+        /* item label, truncated to the menu width */
+        char label[sizeof(g_menu_items[0].name)];
+        snprintf(label, sizeof(label), "%.68s", g_menu_items[i].name);
+        for (int used = xwc_text_width(label);
+             used > MENU_W - 20 && strlen(label) > 1;
+             used = xwc_text_width(label))
+            label[strlen(label) - 1] = 0;
+        xwc_draw_text(pix, stride, w, h, 10, iy + ty_off, label,
+                      i == p->menu_hover ? 0xffffffff : COL_TEXT);
+    }
+    xwc_popup_commit(p->menu);
+}
+
+static void menu_launch(struct panel *p, int idx) {
+    if (idx < 0 || idx >= g_menu_n_items)
+        return;
+    struct menu_item *it = &g_menu_items[idx];
+    fprintf(stderr, "xw-panel: menu item selected: '%s' -> ctl \"run %s\"\n",
+            it->name, it->exec);
+    char cmd[320];
+    snprintf(cmd, sizeof(cmd), "run %s", it->exec);
+    if (!xw_ctl_send_async(cmd))
+        fprintf(stderr, "xw-panel: cannot launch '%s' (fork failed)\n",
+                it->name);
+    menu_close(p, "item selected");
+}
+
+static void menu_on_configure(struct xwc_win *win, int w, int h, void *ud) {
+    struct panel *p = ud;
+    /* the configure fires DURING xwc_popup_create (before menu_open
+     * could store the pointer): the popup arrives as the callback's
+     * own first argument — store it now, or the draw below would see
+     * a NULL menu and silently never commit (the exact bug that kept
+     * the first menu invisible) */
+    struct xwc_popup *menu = (struct xwc_popup *)win;
+    if (menu)
+        p->menu = menu;
+    p->menu_w = w > 0 ? w : MENU_W;
+    p->menu_h = h > 0 ? h : MENU_PAD * 2 + g_menu_n_items * MENU_ITEM_H;
+    fprintf(stderr,
+            "xw-panel: menu surface created: %dx%d, item count=%d%s\n",
+            p->menu_w, p->menu_h, g_menu_n_items,
+            g_menu_n_items == MENU_MAX_ITEMS ? " (v0 cap reached — more "
+                                               "applications exist, see "
+                                               "ROADMAP)"
+                                             : "");
+    menu_draw(p);
+    /* the grab (keyboard + outside-press dismissal) must follow the
+     * mapping commit — request ordering carries it after the commit,
+     * which is exactly the ordering the server requires */
+    xwc_popup_grab(p->menu);
+}
+
+static void menu_on_done(struct xwc_win *win, void *ud) {
+    struct panel *p = ud;
+    (void)win;
+    /* popup_done: the compositor dismissed us (press outside). This
+     * runs from inside the popup's own event handler; destroying the
+     * proxy there is the safe established pattern (the tasklist does
+     * the same) — and the panel's own button handler for the SAME
+     * click follows right behind it (event order: popup_done, then
+     * the button). The close timestamp suppresses an instant reopen. */
+    menu_close(p, "dismissed (outside press or compositor)");
+}
+
+static int menu_item_at(struct panel *p, int x, int y) {
+    if (x < 0 || x > p->menu_w || y < MENU_PAD)
+        return -1;
+    int idx = (y - MENU_PAD) / MENU_ITEM_H;
+    int iy = MENU_PAD + idx * MENU_ITEM_H;
+    if (idx >= g_menu_n_items || y >= iy + MENU_ITEM_H)
+        return -1;
+    return idx;
+}
+
+static void menu_on_button(struct xwc_win *win, uint32_t button, bool down,
+                           int x, int y, void *ud) {
+    struct panel *p = ud;
+    (void)win;
+    int idx = menu_item_at(p, x, y);
+    trace("menu button %u %s at %d,%d -> item=%d", button,
+          down ? "press" : "release", x, y, idx);
+    if (down && button == BTN_LEFT && idx >= 0)
+        menu_launch(p, idx);
+}
+
+static void menu_on_motion(struct xwc_win *win, int x, int y, void *ud) {
+    struct panel *p = ud;
+    (void)win;
+    int idx = menu_item_at(p, x, y);
+    if (idx != p->menu_hover) {
+        p->menu_hover = idx;
+        if (p->menu)
+            menu_draw(p);
+    }
+}
+
+static void menu_on_key(struct xwc_win *win, uint32_t keycode, bool down,
+                        xkb_keysym_t sym, uint32_t mods, void *ud) {
+    struct panel *p = ud;
+    (void)win;
+    (void)keycode;
+    (void)mods;
+    if (!down)
+        return;
+    if (sym == XKB_KEY_Escape) {
+        trace("menu key Escape -> close");
+        menu_close(p, "escape key");
+    } else if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
+        trace("menu key Enter -> launch hovered item");
+        menu_launch(p, p->menu_hover);
+    }
+}
+
+static void menu_open(struct panel *p) {
+    if (p->menu) {
+        fprintf(stderr, "xw-panel: start clicked — menu already open; "
+                        "toggling closed\n");
+        menu_close(p, "start toggle");
+        return;
+    }
+    menu_scan_apps();
+    if (g_menu_n_items == 0) {
+        fprintf(stderr,
+                "xw-panel: start clicked — menu opening aborted: no "
+                "applications found ($XDG_DATA_DIRS/applications, "
+                "~/.local/share/applications)\n");
+        return;
+    }
+    int h = MENU_PAD * 2 + g_menu_n_items * MENU_ITEM_H;
+    fprintf(stderr, "xw-panel: start clicked — menu opening "
+                    "(item count=%d, %dx%d popup under the button)\n",
+            g_menu_n_items, MENU_W, h);
+
+    struct xwc_callbacks cb = {
+        .button = menu_on_button,
+        .motion = menu_on_motion,
+        .configure = menu_on_configure,
+        .close = menu_on_done,
+        .key = menu_on_key,
+        .ud = p,
+    };
+    /* anchor rect = the Start button, in bar-surface coordinates */
+    p->menu = xwc_popup_create(&p->c, p->layer, EDGE_PAD, 0, LAUNCHER_W,
+                               p->bar_h, MENU_W, h, &cb);
+    p->menu_hover = -1;
+    if (!p->menu)
+        fprintf(stderr, "xw-panel: menu popup creation failed\n");
+}
+
 static const char *btn_kind_name(int kind) {
     switch (kind) {
     case BTN_LAUNCHER: return "menu/launcher";
@@ -380,23 +772,26 @@ static const char *btn_kind_name(int kind) {
 
 static void do_exit_button(struct panel *p) {
     (void)p;
-    trace("activate action=exit (ctl exit-dialog)");
-    char reply[256];
-    if (!xw_ctl_send("exit-dialog", reply, sizeof(reply)))
-        fprintf(stderr, "xw-panel: exit dialog: %s\n", reply);
+    fprintf(stderr, "xw-panel: exit clicked (ctl exit-dialog, async)\n");
+    /* async (forked) round trip: never block the Wayland dispatch on
+     * the session manager's poll cycle — the click must keep the bar
+     * responsive */
+    if (!xw_ctl_send_async("exit-dialog"))
+        fprintf(stderr, "xw-panel: exit dialog: cannot spawn the ctl "
+                        "round trip\n");
 }
 
 static void do_launcher(struct panel *p) {
-    char cmd[320], reply[256];
-    /* p->terminal_cmd was resolved at startup from the fallback list;
-     * still, a stale cache or a removed binary must not silently kill
-     * the action — re-resolve so a terminal installed after the panel
-     * started works too */
+    /* fallback when no .desktop applications exist at all (a minimal
+     * box without an applications dir): the resolved terminal is the
+     * one thing the old Start behavior could still do */
+    char cmd[320];
     resolve_terminal(p->terminal_cmd, sizeof(p->terminal_cmd));
     snprintf(cmd, sizeof(cmd), "run %s", p->terminal_cmd);
-    trace("activate action=menu (ctl '%s')", cmd);
-    if (!xw_ctl_send(cmd, reply, sizeof(reply)))
-        fprintf(stderr, "xw-panel: launcher: %s\n", reply);
+    fprintf(stderr, "xw-panel: start clicked — no applications found, "
+                    "launching the fallback terminal (ctl '%s')\n", cmd);
+    if (!xw_ctl_send_async(cmd))
+        fprintf(stderr, "xw-panel: terminal launch failed (fork)\n");
 }
 
 static void on_button(struct xwc_win *win, uint32_t button, bool down, int x,
@@ -416,8 +811,24 @@ static void on_button(struct xwc_win *win, uint32_t button, bool down, int x,
     }
     switch (b->kind) {
     case BTN_LAUNCHER:
-        if (button == BTN_LEFT)
-            do_launcher(p);
+        if (button == BTN_LEFT) {
+            fprintf(stderr, "xw-panel: start clicked\n");
+            if (p->menu) {
+                menu_close(p, "start toggle");
+            } else if (mono_ms() - p->menu_closed_ms < 250) {
+                /* the compositor dismissed the menu with the SAME
+                 * press that reached this handler (outside-press
+                 * dismissal runs server-side, popup_done lands just
+                 * before the button event): this click CLOSES, it
+                 * must not immediately reopen the menu */
+                trace("start press follows the menu dismissal of the "
+                      "same click — reopen suppressed");
+            } else {
+                menu_open(p);
+                if (!p->menu)
+                    do_launcher(p); /* fallback: no apps, try terminal */
+            }
+        }
         break;
     case BTN_WS:
         if (button == BTN_LEFT) {
@@ -484,9 +895,22 @@ static void on_close(struct xwc_win *win, void *ud) {
 /* --------------------------------------------------------------- main */
 
 static void on_sigterm(int sig) {
+    /* SIGTERM (session shutdown), SIGINT (Ctrl+C on the session's
+     * terminal), SIGHUP (terminal gone): all mean "exit cleanly" —
+     * the compositor notices the closed connection and reaps the
+     * surfaces */
     (void)sig;
     if (g_panel)
         g_panel->quit = true;
+}
+
+/* reap the forked ctl round-trip helpers (xw_ctl_send_async). The
+ * panel spawns no other children, so a blanket non-blocking reap is
+ * exact; without it every launch would leave a zombie until exit. */
+static void on_sigchld(int sig) {
+    (void)sig;
+    while (waitpid(-1, NULL, WNOHANG) > 0)
+        ;
 }
 
 int main(int argc, char **argv) {
@@ -513,8 +937,23 @@ int main(int argc, char **argv) {
     trace("launcher terminal resolved: '%s'", p.terminal_cmd);
     p.bar_h = BAR_H;
 
+    struct sigaction sa = {0};
+    sa.sa_handler = on_sigchld;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_NOCLDSTOP | SA_RESTART;
+    sigaction(SIGCHLD, &sa, NULL);
     signal(SIGTERM, on_sigterm);
     signal(SIGINT, on_sigterm);
+    signal(SIGHUP, on_sigterm);
+    /* clear any signal mask inherited across fork+exec: when the panel
+     * is launched by a signalfd-using parent (the compositor's own
+     * spawner, an in-process test embedding a compositor), the blocked
+     * mask survives exec and these handlers would never run */
+    {
+        sigset_t empty;
+        sigemptyset(&empty);
+        sigprocmask(SIG_SETMASK, &empty, NULL);
+    }
 
     if (xwc_connect(&p.c, socket_name) < 0)
         return 1;
@@ -553,8 +992,8 @@ int main(int argc, char **argv) {
     xwc_layer_set_keyboard(p.layer, 0); /* keyboard stays with windows */
 
     /* main loop: dispatch with a 1s ceiling so the clock ticks; the
-     * compositor driving events (title changes, workspace switches)
-     * wakes us immediately */
+     * compositor driving events (title changes, workspace switches,
+     * menu interaction) wakes us immediately */
     while (!p.quit && p.c.running) {
         if (xwc_dispatch(&p.c, 1000) < 0)
             break; /* compositor went away */
@@ -568,6 +1007,10 @@ int main(int argc, char **argv) {
             draw(&p);
     }
 
+    /* compositor shutdown with the menu open: destroy it before the
+     * connection teardown (the popup teardown needs a live display) */
+    if (p.menu)
+        menu_close(&p, "compositor gone");
     xwc_layer_destroy(p.layer);
     xwc_tasklist_destroy(p.tl);
     xwc_wspaces_destroy(p.wsp);

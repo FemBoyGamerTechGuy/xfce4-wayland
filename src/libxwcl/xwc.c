@@ -805,6 +805,195 @@ void xwc_layer_set_layer(struct xwc_layer *l, uint32_t layer) {
         zwlr_layer_surface_v1_set_layer(l->ls, layer);
 }
 
+/* ------------------------------------------------------------ popup */
+
+struct xwc_popup {
+    struct xwc *c;
+    struct xwc_callbacks cb;
+    struct wl_surface *surface;
+    struct xdg_surface *xdg_surface;
+    struct xdg_popup *popup;
+    struct wl_shm_pool *pool;
+    struct wl_buffer *bufs[2];
+    int cur;
+    uint32_t *data;
+    size_t pool_size;
+    int w, h;
+    bool mapped;
+    bool done; /* popup_done received (compositor dismissed us) */
+};
+
+static void popup_xdg_configure(void *data, struct xdg_surface *xs,
+                                uint32_t serial) {
+    struct xwc_popup *p = data;
+    xdg_surface_ack_configure(xs, serial);
+    /* the popup.configure event (same batch) already recorded the size;
+     * hand the buffer to the owner, which draws + commits (mapping) */
+    if (p->cb.configure)
+        p->cb.configure((struct xwc_win *)p, p->w, p->h, p->cb.ud);
+}
+
+static const struct xdg_surface_listener popup_xdg_surface_listener = {
+    .configure = popup_xdg_configure,
+};
+
+static void popup_cfg(void *data, struct xdg_popup *pp, int32_t x, int32_t y,
+                      int32_t w, int32_t h) {
+    (void)pp;
+    (void)x;
+    (void)y;
+    struct xwc_popup *p = data;
+    if (w > 0)
+        p->w = w;
+    if (h > 0)
+        p->h = h;
+}
+
+static void popup_done_ev(void *data, struct xdg_popup *pp) {
+    (void)pp;
+    struct xwc_popup *p = data;
+    p->done = true;
+    /* the compositor dismissed the popup (press outside / explicit):
+     * destroying the proxy inside its own event handler is the
+     * documented-safe pattern (see the tasklist's handle_closed) */
+    if (p->cb.close)
+        p->cb.close((struct xwc_win *)p, p->cb.ud);
+}
+
+static void popup_repositioned(void *data, struct xdg_popup *pp,
+                               uint32_t token) {
+    (void)data;
+    (void)pp;
+    (void)token;
+}
+
+static const struct xdg_popup_listener popup_listener = {
+    .configure = popup_cfg,
+    .popup_done = popup_done_ev,
+    .repositioned = popup_repositioned,
+};
+
+struct xwc_popup *xwc_popup_create(struct xwc *c, struct xwc_layer *parent,
+                                   int anchor_x, int anchor_y,
+                                   int anchor_w, int anchor_h, int w, int h,
+                                   const struct xwc_callbacks *cb) {
+    if (!c || !c->wm_base || !parent || w < 1 || h < 1)
+        return NULL;
+
+    /* positioner: the popup's top-left lands on the anchor rect's
+     * bottom-left corner (menu under a panel button); flip up and/or
+     * slide if the screen edge is in the way. Created LAST, right
+     * before the request that consumes it, so no failure path in
+     * between can leak it. */
+    struct xwc_popup *p = calloc(1, sizeof(*p));
+    if (!p)
+        return NULL;
+    p->c = c;
+    if (cb)
+        p->cb = *cb;
+    p->w = w;
+    p->h = h;
+
+    p->surface = wl_compositor_create_surface(c->compositor);
+    if (!p->surface)
+        goto fail;
+    xwc_register_surface(c, p, &p->cb, p->surface);
+
+    p->xdg_surface = xdg_wm_base_get_xdg_surface(c->wm_base, p->surface);
+    if (!p->xdg_surface)
+        goto fail;
+    xdg_surface_add_listener(p->xdg_surface, &popup_xdg_surface_listener, p);
+
+    struct xdg_positioner *pos = xdg_wm_base_create_positioner(c->wm_base);
+    if (!pos)
+        goto fail;
+    xdg_positioner_set_size(pos, w, h);
+    xdg_positioner_set_anchor_rect(pos, anchor_x, anchor_y, anchor_w,
+                                   anchor_h);
+    xdg_positioner_set_anchor(pos, XDG_POSITIONER_ANCHOR_BOTTOM_LEFT);
+    xdg_positioner_set_gravity(pos, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+    xdg_positioner_set_constraint_adjustment(
+        pos, XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y |
+                 XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
+                 XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y);
+
+    /* parent = the layer surface (NULL here): the linkage goes through
+     * zwlr_layer_surface.get_popup, the layer-shell way to parent a
+     * menu to a panel. The positioner is consumed by this request
+     * (the server copies it) and destroyed right after. */
+    p->popup = xdg_surface_get_popup(p->xdg_surface, NULL, pos);
+    xdg_positioner_destroy(pos);
+    if (!p->popup)
+        goto fail;
+    zwlr_layer_surface_v1_get_popup(parent->ls, p->popup);
+    xdg_popup_add_listener(p->popup, &popup_listener, p);
+
+    /* deliberately NO round trip here: the configure (and the draw +
+     * commit + grab the configure callback performs) arrives through
+     * the caller's normal dispatch. Blocking in a sync from inside an
+     * event handler (the panel opens the menu from its button
+     * handler) wedges the client on signals: libwayland's dispatch
+     * loop retries EINTR internally, so a SIGTERM arriving mid-sync
+     * is only noticed after the next server event. Fire-and-forget
+     * keeps every client callback non-blocking. */
+    return p;
+
+fail:
+    xwc_popup_destroy(p);
+    return NULL;
+}
+
+void xwc_popup_destroy(struct xwc_popup *p) {
+    if (!p)
+        return;
+    if (p->popup)
+        xdg_popup_destroy(p->popup);
+    if (p->xdg_surface)
+        xdg_surface_destroy(p->xdg_surface);
+    xwc_unregister_surface(p->c, p->surface);
+    if (p->surface)
+        wl_surface_destroy(p->surface);
+    pool_destroy(p->pool, p->bufs, p->data, p->pool_size);
+    free(p);
+}
+
+uint32_t *xwc_popup_pixels(struct xwc_popup *p, int *stride) {
+    if (!p)
+        return NULL;
+    /* allocate the pool on first use (the configure callback's first
+     * draw); menus do not resize while open, so one pool serves the
+     * popup's lifetime */
+    if (!p->bufs[0]) {
+        if (!pool_create(p->c, p, p->w, p->h, &p->pool, p->bufs, &p->data,
+                         &p->pool_size))
+            return NULL;
+        wl_buffer_add_listener(p->bufs[0], &buf_listener, p);
+        wl_buffer_add_listener(p->bufs[1], &buf_listener, p);
+    }
+    if (stride)
+        *stride = p->w;
+    return p->data + (size_t)p->cur * p->w * p->h;
+}
+
+void xwc_popup_commit(struct xwc_popup *p) {
+    if (!p || !p->bufs[0])
+        return;
+    wl_surface_attach(p->surface, p->bufs[p->cur], 0, 0);
+    wl_surface_damage(p->surface, 0, 0, p->w, p->h);
+    wl_surface_commit(p->surface);
+    p->cur ^= 1;
+    p->mapped = true;
+}
+
+void xwc_popup_grab(struct xwc_popup *p) {
+    if (!p || !p->popup || !p->c->seat)
+        return;
+    xdg_popup_grab(p->popup, p->c->seat, p->c->last_serial);
+}
+
+bool xwc_popup_done(struct xwc_popup *p) { return p && p->done; }
+
+
 /* ------------------------------------------------------ input routing */
 
 void xwc_input_key(struct xwc *c, uint32_t keycode, bool down,

@@ -78,6 +78,10 @@ struct xwc {
     int ptr_x, ptr_y;     /* last pointer position (surface-local) */
     bool running;
 
+    /* serial of the last input event (enter/button/key) — popup grabs
+     * should carry the serial of the click that opened them */
+    uint32_t last_serial;
+
     /* wl_keyboard.repeat_info as advertised by the server (client-side
      * repeat parameters; 0/0 = not received yet) */
     int repeat_rate_hz, repeat_delay_ms;
@@ -143,6 +147,30 @@ void xwc_layer_destroy(struct xwc_layer *l);
 uint32_t *xwc_layer_pixels(struct xwc_layer *l, int *stride);
 void xwc_layer_commit(struct xwc_layer *l);
 void xwc_layer_resize(struct xwc_layer *l, int w, int h);
+
+/* ------------------------------------------------------------- popup */
+/* xdg_popup anchored to a layer surface (panel menus, the
+ * applications-menu case). Anchor rect is in PARENT-SURFACE
+ * coordinates; the popup is placed below-left of the rect with
+ * slide/flip constraint adjustment. Lifecycle: create (returns after
+ * the first configure) -> configure callback draws + commits ->
+ * xwc_popup_grab() (keyboard + dismiss-on-outside-press) -> user
+ * interaction -> close callback (popup_done: dismissed by an outside
+ * click) or explicit xwc_popup_destroy(). One double-buffered shm
+ * pool; menus do not resize while open. */
+struct xwc_popup *xwc_popup_create(struct xwc *c, struct xwc_layer *parent,
+                                   int anchor_x, int anchor_y,
+                                   int anchor_w, int anchor_h, int w, int h,
+                                   const struct xwc_callbacks *cb);
+void xwc_popup_destroy(struct xwc_popup *p);
+uint32_t *xwc_popup_pixels(struct xwc_popup *p, int *stride);
+void xwc_popup_commit(struct xwc_popup *p);
+/* request the seat grab after the first commit (keyboard focus +
+ * outside-press dismissal server-side); uses the last input serial */
+void xwc_popup_grab(struct xwc_popup *p);
+/* popup_done was received (the compositor dismissed the menu) */
+bool xwc_popup_done(struct xwc_popup *p);
+
 
 /* -------------------------------------- tasklist (foreign-toplevel) */
 /* Tracks every toplevel window via wlr-foreign-toplevel-management:

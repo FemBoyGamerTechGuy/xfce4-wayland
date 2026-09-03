@@ -383,6 +383,8 @@ void xw_seat_pointer_axis(struct xw_seat *s, uint32_t axis, double value);
 
 /* focus management (called by wm) */
 void xw_seat_set_kb_focus(struct xw_seat *s, struct xw_surface *surface);
+/* pointer focus follows a popup grab (see xw-seat.c) */
+void xw_seat_popup_ptr_focus(struct xw_seat *s, struct xw_surface *popup);
 
 /* re-run the pointer hit-test at the current cursor position for every
  * seat (surface stack changed without motion: map/unmap/destroy) */

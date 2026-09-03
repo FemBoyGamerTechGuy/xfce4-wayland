@@ -67,6 +67,7 @@ static void pointer_release(struct wl_client *client, struct wl_resource *res) {
 /* ------------------------------------------------------------ wl_seat */
 
 static void send_modifiers(struct xw_seat *s);
+static void set_ptr_focus(struct xw_seat *s, struct xw_surface *surface);
 static void disarm_interactive_repeat(struct xw_seat *s);
 static const char *surface_desc(struct xw_surface *s, char *buf, size_t n);
 
@@ -296,6 +297,15 @@ static void send_modifiers(struct xw_seat *s) {
     }
 }
 
+/* pointer focus follows a popup grab: per xdg-shell, while a popup
+ * holds the seat grab ALL pointer events go to it (the panel menu must
+ * receive its item clicks; the pre-grab focus — the bar the user
+ * clicked to open the menu — must not keep them). Called by the
+ * xdg-shell popup grab handler after the grab fields are set. */
+void xw_seat_popup_ptr_focus(struct xw_seat *s, struct xw_surface *popup) {
+    set_ptr_focus(s, popup);
+}
+
 void xw_seat_set_kb_focus(struct xw_seat *s, struct xw_surface *surface) {
     disarm_interactive_repeat(s);
     /* session lock: lock surfaces own the keyboard absolutely while
@@ -354,7 +364,13 @@ static void set_ptr_focus(struct xw_seat *s, struct xw_surface *surface) {
     struct wl_client *newc =
         surface ? wl_resource_get_client(surface->res) : NULL;
 
-    if (old && old != newc && !s->ptr_grab) {
+    /* leave the old surface on ANY focus change (same or different
+     * client): a wl_pointer tracks exactly one surface, and skipping
+     * the leave on a same-client change (the panel bar -> its menu
+     * popup, both owned by the panel process) would deliver a second
+     * enter without a leave. Suppressed only while a DnD drag grab
+     * owns the focus (its own protocol carries the transitions). */
+    if (old && !(s->ptr_grab && s->ptr_grab_is_drag)) {
         struct wl_resource *p;
         wl_list_for_each(p, &s->pointers, link) {
             if (wl_resource_get_client(p) == old) {
@@ -364,8 +380,6 @@ static void set_ptr_focus(struct xw_seat *s, struct xw_surface *surface) {
                        desc_old, s->serial);
             }
         }
-    } else if (old && old != newc && s->ptr_focus && s->ptr_grab) {
-        /* leave suppressed under grab; the grab owner already has focus */
     }
     s->ptr_focus = surface;
     if (newc) {
@@ -734,16 +748,40 @@ void xw_seat_pointer_button(struct xw_seat *s, uint32_t linux_button,
     }
 
     /* a press outside the topmost popup dismisses the popup chain
-     * (menu/tooltip behavior: xfwm4 closes menus on outside clicks) */
-    if (down && !s->ptr_grab) {
+     * (menu/tooltip behavior: xfwm4 closes menus on outside clicks).
+     * The geometry check is a RAW input-region test, NOT surface_at():
+     * surface_at short-circuits to the grab surface while a grab is
+     * active, which would classify every outside press as "on the
+     * popup" and the menu could never be closed by clicking away.
+     * Popup grabs run this path too; window grabs (move/resize) and
+     * DnD do not. */
+    if (down && (!s->ptr_grab ||
+                 (s->grab_surface &&
+                  s->grab_surface->role == XW_SURFACE_ROLE_XDG_POPUP))) {
+        bool dismissed = false;
         struct xw_popup *p;
         wl_list_for_each_reverse(p, &c->popups, link) {
             if (!p->mapped)
                 continue;
-            if (s->ptr_focus && p->surface == s->ptr_focus)
+            if (p->surface && xw_surface_has_input_at(p->surface,
+                                                      s->cursor_x,
+                                                      s->cursor_y))
                 break; /* the press is on this popup: keep it (and its
                           * parents, below us in the list) open */
             xw_popup_dismiss(p);
+            dismissed = true;
+        }
+        /* the dismissed popup may still hold ptr_focus (the client has
+         * not processed popup_done yet): re-hit-test so the press is
+         * delivered to the surface actually under the cursor */
+        if (dismissed && s->ptr_focus &&
+            s->ptr_focus->role == XW_SURFACE_ROLE_XDG_POPUP) {
+            struct xw_popup *fp = s->ptr_focus->role_data;
+            if (!fp || !fp->mapped) {
+                struct xw_surface *target =
+                    surface_at(s, s->cursor_x, s->cursor_y);
+                set_ptr_focus(s, target);
+            }
         }
     }
 

@@ -57,9 +57,9 @@ static void kb_keymap(void *data, struct wl_keyboard *kb, uint32_t format,
 static void kb_enter(void *data, struct wl_keyboard *kb, uint32_t serial,
                      struct wl_surface *surface, struct wl_array *keys) {
     (void)kb;
-    (void)serial;
     (void)keys;
     struct xwc *c = data;
+    c->last_serial = serial;
     xwc_surface_focus(c, surface);
 }
 
@@ -79,6 +79,7 @@ static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
     (void)serial;
     (void)time;
     struct xwc *c = data;
+    c->last_serial = serial;
     bool down = state == WL_KEYBOARD_KEY_STATE_PRESSED;
     if (c->xkb_state) {
         xkb_state_update_key(c->xkb_state, key,
@@ -126,8 +127,8 @@ static void ptr_enter(void *data, struct wl_pointer *p, uint32_t serial,
                       struct wl_surface *surface, wl_fixed_t sx,
                       wl_fixed_t sy) {
     (void)p;
-    (void)serial;
     struct xwc *c = data;
+    c->last_serial = serial;
     xwc_surface_focus(c, surface);
     xwc_input_motion(c, wl_fixed_to_int(sx), wl_fixed_to_int(sy));
 }
@@ -151,9 +152,9 @@ static void ptr_motion(void *data, struct wl_pointer *p, uint32_t time,
 static void ptr_button(void *data, struct wl_pointer *p, uint32_t serial,
                        uint32_t time, uint32_t button, uint32_t state) {
     (void)p;
-    (void)serial;
     (void)time;
     struct xwc *c = data;
+    c->last_serial = serial;
     xwc_input_button(c, button,
                      state == WL_POINTER_BUTTON_STATE_PRESSED, c->ptr_x,
                      c->ptr_y);

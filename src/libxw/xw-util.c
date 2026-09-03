@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -145,7 +146,21 @@ pid_t xw_spawn_command(struct xw_compositor *c, const char *cmdline) {
         return -1;
     }
     if (pid == 0) {
-        /* child: detach from the wayland socket fd trio; keep environment
+        /* child: restore the DEFAULT signal state before exec. The
+         * compositor blocks SIGINT/SIGTERM/SIGHUP/SIGCHLD for its
+         * signalfd event sources — and a blocked signal mask survives
+         * both fork() and exec(). Without this, every process launched
+         * here (terminals from the shortcuts, the exit-dialog helper,
+         * ctl-launched apps) inherits the mask and Ctrl+C inside those
+         * apps silently does nothing. Standard spawner practice. */
+        sigset_t empty;
+        sigemptyset(&empty);
+        sigprocmask(SIG_SETMASK, &empty, NULL);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        signal(SIGCHLD, SIG_DFL);
+        /* detach from the wayland socket fd trio; keep environment
          * (WAYLAND_DISPLAY etc.) so the launched app can connect back. */
         int nfd = open("/dev/null", O_RDWR);
         if (nfd >= 0) {

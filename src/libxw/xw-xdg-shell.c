@@ -656,6 +656,11 @@ static void popup_grab(struct wl_client *client, struct wl_resource *res,
     s->ptr_grab_is_drag = false;
     s->grab_surface = p->surface;
     xw_seat_set_kb_focus(s, p->surface);
+    /* per xdg-shell grab semantics all pointer events go to the popup
+     * while it holds the grab — the panel menu receives its item
+     * clicks, hover motion and (via the hit-test-based dismissal in
+     * xw_seat_pointer_button) outside-press dismissal */
+    xw_seat_popup_ptr_focus(s, p->surface);
 }
 
 static void popup_reposition(struct wl_client *client, struct wl_resource *res,

@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -543,9 +544,19 @@ static void test_panel_launcher(struct xwt_ctx *t) {
     XWT_ASSERT(bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
     XWT_ASSERT(listen(lfd, 4) == 0);
 
+    /* no applications anywhere: the Start button's fallback is the
+     * resolved terminal (the pre-menu launcher behavior) */
+    char empty[300];
+    snprintf(empty, sizeof(empty), "%s/noapps-%d", g_runtimedir(),
+             (int)getpid());
+    mkdir(empty, 0755);
+    setenv("XDG_DATA_HOME", empty, 1);
+    setenv("XDG_DATA_DIRS", empty, 1);
     setenv("XW_TERMINAL", "/bin/true", 1); /* inherited by the panel */
     pid_t pid = spawn_panel(t, "-launcher");
     unsetenv("XW_TERMINAL");
+    unsetenv("XDG_DATA_HOME");
+    unsetenv("XDG_DATA_DIRS");
     XWT_ASSERT(pid > 0);
     PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
 
@@ -589,34 +600,151 @@ static void test_panel_launcher(struct xwt_ctx *t) {
 /* ------------------------------------------------------------------ */
 /* Start-button robustness: the user report behind this suite —
  * "Start does nothing; clicking it repeatedly crashes xw-panel".
- * Reproduced here as rapid repeated activation with a live fake
- * session-manager ctl socket (each click = one blocking ctl round
- * trip inside the panel's Wayland dispatch). */
+ * With the applications menu, repeated Start activation is a rapid
+ * popup create/destroy cycle (menu open -> Start toggle closes it);
+ * it must be idempotent and must never take the panel down. */
 
-/* service one pending ctl connection: read the line, reply ok */
-static int ctl_service_one(int lfd, char *line, size_t line_n) {
+/* service one pending fake-session-manager ctl connection: read the
+ * line, reply ok (used by the menu-launch and exit-dialog checks) */
+static void handled_ctl_line(int lfd, char *line, size_t line_n, bool *got) {
+    if (*got)
+        return;
     struct pollfd pfd = {.fd = lfd, .events = POLLIN};
     if (poll(&pfd, 1, 0) != 1)
-        return 0;
+        return;
     int cfd = accept(lfd, NULL, NULL);
     if (cfd < 0)
-        return 0;
+        return;
     ssize_t n = read(cfd, line, line_n - 1);
-    int handled = 0;
     if (n > 0) {
         line[n] = 0;
         char *nl = strchr(line, '\n');
         if (nl)
             *nl = 0;
         dprintf(cfd, "ok spawned\n");
-        handled = 1;
+        *got = true;
     }
     shutdown(cfd, SHUT_WR);
     close(cfd);
-    return handled;
+}
+
+static void fake_appdir(char *out, size_t outn) {
+    /* XDG_DATA_HOME points at out; entries live in out/applications */
+    snprintf(out, outn, "%s/apps-%d", g_runtimedir(), (int)getpid());
+    mkdir(out, 0755); /* parent first: mkdir is not recursive */
+    char appsub[340];
+    snprintf(appsub, sizeof(appsub), "%.320s/applications", out);
+    mkdir(appsub, 0755);
+    static const char *const entries[] = {
+        "[Desktop Entry]\nType=Application\nName=Alpha\nExec=/bin/alpha %f\n",
+        "[Desktop Entry]\nType=Application\nName=Beta\nExec=beta --flag\n",
+        "[Desktop Entry]\nType=Application\nName=Gamma\nExec=gamma\n",
+        /* filtered out: NoDisplay */
+        "[Desktop Entry]\nType=Application\nName=Hidden App\n"
+        "Exec=/bin/hidden\nNoDisplay=true\n",
+        /* filtered out: wrong type */
+        "[Desktop Entry]\nType=Link\nName=Web\nURL=https://xw\n",
+    };
+    static const char *const files[] = {"alpha.desktop", "beta.desktop",
+                                        "gamma.desktop", "hidden.desktop",
+                                        "web.desktop"};
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", appsub, files[i]);
+        FILE *f = fopen(path, "w");
+        if (f) {
+            fputs(entries[i], f);
+            fclose(f);
+        }
+    }
+    /* an empty extra data dir: XDG_DATA_DIRS points here so the scan
+     * never sees the real system applications (deterministic items) */
+    char empty[300];
+    snprintf(empty, sizeof(empty), "%s/emptydata-%d", g_runtimedir(),
+             (int)getpid());
+    mkdir(empty, 0755);
+}
+
+static int n_top_popups(struct xwt_ctx *t) {
+    int n = 0;
+    struct xw_popup *p;
+    wl_list_for_each(p, &t->comp->popups, link)
+        n++;
+    return n;
+}
+
+static struct xw_popup *the_menu(struct xwt_ctx *t) {
+    if (wl_list_empty(&t->comp->popups))
+        return NULL;
+    struct xw_popup *p;
+    p = wl_container_of(t->comp->popups.next, p, link);
+    return p;
 }
 
 static void test_panel_start_repeated(struct xwt_ctx *t) {
+    char appdir[300];
+    fake_appdir(appdir, sizeof(appdir));
+    char empty[300];
+    snprintf(empty, sizeof(empty), "%s/emptydata-%d", g_runtimedir(),
+             (int)getpid());
+    setenv("XDG_DATA_HOME", appdir, 1);
+    setenv("XDG_DATA_DIRS", empty, 1);
+
+    pid_t pid = spawn_panel(t, "-start-rep");
+    unsetenv("XDG_DATA_HOME");
+    unsetenv("XDG_DATA_DIRS");
+    XWT_ASSERT(pid > 0);
+    PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
+
+    /* 20 paced open/close cycles (the 600ms pacing clears the
+     * same-click dismissal-suppression window, so every odd click
+     * opens and every even click toggles closed) */
+    bool saw_popup = false;
+    for (int round = 0; round < 20; round++) {
+        xw_compositor_inject_pointer_motion(t->comp, 20, 14);
+        pump_ms(t, 60);
+        xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+        xwt_pump(t);
+        xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+        /* let the panel run its popup create (blocking sync against
+         * this server) or destroy */
+        pump_ms(t, 600);
+        if (n_top_popups(t) > 0)
+            saw_popup = true;
+        if (kill(pid, 0) != 0) {
+            XWT_CHECK(false, "panel died during round %d of 20", round);
+            break;
+        }
+    }
+    XWT_CHECK(kill(pid, 0) == 0, "panel alive after 20 Start toggle cycles");
+    XWT_CHECK(saw_popup, "the menu opened at least once");
+
+    /* and a rapid-fire burst on top: clicks faster than the
+     * suppression window must not thrash or crash either */
+    for (int round = 0; round < 30; round++) {
+        xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+        xwt_pump(t);
+        xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+        pump_ms(t, 40);
+    }
+    XWT_CHECK(kill(pid, 0) == 0, "panel alive after a 30-click burst");
+
+    reap(&pid);
+}
+
+/* the applications menu end to end: open (popup parented to the bar
+ * layer, anchored under the Start button), Escape dismissal, outside
+ * click dismissal, item launch through the ctl wire, toggle, and the
+ * destroy-under-cursor UAF guard */
+static void test_panel_menu(struct xwt_ctx *t) {
+    char appdir[300];
+    fake_appdir(appdir, sizeof(appdir));
+    char empty[300];
+    snprintf(empty, sizeof(empty), "%s/emptydata-%d", g_runtimedir(),
+             (int)getpid());
+    setenv("XDG_DATA_HOME", appdir, 1);
+    setenv("XDG_DATA_DIRS", empty, 1);
+
     char ctl_path[192];
     snprintf(ctl_path, sizeof(ctl_path), "%s/xw-session.sock",
              g_runtimedir());
@@ -627,49 +755,205 @@ static void test_panel_start_repeated(struct xwt_ctx *t) {
     int ncpy = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", ctl_path);
     XWT_ASSERT(ncpy >= 0 && (size_t)ncpy < sizeof(addr.sun_path));
     XWT_ASSERT(bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
-    XWT_ASSERT(listen(lfd, 16) == 0);
-    int fl = fcntl(lfd, F_GETFL, 0);
-    fcntl(lfd, F_SETFL, fl | O_NONBLOCK);
+    XWT_ASSERT(listen(lfd, 8) == 0);
 
-    setenv("XW_TERMINAL", "/bin/true", 1); /* inherited by the panel */
-    pid_t pid = spawn_panel(t, "-start-rep");
-    unsetenv("XW_TERMINAL");
+    pid_t pid = spawn_panel(t, "-menu");
+    unsetenv("XDG_DATA_HOME");
+    unsetenv("XDG_DATA_DIRS");
     XWT_ASSERT(pid > 0);
     PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
 
-    /* rapid-fire 40 press/release cycles on the launcher (x=3..39);
-     * the panel queues the clicks and services each ctl round trip as
-     * fast as the fake session manager replies */
+    struct xw_seat *seat = xw_seat_first(t->comp);
+    XWT_ASSERT(seat);
+
+    /* 1. Start click opens the menu: popup exists, mapped, parented to
+     * the bar layer, anchored under the button */
     xw_compositor_inject_pointer_motion(t->comp, 20, 14);
     pump_ms(t, 60);
-    int handled = 0;
-    char line[128];
-    for (int round = 0; round < 40; round++) {
-        xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, the_menu(t) && the_menu(t)->mapped);
+    struct xw_popup *pu = the_menu(t);
+    XWT_ASSERT(pu);
+    XWT_CHECK(pu->mapped, "menu popup mapped");
+    XWT_CHECK(pu->parent == first_top_layer(t)->surface,
+              "menu parented to the bar layer surface");
+    XWT_CHECK(pu->anchor_x == 3 && pu->anchor_y == 28,
+              "menu anchored under the Start button (%d,%d)", pu->anchor_x,
+              pu->anchor_y);
+    /* 3 sorted entries (Alpha/Beta/Gamma; NoDisplay and Type=Link
+     * filtered), 26px rows */
+    XWT_CHECK(pu->h == 3 * 26 + 8, "menu height = 3 items (%d)", pu->h);
+    XWT_CHECK(pu->w == 230, "menu width 230 (%d)", pu->w);
+    /* menu pixels actually rendered below the bar (item 1's row:
+     * item 0 carries the hover fill once the pointer is inside) */
+    PANEL_WAIT(t, pixel_at(t, 50, 28 + 4 + 26 + 13) == 0xff262b33);
+    XWT_CHECK(pixel_at(t, 50, 28 + 4 + 26 + 13) == 0xff262b33,
+              "menu background rendered");
+
+    /* 2. hover: motion over item 0 lights the highlight (checked at
+     * x=150: the software cursor sprite sits exactly on the pointer
+     * position and would cover a pixel taken at the pointer itself) */
+    xw_compositor_inject_pointer_motion(t->comp, 50, 28 + 4 + 13);
+    PANEL_WAIT(t, pixel_at(t, 150, 28 + 4 + 13) == 0xff3584e4);
+    XWT_CHECK(pixel_at(t, 150, 28 + 4 + 13) == 0xff3584e4,
+              "menu item hover highlight rendered");
+    XWT_CHECK(seat->grab_surface == pu->surface,
+              "the menu holds the seat grab (all pointer events)");
+
+    /* 3. Escape dismisses (the popup owns keyboard focus via grab) */
+    xw_compositor_inject_key(t->comp, K_ESC, true);
+    xwt_pump(t);
+    xw_compositor_inject_key(t->comp, K_ESC, false);
+    PANEL_WAIT(t, n_top_popups(t) == 0);
+    XWT_CHECK(n_top_popups(t) == 0, "Escape closed the menu");
+    /* pointer was ON the menu when it died: the destroyed surface must
+     * not keep pointer or grab focus, and further motion must be clean
+     * (the UAF guard) */
+    XWT_WAIT(t, seat->ptr_focus == NULL && seat->grab_surface == NULL);
+    xw_compositor_inject_pointer_motion(t->comp, 700, 300);
+    xwt_pump(t);
+    XWT_CHECK(true, "motion after menu death under the cursor is clean");
+    XWT_CHECK(kill(pid, 0) == 0, "panel alive after Escape close");
+
+    /* 4. reopen + item click launches through the ctl wire */
+    xw_compositor_inject_pointer_motion(t->comp, 20, 14);
+    pump_ms(t, 300); /* clear the suppression window */
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, n_top_popups(t) == 1);
+    /* item 0 (Alpha, sorted): click its center; the panel forks the
+     * async ctl round trip — service the fake socket for it */
+    xw_compositor_inject_pointer_motion(t->comp, 50, 28 + 4 + 13);
+    pump_ms(t, 60);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+
+    char line[128] = {0};
+    bool got = false;
+    for (int i = 0; i < 400 && !got; i++) {
         xwt_pump(t);
-        xw_compositor_inject_pointer_button(t->comp, 0x110, false);
-        /* let the panel process the click + complete its ctl round
-         * trip before the next one lands (the real session manager
-         * replies within its 500ms poll cycle) */
-        for (int i = 0; i < 120; i++) {
-            xwt_pump(t);
-            handled += ctl_service_one(lfd, line, sizeof(line));
-            usleep(5000);
-        }
-        /* still alive at every round: a crash mid-sequence must fail
-         * here with the round number, not at the end */
-        if (kill(pid, 0) != 0) {
-            XWT_CHECK(false, "panel died during round %d of 40", round);
-            break;
-        }
+        handled_ctl_line(lfd, line, sizeof(line), &got);
+        usleep(10000);
     }
-    XWT_CHECK(kill(pid, 0) == 0, "panel alive after 40 rapid Start clicks");
-    XWT_CHECK(handled >= 1, "ctl lines were exchanged (%d)", handled);
+    XWT_CHECK(got && strncmp(line, "run /bin/alpha", 14) == 0,
+              "menu item launched via ctl (got '%s')", got ? line : "(none)");
+    PANEL_WAIT(t, n_top_popups(t) == 0);
+    XWT_CHECK(n_top_popups(t) == 0, "menu closed after item selection");
+    XWT_CHECK(kill(pid, 0) == 0, "panel alive after launching an item");
+
+    /* 5. outside click dismisses (press on the desktop background) */
+    xw_compositor_inject_pointer_motion(t->comp, 20, 14);
+    pump_ms(t, 300);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, n_top_popups(t) == 1);
+    xw_compositor_inject_pointer_motion(t->comp, 800, 400);
+    pump_ms(t, 60);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, n_top_popups(t) == 0);
+    XWT_CHECK(n_top_popups(t) == 0, "outside click dismissed the menu");
+    XWT_CHECK(kill(pid, 0) == 0, "panel alive after outside dismissal");
+
+    /* 6. exit button with the menu previously opened: the async ctl
+     * round trip must not freeze or kill the panel */
+    xw_compositor_inject_pointer_motion(t->comp, 20, 14);
+    pump_ms(t, 300);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, n_top_popups(t) == 1);
+
+    /* the exit button is found by its red fill (same scan as the
+     * exit-button test) */
+    int red_x = -1;
+    for (int i = 0; i < 1000 && red_x < 0; i++) {
+        xwt_pump(t);
+        for (int x = 1000; x < 1280; x++) {
+            if (pixel_at(t, x, 14) == 0xffa33434) {
+                red_x = x;
+                break;
+            }
+        }
+        if (red_x < 0)
+            usleep(10000);
+    }
+    XWT_ASSERT(red_x > 0);
+    xw_compositor_inject_pointer_motion(t->comp, red_x + 10, 14);
+    pump_ms(t, 60);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    /* service the async exit-dialog round trip (a second ctl line) */
+    char line2[128] = {0};
+    bool got2 = false;
+    for (int i = 0; i < 400 && !got2; i++) {
+        xwt_pump(t);
+        handled_ctl_line(lfd, line2, sizeof(line2), &got2);
+        usleep(10000);
+    }
+    XWT_CHECK(got2 && strncmp(line2, "exit-dialog", 11) == 0,
+              "exit button fired the ctl line (got '%s')",
+              got2 ? line2 : "(none)");
+    XWT_CHECK(kill(pid, 0) == 0, "panel alive after exit click + menu open");
 
     reap(&pid);
     unlink(ctl_path);
     close(lfd);
 }
+
+/* compositor shutdown while the menu is open: the panel must exit
+ * cleanly (no crash, exit status 0) */
+static void test_panel_menu_compositor_shutdown(struct xwt_ctx *t) {
+    char appdir[300];
+    fake_appdir(appdir, sizeof(appdir));
+    char empty[300];
+    snprintf(empty, sizeof(empty), "%s/emptydata-%d", g_runtimedir(),
+             (int)getpid());
+    setenv("XDG_DATA_HOME", appdir, 1);
+    setenv("XDG_DATA_DIRS", empty, 1);
+
+    pid_t pid = spawn_panel(t, "-menu-shutdown");
+    unsetenv("XDG_DATA_HOME");
+    unsetenv("XDG_DATA_DIRS");
+    XWT_ASSERT(pid > 0);
+    PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
+
+    xw_compositor_inject_pointer_motion(t->comp, 20, 14);
+    pump_ms(t, 60);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, n_top_popups(t) == 1);
+    XWT_CHECK(n_top_popups(t) == 1, "menu open when the compositor dies");
+
+    /* SIGTERM the panel with the menu open: clean exit (the menu
+     * teardown runs before the connection teardown) */
+    kill(pid, SIGTERM);
+    int status = 0;
+    bool exited = false;
+    for (int i = 0; i < 200; i++) {
+        xwt_pump(t);
+        if (waitpid(pid, &status, WNOHANG) == pid) {
+            exited = true;
+            break;
+        }
+        usleep(10000);
+    }
+    XWT_CHECK(exited && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+              "panel exited cleanly with the menu open (status 0x%x)",
+              status);
+    /* the compositor reaped the popup surface: no leak into the list */
+    PANEL_WAIT(t, n_top_popups(t) == 0);
+    XWT_CHECK(n_top_popups(t) == 0, "popup gone after the panel exited");
+}
+
 
 /* v0 documented behavior: the clock is display-only — a click neither
  * crashes the panel nor fires any session action */
@@ -867,6 +1151,8 @@ static const struct xwt_test tests[] = {
     {"late-pointer-enter-replay", test_late_pointer_enter_replay},
     {"panel-launcher", test_panel_launcher},
     {"panel-start-repeated", test_panel_start_repeated},
+    {"panel-menu", test_panel_menu},
+    {"panel-menu-compositor-shutdown", test_panel_menu_compositor_shutdown},
     {"panel-clock-click", test_panel_clock_click},
     {"layer-before-outputs", test_layer_before_outputs},
     {"compositor-without-panel", test_compositor_without_panel},
