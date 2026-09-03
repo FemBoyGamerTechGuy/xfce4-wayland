@@ -437,6 +437,138 @@ static void test_seatd_disable_lifecycle(struct xwt_ctx *t) {
     close_mock_env(sock);
 }
 
+/* The consumer-less disable MUST auto-ack: the seatd daemon holds its
+ * VT handoff until the DISABLE_SEAT ack arrives, and a seat opened
+ * without the DRM backend registering hooks would otherwise park the
+ * console mid-switch forever (the VT-trap failure mode). The mock's
+ * disable dance completes (ack received -> SEAT_DISABLED -> ENABLE)
+ * without the test acknowledging anything. */
+static void test_seatd_disable_autoack(struct xwt_ctx *t) {
+    pid_t pid;
+    char sock[108];
+    struct xw_seat_session *s = open_mock_seat(t, "disable", &pid, sock);
+    XWT_ASSERT(s != NULL);
+
+    g_disable_events = 0;
+    g_enable_events = 0;
+    /* events registered WITHOUT a disable consumer: seat_call_disable
+     * must ack on its own */
+    struct xw_seat_events ev = {
+        .disable = NULL,
+        .enable = on_enable,
+    };
+    xw_seat_session_set_events(s, &ev, NULL);
+
+    /* the first device open carries the DISABLE event; the auto-ack
+     * lets the mock complete the cycle and send ENABLE */
+    int fd = -1;
+    int dev_id = xw_seat_session_open_device(s, "/dev/null", &fd);
+    XWT_CHECK(dev_id >= 0 && fd >= 0, "the request itself still succeeds");
+    XWT_CHECK(g_enable_events == 1,
+              "enable delivered after the automatic ack (%d)",
+              g_enable_events);
+    XWT_CHECK(xw_seat_session_active(s),
+              "the whole disable/ack/enable cycle completed on its own");
+
+    if (dev_id >= 0)
+        xw_seat_session_close_device(s, dev_id);
+    if (fd >= 0)
+        close(fd);
+    xw_seat_session_destroy(s);
+    int st = mock_wait(pid);
+    XWT_CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0,
+              "mock saw the ack without any test-side ack call");
+    close_mock_env(sock);
+}
+
+/* Ctrl+Alt+F1..F12 (raw linux keycodes 59..68, 87, 88) requests a VT
+ * switch through the seat session and is consumed like a shortcut —
+ * the focused client never sees the key. F-keys without Ctrl+Alt pass
+ * through to clients. The headless test compositor gets a mock seat
+ * session so the DRM-only path is exercisable without hardware. */
+static int g_vt_key_count;
+static struct xwc_win *g_vt_win;
+static void vt_key_cb(struct xwc_win *w, uint32_t keycode, bool down,
+                      xkb_keysym_t sym, uint32_t mods, void *ud) {
+    (void)sym;
+    (void)mods;
+    (void)ud;
+    /* count F2 presses only: the Ctrl/Alt modifier keys themselves are
+     * legitimately delivered to the client while held */
+    if (w == g_vt_win && down && keycode == 60)
+        g_vt_key_count++;
+}
+
+/* solid-fill configure so the window maps and takes focus */
+static void vt_win_configure(struct xwc_win *w, int width, int height,
+                             void *ud) {
+    (void)width;
+    (void)height;
+    uint32_t color = *(uint32_t *)ud;
+    int ww = 0, wh = 0, stride = 0;
+    xwc_win_size(w, &ww, &wh);
+    uint32_t *pix = xwc_win_pixels(w, &stride);
+    if (!pix || ww < 1 || wh < 1)
+        return;
+    xwc_fill_rect(pix, stride, ww, wh, 0, 0, ww, wh, color);
+    xwc_win_commit(w);
+}
+
+static void test_seat_vt_switch_keys(struct xwt_ctx *t) {
+    pid_t pid;
+    char sock[108];
+    struct xw_seat_session *s = open_mock_seat(t, "ok", &pid, sock);
+    XWT_ASSERT(s != NULL);
+    /* the DRM backend is the only seat-session consumer; give the
+     * headless test compositor one so the key path is armed */
+    XWT_ASSERT(t->comp->seat == NULL);
+    t->comp->seat = s;
+
+    /* a focused window counts keys it receives */
+    static uint32_t color = 0xff445566;
+    g_vt_key_count = 0;
+    struct xwc_callbacks cb = {
+        .key = vt_key_cb,
+        .configure = vt_win_configure,
+        .ud = &color,
+    };
+    g_vt_win = xwc_win_create(&t->client, &cb, "VTKeys", "vtkeys", 300, 200);
+    XWT_ASSERT(g_vt_win);
+    XWT_WAIT(t, t->comp->wm->focused &&
+                    strcmp(t->comp->wm->focused->title, "VTKeys") == 0);
+
+    /* F2 with Ctrl+Alt held: consumed by the VT-switch path (the mock
+     * answers the SWITCH_SESSION round trip), never delivered */
+    xw_compositor_inject_key(t->comp, K_LEFTCTRL, true);
+    xw_compositor_inject_key(t->comp, K_LEFTALT, true);
+    xw_compositor_inject_key(t->comp, K_F2, true);
+    xwt_pump(t);
+    xw_compositor_inject_key(t->comp, K_F2, false);
+    xw_compositor_inject_key(t->comp, K_LEFTALT, false);
+    xw_compositor_inject_key(t->comp, K_LEFTCTRL, false);
+    xwt_pump(t);
+    XWT_CHECK(g_vt_key_count == 0,
+              "Ctrl+Alt+F2 consumed by the VT switch path (%d delivered)",
+              g_vt_key_count);
+
+    /* F2 without modifiers: delivered to the client like any key */
+    xw_compositor_inject_key(t->comp, K_F2, true);
+    xwt_pump(t);
+    xw_compositor_inject_key(t->comp, K_F2, false);
+    xwt_pump(t);
+    XWT_CHECK(g_vt_key_count == 1,
+              "plain F2 reaches the client (%d)", g_vt_key_count);
+
+    xwc_win_destroy(g_vt_win);
+    g_vt_win = NULL;
+    /* the harness teardown destroys the compositor, which destroys
+     * the seat session; the mock exits through its CLOSE_SEAT path */
+    t->comp->seat = NULL; /* the test owned it; destroy it directly */
+    xw_seat_session_destroy(s);
+    mock_wait(pid);
+    close_mock_env(sock);
+}
+
 static void test_seatd_switch_session(struct xwt_ctx *t) {
     pid_t pid;
     char sock[108];
@@ -560,6 +692,8 @@ __attribute__((constructor)) static void register_seat(void) {
         {"seat-seatd-handshake", test_seatd_handshake},
         {"seat-seatd-open-device", test_seatd_open_device},
         {"seat-seatd-disable-lifecycle", test_seatd_disable_lifecycle},
+        {"seat-seatd-disable-autoack", test_seatd_disable_autoack},
+        {"seat-vt-switch-keys", test_seat_vt_switch_keys},
         {"seat-seatd-switch-session", test_seatd_switch_session},
         {"seat-seatd-server-error", test_seatd_server_error},
         {"seat-seatd-garbage", test_seatd_garbage},

@@ -786,6 +786,65 @@ EOF
     rm -f "$RTD/dbus-probe" "$FAKE_HOME/.config/autostart/xw-dbus-probe.desktop"
 fi
 
+
+echo
+echo "== session 10: signal lifecycle (SIGINT/SIGHUP) + crash recovery =="
+
+LOG10="$RTD/session10-sigint.log"
+"$BIN/xw-session" -n >"$LOG10" 2>&1 &
+SESS_PID=$!
+check "sigint: session starts" \
+    'wait_for "[ -S \"$RTD/xw-session.sock\" ]"'
+# Ctrl+C on the launching TTY reaches the session manager (foreground
+# process group): clean shutdown, sockets removed, exit 0
+kill -INT "$SESS_PID"
+check "sigint: session exits cleanly" 'wait_pid_exit "$SESS_PID"'
+wait "$SESS_PID"
+check "sigint: exit code 0" '[ "$?" -eq 0 ]'
+check "sigint: control socket removed" '[ ! -S "$RTD/xw-session.sock" ]'
+check "sigint: no children leaked" \
+    '[ -z "$(pgrep -P "$SESS_PID" 2>/dev/null)" ]'
+
+LOG10B="$RTD/session10-sighup.log"
+"$BIN/xw-session" -n >"$LOG10B" 2>&1 &
+SESS_PID=$!
+check "sighup: session starts" \
+    'wait_for "[ -S \"$RTD/xw-session.sock\" ]"'
+# SIGHUP (controlling terminal gone) must be a CLEAN shutdown, not the
+# default instant death that used to orphan the compositor on a
+# graphics-mode console
+kill -HUP "$SESS_PID"
+check "sighup: session exits cleanly" 'wait_pid_exit "$SESS_PID"'
+wait "$SESS_PID"
+check "sighup: exit code 0" '[ "$?" -eq 0 ]'
+check "sighup: control socket removed" '[ ! -S "$RTD/xw-session.sock" ]'
+check "sighup: no children leaked" \
+    '[ -z "$(pgrep -P "$SESS_PID" 2>/dev/null)" ]'
+
+# compositor crash loop: a crashing compositor is restarted (bounded),
+# reported honestly, the session ends without leftover processes, and
+# the emergency console-restore path runs (a logged no-op where
+# /dev/tty is not a VT, like in this container)
+printf '#!/bin/sh\necho "$XDG_RUNTIME_DIR/wayland-crash"\nsleep 1.5\nkill -SEGV $$\n' > "$RTD/crash-comp.sh"
+chmod +x "$RTD/crash-comp.sh"
+LOG10C="$RTD/session10-crash.log"
+XW_COMPOSITOR="$RTD/crash-comp.sh" \
+    "$BIN/xw-session" -n -S xw-crash >"$LOG10C" 2>&1 &
+SESS_PID=$!
+check "crash: session gives up after bounded restarts" \
+    'wait_pid_exit "$SESS_PID"'
+wait "$SESS_PID" 2>/dev/null
+check "crash: nonzero exit" '[ "$?" -ne 0 ]'
+check "crash: restarts logged" \
+    'rg -q "restarting" "$LOG10C"'
+check "crash: signal death recorded" \
+    'rg -q "killed by signal" "$LOG10C"'
+check "crash: session reports giving up" \
+    'rg -q "kept crashing" "$LOG10C"'
+check "crash: no children leaked" \
+    '[ -z "$(pgrep -P "$SESS_PID" 2>/dev/null)" ]'
+rm -f "$RTD/crash-comp.sh"
+
 echo
 echo "test-session: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1

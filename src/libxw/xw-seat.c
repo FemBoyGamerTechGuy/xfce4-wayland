@@ -533,10 +533,14 @@ static bool seat_vt_switch_key(struct xw_seat *s, uint32_t keycode,
     }
     if (!vt)
         return false;
-    if (!xkb_state_mod_name_is_active(s->xkb_state, XKB_MOD_NAME_CTRL,
-                                      XKB_STATE_MODS_DEPRESSED) ||
-        !xkb_state_mod_name_is_active(s->xkb_state, XKB_MOD_NAME_ALT,
-                                      XKB_STATE_MODS_DEPRESSED))
+    /* Ctrl+Alt held (same mod-index scheme the shortcut engine uses;
+     * Alt is Mod1 on evdev keymaps) */
+    xkb_mod_mask_t mods = xkb_state_serialize_mods(
+                               s->xkb_state, XKB_STATE_MODS_DEPRESSED);
+    bool ctrl = s->mod_ctrl != XKB_MOD_INVALID &&
+                (mods & (1u << s->mod_ctrl));
+    bool alt = s->mod_alt != XKB_MOD_INVALID && (mods & (1u << s->mod_alt));
+    if (!ctrl || !alt)
         return false;
     xw_log(XW_LOG_INFO, "seat: Ctrl+Alt+F%d -> requesting VT %d switch",
            vt, vt);
