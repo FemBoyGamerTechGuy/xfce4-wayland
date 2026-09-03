@@ -141,6 +141,10 @@ int panel_draw_text(const struct panel *p, uint32_t *pix, int stride, int w,
  * when anything was cut. Never splits a multibyte character. */
 void panel_text_fit(const struct panel *p, char *dst, size_t n,
                     const char *src, int room);
+/* generic app-grid glyph for icons that failed to resolve */
+void panel_draw_app_fallback_icon(const struct panel *p, uint32_t *pix,
+                                  int stride, int bw, int bh, int x, int y,
+                                  int cell);
 
 /* the clock format engine (panel-clock.c): strftime-lite with an
  * ASCII-safe token set (%a %b %d %m %H %I %M %S %p %y %Y %%) */

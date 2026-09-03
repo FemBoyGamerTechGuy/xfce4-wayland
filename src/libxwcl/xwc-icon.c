@@ -3,9 +3,19 @@
  * The icon theme spec (freedesktop) is followed in its common path:
  * search <data dirs>/icons/<theme>/... for "<name>.<ext>" with .png and
  * .xpm renderable; pick the file whose size is closest >= the request;
- * /usr/share/pixmaps is the flat legacy fallback. SVG is not renderable
- * without a vector stack and is skipped (documented deviation). PNG
- * needs the optional libpng (XW_PNG=auto|1|0); XPM is parsed in-house.
+ * /usr/share/pixmaps is the flat legacy fallback. Theme selection
+ * follows the desktop's own configuration:
+ *   $XW_ICON_THEME (panel.conf icon_theme) > gtk-3.0/settings.ini
+ *   gtk-icon-theme-name > gtk-4.0 > XFCE xfconf xsettings IconThemeName
+ *   > "hicolor" (the guaranteed fallback). Theme inheritance
+ *   (Inherit= in index.theme) is followed depth-limited, cycle-safe;
+ *   hicolor terminates every chain.
+ * Icon= values carrying an extension ("foo.png") are looked up both
+ * verbatim and stripped. Misses are logged once per name@size and
+ * fall back to the caller's generic glyph.
+ * SVG is not renderable without a vector stack and is skipped
+ * (documented deviation). PNG needs the optional libpng
+ * (XW_PNG=auto|1|0); XPM is parsed in-house.
  *
  * Everything is cached: one on-disk index (built on first use) and one
  * decoded-surface cache keyed by "name@size". Single-threaded clients.
@@ -82,6 +92,23 @@ static const struct xwc_icon *cache_get(const char *key) {
     return NULL;
 }
 
+/* one-shot miss log: a name@size that failed to resolve is logged
+ * once so a menu redraw cannot spam (and the user can see WHY an icon
+ * is missing) */
+static char g_missed[64][600];
+static int g_missed_n;
+
+static void log_miss(const char *key, const char *name) {
+    for (int i = 0; i < g_missed_n; i++)
+        if (strcmp(g_missed[i], key) == 0)
+            return;
+    if (g_missed_n >= 64)
+        return;
+    snprintf(g_missed[g_missed_n++], sizeof(g_missed[0]), "%s", key);
+    fprintf(stderr, "xw: icon missing: %s (size key %s) — using fallback\n",
+            name, key);
+}
+
 void xwc_icon_flush(void) {
     for (int i = 0; i < g_index_n; i++) {
         free(g_index[i].name);
@@ -96,6 +123,7 @@ void xwc_icon_flush(void) {
     free(g_cache);
     g_cache = NULL;
     g_cache_n = g_cache_cap = 0;
+    g_missed_n = 0;
 }
 
 bool xwc_icon_png(void) {
@@ -189,14 +217,72 @@ static void walk_theme_dir(const char *dir, int size_hint, int depth) {
     closedir(d);
 }
 
-static void add_theme(const char *icons_root, const char *theme) {
+/* parse Inherit= from <root>/<theme>/index.theme (comma-separated
+ * parent theme names, the [Icon Theme] group) */
+static void theme_parents(const char *icons_root, const char *theme,
+                          char out[4][128], int *n_out) {
+    *n_out = 0;
+    if (!icons_root || !theme)
+        return;
+    char path[1024];
+    if (snprintf(path, sizeof(path), "%.480s/%.240s/index.theme",
+                 icons_root, theme) >= (int)sizeof(path))
+        return;
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return;
+    char line[512];
+    bool in_group = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '[') {
+            in_group = strncmp(line, "[Icon Theme]", 12) == 0;
+            continue;
+        }
+        if (!in_group || strncmp(line, "Inherit", 7) != 0)
+            continue;
+        const char *v = strchr(line, '=');
+        if (!v)
+            continue;
+        v++;
+        char names[512];
+        snprintf(names, sizeof(names), "%.500s", v);
+        char *save = NULL;
+        for (char *tok = strtok_r(names, ", \t\r\n", &save);
+             tok && *n_out < 4; tok = strtok_r(NULL, ", \t\r\n", &save)) {
+            if (*tok && strcmp(tok, theme) != 0 &&
+                strcmp(tok, "hicolor") != 0)
+                snprintf(out[(*n_out)++], 128, "%.120s", tok);
+        }
+        break;
+    }
+    fclose(f);
+}
+
+/* add a theme and its inheritance chain (depth-limited, cycle-safe;
+ * hicolor always terminates a chain and is never re-walked) */
+static void add_theme(const char *icons_root, const char *theme, int depth) {
     if (!icons_root || !*icons_root || !theme || !*theme)
         return;
+    if (depth > 3)
+        return; /* chains deeper than that are broken configs */
+    if (strcmp(theme, "hicolor") == 0) {
+        char path[1024];
+        if (snprintf(path, sizeof(path), "%.480s/hicolor", icons_root) <
+            (int)sizeof(path))
+            walk_theme_dir(path, 0, 0);
+        return;
+    }
     char path[1024];
     if (snprintf(path, sizeof(path), "%.480s/%.240s", icons_root, theme) >=
         (int)sizeof(path))
         return;
     walk_theme_dir(path, 0, 0);
+    /* Inherit= parents come after the theme itself */
+    char parents[4][128];
+    int n_parents = 0;
+    theme_parents(icons_root, theme, parents, &n_parents);
+    for (int i = 0; i < n_parents; i++)
+        add_theme(icons_root, parents[i], depth + 1);
 }
 
 static int entry_cmp(const void *a, const void *b) {
@@ -204,10 +290,95 @@ static int entry_cmp(const void *a, const void *b) {
                   ((const struct icon_entry *)b)->name);
 }
 
+/* the desktop's configured icon theme, from the places GTK/XFCE
+ * actually store it. $XW_ICON_THEME (set from panel.conf) wins; then
+ * gtk-3.0/gtk-4.0 settings.ini; then the XFCE xfconf xsettings xml. */
+static void discover_theme(char *out, size_t n) {
+    out[0] = 0;
+    const char *env = getenv("XW_ICON_THEME");
+    if (env && *env) {
+        snprintf(out, n, "%.60s", env);
+        return;
+    }
+    const char *xh = getenv("XDG_CONFIG_HOME");
+    const char *home = getenv("HOME");
+    char base[512];
+    if (xh && *xh)
+        snprintf(base, sizeof(base), "%.480s", xh);
+    else if (home && *home)
+        snprintf(base, sizeof(base), "%.480s/.config", home);
+    else
+        return;
+    static const char *const gtk_ini[] = {"gtk-3.0/settings.ini",
+                                          "gtk-4.0/settings.ini"};
+    for (size_t i = 0; i < 2 && !out[0]; i++) {
+        char path[600];
+        snprintf(path, sizeof(path), "%.480s/%s", base, gtk_ini[i]);
+        FILE *f = fopen(path, "r");
+        if (!f)
+            continue;
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            char *v = strstr(line, "gtk-icon-theme-name");
+            if (!v)
+                continue;
+            char *eq = strchr(v, '=');
+            if (!eq)
+                continue;
+            char val[192];
+            snprintf(val, sizeof(val), "%.180s", eq + 1);
+            char *nl = strpbrk(val, "\r\n");
+            if (nl)
+                *nl = 0;
+            char *p = val;
+            while (*p == ' ' || *p == '"')
+                p++;
+            char *end = p + strlen(p);
+            while (end > p && (end[-1] == ' ' || end[-1] == '"'))
+                *--end = 0;
+            if (*p)
+                snprintf(out, n, "%.60s", p);
+            break;
+        }
+        fclose(f);
+    }
+    if (out[0])
+        return;
+    /* xfconf: <property name="IconThemeName" type="empty"><property
+     * name="" type="string" value="Papirus"/></property> or the flat
+     * <property name="IconThemeName" type="string" value="..."/> */
+    char path[600];
+    snprintf(path, sizeof(path),
+             "%.480s/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml", base);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "IconThemeName") && strstr(line, "value=")) {
+            char *v = strstr(line, "value=\"");
+            if (v) {
+                v += 7;
+                char *end = strchr(v, '"');
+                if (end && end > v) {
+                    size_t len = (size_t)(end - v);
+                    if (len < n) {
+                        memcpy(out, v, len);
+                        out[len] = 0;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    fclose(f);
+}
+
 static void index_build(void) {
     g_index_built = true;
 
-    const char *env_theme = getenv("XW_ICON_THEME");
+    char theme[128];
+    discover_theme(theme, sizeof(theme));
 
     /* roots in priority order (user overrides system, matching the
      * icon theme spec's lookup order) */
@@ -255,11 +426,11 @@ static void index_build(void) {
             }
             continue;
         }
-        /* env theme first (higher priority), hicolor as the spec's
-         * guaranteed fallback */
-        if (env_theme && *env_theme)
-            add_theme(roots[i], env_theme);
-        add_theme(roots[i], "hicolor");
+        /* the configured theme (with its Inherit= chain) first, then
+         * hicolor as the spec's guaranteed fallback */
+        if (theme[0])
+            add_theme(roots[i], theme, 0);
+        add_theme(roots[i], "hicolor", 0);
     }
 
     qsort(g_index, (size_t)g_index_n, sizeof(g_index[0]), entry_cmp);
@@ -704,9 +875,26 @@ const struct xwc_icon *xwc_icon_get(const char *name, int size) {
         path = name;
     } else {
         struct icon_file f;
-        if (!index_find(name, size, &f))
-            return NULL;
-        path = f.path;
+        if (!index_find(name, size, &f)) {
+            /* Icon= values sometimes carry an extension ("foo.png"):
+             * the theme lookup wants the bare name too */
+            char stripped[600];
+            snprintf(stripped, sizeof(stripped), "%.560s", name);
+            char *dot = strrchr(stripped, '.');
+            if (dot && (strcasecmp(dot, ".png") == 0 ||
+                        strcasecmp(dot, ".svg") == 0 ||
+                        strcasecmp(dot, ".xpm") == 0)) {
+                *dot = 0;
+                if (index_find(stripped, size, &f))
+                    path = f.path;
+            }
+            if (!path) {
+                log_miss(key, name);
+                return NULL;
+            }
+        } else {
+            path = f.path;
+        }
     }
     struct stat st;
     if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
@@ -720,17 +908,22 @@ const struct xwc_icon *xwc_icon_get(const char *name, int size) {
                     break;
                 }
             }
-            if (path == name || path == NULL)
+            if (path == name || path == NULL) {
+                log_miss(key, name);
                 return NULL;
+            }
         } else {
+            log_miss(key, name);
             return NULL;
         }
     }
 
     int w = 0, h = 0;
     uint32_t *pix = load_any(path, &w, &h);
-    if (!pix)
+    if (!pix) {
+        log_miss(key, name);
         return NULL;
+    }
 
     /* scale into a square size x size cell (icons keep aspect by
      * letterboxing in xwc_draw_icon; here the surface is the largest

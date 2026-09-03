@@ -307,11 +307,133 @@ static void test_icon_blit(struct xwt_ctx *t) {
     env_restore();
 }
 
+/* theme inheritance: the configured theme misses the icon, its
+ * Inherit= parent has it — the chain must resolve it */
+static void test_theme_inherit(struct xwt_ctx *t) {
+    (void)t;
+    snprintf(t_dir, sizeof(t_dir), "/tmp/xwt-icons-i-%d", (int)getpid());
+    char user[300];
+    snprintf(user, sizeof(user), "%s/user", t_dir);
+    /* "mytheme" (empty of the icon) inherits "parenttheme" which has it */
+    mkdirs("%s/user/icons/mytheme/48x48/apps", t_dir);
+    mkdirs("%s/user/icons/parenttheme/48x48/apps", t_dir);
+    mkdirs("%s/user/icons/hicolor/48x48/apps", t_dir);
+    char idx[400], pp[400];
+    snprintf(idx, sizeof(idx), "%s/user/icons/mytheme/index.theme", t_dir);
+    write_file(idx, "[Icon Theme]\nName=My Theme\nInherit=parenttheme\n");
+    snprintf(pp, sizeof(pp),
+             "%s/user/icons/parenttheme/48x48/apps/inherited.xpm", t_dir);
+    write_file(pp, XPM_RED4);
+    /* hicolor carries a DIFFERENT icon under the same name: the chain
+     * parent must win over the hicolor fallback */
+    char hp[400];
+    snprintf(hp, sizeof(hp),
+             "%s/user/icons/hicolor/48x48/apps/inherited.xpm", t_dir);
+    write_file(hp, XPM_BLUE4);
+
+    env_snapshot();
+    env_redirect(t_dir, user, NULL);
+    setenv("XW_ICON_THEME", "mytheme", 1);
+
+    const struct xwc_icon *ic = xwc_icon_get("inherited", 48);
+    XWT_CHECK(ic && ic->pix, "icon found through the Inherit= chain");
+    if (ic)
+        XWT_CHECK(ic->pix[24 * 48 + 24] == 0xffff0000,
+                  "parent theme wins over hicolor (%08x)",
+                  ic->pix[24 * 48 + 24]);
+
+    unsetenv("XW_ICON_THEME");
+    env_restore();
+}
+
+/* the desktop's configured theme: gtk-3.0 settings.ini is honored */
+static void test_theme_gtk_discovery(struct xwt_ctx *t) {
+    (void)t;
+    snprintf(t_dir, sizeof(t_dir), "/tmp/xwt-icons-g-%d", (int)getpid());
+    char home[300];
+    snprintf(home, sizeof(home), "%s/home", t_dir);
+    char data[300];
+    snprintf(data, sizeof(data), "%s/data", t_dir);
+    mkdirs("%s/home/.config/gtk-3.0", t_dir);
+    mkdirs("%s/data/icons/fancytheme/48x48/apps", t_dir);
+    char ini[400], icp[400];
+    snprintf(ini, sizeof(ini), "%s/home/.config/gtk-3.0/settings.ini",
+             t_dir);
+    write_file(ini, "[Settings]\n gtk-icon-theme-name=fancytheme\n");
+    snprintf(icp, sizeof(icp),
+             "%s/data/icons/fancytheme/48x48/apps/fancy.xpm", t_dir);
+    write_file(icp, XPM_BLUE4);
+
+    env_snapshot();
+    env_redirect(home, data, data);
+    unsetenv("XW_ICON_THEME");
+
+    const struct xwc_icon *ic = xwc_icon_get("fancy", 48);
+    XWT_CHECK(ic && ic->pix, "gtk-3.0 icon theme discovered");
+    env_restore();
+}
+
+/* the XFCE xfconf IconThemeName property is honored */
+static void test_theme_xfce_discovery(struct xwt_ctx *t) {
+    (void)t;
+    snprintf(t_dir, sizeof(t_dir), "/tmp/xwt-icons-x-%d", (int)getpid());
+    char home[300], data[300];
+    snprintf(home, sizeof(home), "%s/home", t_dir);
+    snprintf(data, sizeof(data), "%s/data", t_dir);
+    mkdirs("%s/home/.config/xfce4/xfconf/xfce-perchannel-xml", t_dir);
+    mkdirs("%s/data/icons/xfctheme/48x48/apps", t_dir);
+    char xml[400], icp[400];
+    snprintf(xml, sizeof(xml),
+             "%s/home/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml",
+             t_dir);
+    write_file(xml,
+               "<channel name=\"xsettings\">\n"
+               "  <property name=\"IconThemeName\" type=\"string\" "
+               "value=\"xfctheme\"/>\n"
+               "</channel>\n");
+    snprintf(icp, sizeof(icp),
+             "%s/data/icons/xfctheme/48x48/apps/xfc.xpm", t_dir);
+    write_file(icp, XPM_RED4);
+
+    env_snapshot();
+    env_redirect(home, data, data);
+    unsetenv("XW_ICON_THEME");
+
+    const struct xwc_icon *ic = xwc_icon_get("xfc", 48);
+    XWT_CHECK(ic && ic->pix, "xfconf IconThemeName discovered");
+    env_restore();
+}
+
+/* Icon= values carrying an extension ("foo.png") still resolve */
+static void test_theme_ext_strip(struct xwt_ctx *t) {
+    (void)t;
+    snprintf(t_dir, sizeof(t_dir), "/tmp/xwt-icons-e-%d", (int)getpid());
+    char user[300];
+    snprintf(user, sizeof(user), "%s/user", t_dir);
+    mkdirs("%s/user/icons/hicolor/48x48/apps", t_dir);
+    char p[400];
+    snprintf(p, sizeof(p), "%s/user/icons/hicolor/48x48/apps/extapp.xpm",
+             t_dir);
+    write_file(p, XPM_RED4);
+
+    env_snapshot();
+    env_redirect(t_dir, user, NULL);
+    unsetenv("XW_ICON_THEME");
+
+    const struct xwc_icon *ic = xwc_icon_get("extapp.png", 48);
+    XWT_CHECK(ic && ic->pix, "extension-stripped lookup resolves");
+    env_restore();
+}
+
 static const struct xwt_test tests[] = {
     {"client-font2", test_font2},
     {"client-icon-xpm-direct", test_xpm_direct},
     {"client-icon-png-direct", test_png_direct},
     {"client-icon-theme-lookup", test_theme_lookup},
+    {"client-icon-theme-inherit", test_theme_inherit},
+    {"client-icon-theme-gtk", test_theme_gtk_discovery},
+    {"client-icon-theme-xfce", test_theme_xfce_discovery},
+    {"client-icon-theme-ext-strip", test_theme_ext_strip},
     {"client-icon-theme-priority", test_theme_priority},
     {"client-icon-blit", test_icon_blit},
 };

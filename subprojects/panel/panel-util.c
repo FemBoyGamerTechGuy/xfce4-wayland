@@ -152,6 +152,29 @@ void panel_text_fit(const struct panel *p, char *dst, size_t n,
     }
 }
 
+/* ------------------------------------------------ fallback app icon */
+/* a generic application glyph (an app-grid: four rounded squares in a
+ * dim tint) drawn whenever a themed icon is missing — an empty slot
+ * would read as a rendering bug instead of a missing icon */
+void panel_draw_app_fallback_icon(const struct panel *p, uint32_t *pix,
+                                  int stride, int bw, int bh, int x, int y,
+                                  int cell) {
+    (void)p;
+    uint32_t tint = 0xff6d7a8f;
+    int q = cell / 2 - 2;
+    if (q < 3)
+        q = 3;
+    int ox = x + (cell - 2 * q - 2) / 2;
+    int oy = y + (cell - 2 * q - 2) / 2;
+    xwc_draw_box(pix, stride, bw, bh, ox, oy, q + 1, q + 1, tint, tint);
+    xwc_draw_box(pix, stride, bw, bh, ox + q + 2, oy, q + 1, q + 1, tint,
+                 tint);
+    xwc_draw_box(pix, stride, bw, bh, ox, oy + q + 2, q + 1, q + 1, tint,
+                 tint);
+    xwc_draw_box(pix, stride, bw, bh, ox + q + 2, oy + q + 2, q + 1, q + 1,
+                 tint, tint);
+}
+
 bool panel_ctl_send(const char *cmd) {
     if (!xw_ctl_send_async(cmd)) {
         fprintf(stderr, "xw-panel: ctl round trip failed (fork): '%s'\n",

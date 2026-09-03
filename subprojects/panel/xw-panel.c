@@ -280,24 +280,6 @@ static void layout(struct panel *p) {
 
 /* ------------------------------------------------------------- drawing */
 
-/* procedural fallback icon: an app-grid (four rounded squares) in a
- * tinted cell — used when the themed icon is missing */
-static void draw_grid_icon(uint32_t *pix, int stride, int bw, int bh, int x,
-                           int y, int cell, uint32_t tint) {
-    int q = cell / 2 - 2;
-    if (q < 3)
-        q = 3;
-    int ox = x + (cell - 2 * q - 2) / 2;
-    int oy = y + (cell - 2 * q - 2) / 2;
-    xwc_draw_box(pix, stride, bw, bh, ox, oy, q + 1, q + 1, tint, tint);
-    xwc_draw_box(pix, stride, bw, bh, ox + q + 2, oy, q + 1, q + 1, tint,
-                 tint);
-    xwc_draw_box(pix, stride, bw, bh, ox, oy + q + 2, q + 1, q + 1, tint,
-                 tint);
-    xwc_draw_box(pix, stride, bw, bh, ox + q + 2, oy + q + 2, q + 1, q + 1,
-                 tint, tint);
-}
-
 /* one standard bar button: box + optional icon + optional label */
 static void draw_btn(struct panel *p, uint32_t *pix, int stride, int bw,
                      int bh, const struct btn *b) {
@@ -363,8 +345,9 @@ static void draw_btn(struct panel *p, uint32_t *pix, int stride, int bw,
                 app ? app->name
                     : (b->kind == BTN_TASK ? xwc_task_title((struct xwc_task *)b->data) : "?");
             char one[2] = {src && *src ? (char)toupper((unsigned char)src[0]) : '?', 0};
-            draw_grid_icon(pix, stride, bw, bh, b->x + p->m.btn_pad_x,
-                           y + (h - icon) / 2, icon, 0xff3584e4);
+            panel_draw_app_fallback_icon(p, pix, stride, bw, bh,
+                                          b->x + p->m.btn_pad_x,
+                                          y + (h - icon) / 2, icon);
             panel_draw_text(p, pix, stride, bw, bh,
                             b->x + p->m.btn_pad_x + (icon - 12) / 2,
                             ty + (icon - p->m.font_h) / 2, one, 0xffffffff);
@@ -392,8 +375,9 @@ static void draw_btn(struct panel *p, uint32_t *pix, int stride, int bw,
         } else {
             /* procedural: grid logo for Start, a power glyph for Exit */
             if (b->kind == BTN_START)
-                draw_grid_icon(pix, stride, bw, bh, b->x + p->m.btn_pad_x,
-                               y + (h - icon) / 2, icon, 0xff3584e4);
+                panel_draw_app_fallback_icon(p, pix, stride, bw, bh,
+                                              b->x + p->m.btn_pad_x,
+                                              y + (h - icon) / 2, icon);
             else
                 xwc_draw_box(pix, stride, bw, bh, b->x + p->m.btn_pad_x + 3,
                              y + (h - icon) / 2 + 3, icon - 6, icon - 6, 0,

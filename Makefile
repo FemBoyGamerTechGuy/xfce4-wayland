@@ -544,7 +544,7 @@ build/lib/libxwcl.a: $(LIBXWCL_OBJ) $(LIBXWCL_PROTO) | build/lib
 	$(AR) rcs $@ $(LIBXWCL_OBJ) $(LIBXWCL_PROTO)
 
 $(OBJ)/libxwcl/%.o: src/libxwcl/%.c src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/libxwcl
-	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLC) $(CFLAGS_PIX) -c $< -o $@
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLC) $(CFLAGS_PIX) $(HAVE_PNG) $(CFLAGS_PNG) -c $< -o $@
 
 # ---------------------------------------------------------------- server bins
 build/bin/xw-compositor: $(OBJ)/compositor/xw-compositor.o build/lib/libxw.a build/lib/libxwcl.a | build/bin

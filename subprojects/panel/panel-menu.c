@@ -243,6 +243,10 @@ static void draw_app_row(struct panel *p, uint32_t *pix, int stride, int bw,
         if (ic)
             xwc_draw_icon(pix, stride, bw, bh, x + 8, y + (g_menu.row_h - icon) / 2,
                           ic, icon);
+        else
+            panel_draw_app_fallback_icon(p, pix, stride, bw, bh, x + 8,
+                                         y + (g_menu.row_h - icon) / 2,
+                                         icon);
     }
     char label[XWAPP_NAME_MAX];
     panel_text_fit(p, label, sizeof(label), a->name, MENU_APP_W - 20);
