@@ -79,6 +79,14 @@ absent rather than half-working.
   security, --idle autolock; a raw wayland connection drives the
   strict protocol-error paths).
 - `tests/suite/test_panel.c` — panel coverage (see below).
+- `tests/suite/test_realclient.c` — real-toolkit regressions for the
+  integration round: `wl_pointer.set_cursor` (the request whose NULL
+  handler aborted the compositor — every real toolkit sends it),
+  `wl_buffer.release` on replacement (rotating shm pools stall forever
+  without it), the subcompositor lifecycle (sync/desync position
+  semantics, stacking, both destroy orderings), and the slow-start
+  contract (a client that idles between connect and first commit is
+  never a failure).
 - `tests/suite/test_backends.c` — nested backend coverage: a real
   compositor (B, nested) running inside another real compositor (A,
   headless) in one process. Asserts topology, the present pipeline
@@ -98,6 +106,33 @@ absent rather than half-working.
   startup (udev-seat path or its honest logged refusal),
   `xw-session --nested`, and the nested Wayland backend across two
   real processes).
+- `scripts/fetch-test-apps.sh` — downloads REAL client applications
+  (foot, zenity/GTK4, xterm, xeyes, Xwayland, plus their recursive
+  runtime dependencies) as .debs WITHOUT root and extracts them into
+  the gitignored `.apps-root/` prefix. The integration tests below
+  run real toolkits against the compositor this way — synthetic
+  protocol clients alone missed the entire bug class this round.
+  (Debian-family apt; on other distros install the same apps and point
+  `$XW_XWAYLAND_CMD` at the Xwayland binary.)
+- `scripts/test-xwayland.sh` — **Level 2**: the XWayland stack without
+  the session: compositor + `Xwayland -rootless` + `xw-xwm` + a real
+  X11 client (xeyes). Asserts every process stays alive, the X socket
+  appears, and the X11 window is MANAGED as an ordinary compositor
+  window (map log with app-id `xwayland`).
+- `scripts/test-realapps.sh` — **Level 2**: full-session acceptance
+  with real toolkits: `xw-session` brings up compositor + XWayland +
+  xw-xwm + panel; two native GTK4 apps launch and stay; an X11 app
+  launches through XWayland into the SAME window list; a deliberately
+  slow-starting client (3s before its first window) is not treated as
+  a failure; everything stops cleanly at logout. This is the
+  in-container mirror of the physical NVIDIA acceptance checklist
+  below.
+- `scripts/audit-interfaces.py` — static audit for the NULL-request-
+  handler bug class: cross-references every protocol XML (in-repo +
+  sysroot wayland-protocols) with the C interface implementations and
+  fails on any request whose listener is not initialized — a NULL
+  handler makes libwayland abort the whole compositor when a client
+  sends that request.
 - `scripts/test-build-regressions.sh` — **Level 2 (build system)**:
   regression suite for the distro-agnostic build: font generation from
   the bundled asset (determinism, stripped environment, precise
@@ -155,7 +190,7 @@ requires a running udev instance; run
 what was verified (device, kernel, distro) in WORKLOG.md — that is
 what keeps "verified at Level 3" honest.
 
-## What is covered today (75 Level-1 tests + 144 Level-2 checks + 50-59 build-regression checks)
+## What is covered today (112 Level-1 tests + 144 Level-2 checks + 50-59 build-regression checks)
 
 The nested-session regression (session 5 below) is the reason several
 of these numbers exist: an invisible panel that looked like a working
@@ -410,6 +445,68 @@ On the real DRM session, after the generic checks above:
    keeps working afterward.
 7. Clock, calendar, pager, taskbar, Exit button still function.
 
+### Manual XWayland checklist (X11 applications, this round)
+
+Prerequisites: Xwayland installed (any distro package; the session
+finds it on PATH or via `$XW_XWAYLAND_CMD`), and the compositor from
+this build (xwayland_shell_v1 in `wayland-info` / the globals dump).
+
+1. After login, the session log shows the XWayland block:
+   executable, pid, `display :N`, `socket /tmp/.X11-unix/XN`, ready
+   yes, alive yes, wm helper pid. `xw-session-ctl status` reports
+   `xwayland=:N pid=... alive=yes`.
+2. Launch an X11 application from the panel (e.g. an .desktop entry
+   with an X11 app): its window appears as a normal compositor window
+   — same focus-on-click, same taskbar button, same Alt+Tab entry as
+   native Wayland apps.
+3. The X11 window moves by title-bar drag, resizes from its edges,
+   and maximizes/unmaximizes (the compositor mirrors its geometry
+   into X11 so input lands correctly — click INSIDE the window at
+   its edges to verify).
+4. Switch workspaces with the X11 window on the other one and back:
+   it hides and reappears; its taskbar button tracks the workspace.
+5. Close the X11 window from its own button AND from the taskbar
+   button: the app exits (WM_DELETE_WINDOW is delivered), the window
+   and its button disappear, native apps and the compositor are
+   unaffected.
+6. Native Wayland apps keep working after X11 apps were launched
+   and closed (mix both orders).
+7. `xw-session-ctl xwayland` prints the live diagnostic block.
+8. A slow-starting X11 app (first big Java/Electron apps qualify)
+   maps late without the session logging errors or restarting
+   anything.
+
+Known v1 gaps (documented, not hidden): X11 windows carry the
+app-id `xwayland` and a generic title (the compositor deliberately
+speaks no X11 protocol — names would need an X property reader in
+xw-xwm); fullscreen X11 windows track the compositor geometry, not
+per-output modes.
+
+### Manual real-client checklist (native Wayland applications)
+
+With `.apps-root` fetched (`scripts/fetch-test-apps.sh`) or foot/
+any GTK4 app installed on the machine:
+
+1. Launch foot (or any native terminal): it stays open, its window
+   renders, the cursor changes shape over it (client cursor images —
+   `set_cursor` — are honored now).
+2. Type into foot for 30+ seconds: no freeze (buffer rotation without
+   `wl_buffer.release` used to stall clients after a few frames).
+3. Launch a second native app: both remain visible and responsive.
+4. The panel's taskbar lists both; clicking buttons switches focus
+   correctly between them.
+
+### Physical NVIDIA acceptance (the full sequence)
+
+On the real DRM session, in order: panel appears; launch a small
+native Wayland app — it stays; launch a second — both stay; switch
+workspace and back — both alive and correctly managed; launch an X11
+app through XWayland — it stays, appears in the same task list, its
+workspace switches, closing it works; native apps still work
+afterward. Then the deliberately slow app (xw-demo --delay-ms 5000
+from a terminal): the session must never log a launch error or
+restart the compositor while it has not mapped yet.
+
 ## Regression policy
 
 Every bug fixed during development gets a test that fails without the
@@ -485,3 +582,28 @@ Highlights (each verifiable by reverting the fix):
   disconnect — the client library now destroys dead locks and frees
   held ones without a request (server still sees the connection die;
   spec-verified) (`session-lock-*`)**
+- **wl_pointer.set_cursor had a NULL request handler: libwayland
+  ABORTS the compositor on any request dispatched to a NULL listener
+  ("listener function for opcode 0 of wl_pointer is NULL"), and every
+  real toolkit sends set_cursor the moment its window takes focus —
+  the "window visible for a fraction of a second, then the compositor
+  restarts" physical-session bug. Reproduced in-container with the
+  extracted real Xwayland before the fix; regressed by
+  `pointer-set-cursor`. The same audit
+  (scripts/audit-interfaces.py) now guards the whole interface table**
+- **wl_buffer.release was never sent: clients rotating 2+ shm buffers
+  (foot, GTK, XWayland) treat release as reuse permission and stop
+  committing after their pool is exhausted — applications froze after
+  a few frames with no error anywhere. Regressed by
+  `buffer-release-rotation`**
+- **wl_subcompositor was absent entirely: foot refuses to start
+  ("no sub compositor"), GTK/Qt/Chromium use subsurfaces for menus
+  and overlays. Regressed by `subsurface-lifecycle`**
+- **wl_touch was never created as a resource: a client creating and
+  releasing it hit a fatal invalid-object error (now a resource with
+  a release handler; touch stays unadvertised)**
+- **Xwayland 24+ maps X11 windows only through xwayland_shell_v1 and
+  only in rootless mode with a COMPOSITE-redirecting X window manager
+  present: without all three, X clients connect and render but no
+  window ever reaches the compositor (regressed by
+  scripts/test-xwayland.sh + scripts/test-realapps.sh)**

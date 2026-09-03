@@ -14,3 +14,6 @@ __pycache__/
 # local editor/environment files
 .env
 tool-results/
+
+# extracted real-client test apps (scripts/fetch-test-apps.sh)
+.apps-root/

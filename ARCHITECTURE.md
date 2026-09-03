@@ -238,6 +238,62 @@ refinement, not a requirement (see DEPENDENCIES.md).
 The graphical exit path is `xw-exit` (a native Wayland dialog) wired to
 `Ctrl+Alt+Delete` by default (XFCE parity) plus a panel button.
 
+## XWayland (X11 application support)
+
+X11 applications run through **Xwayland in rootless mode**, started and
+supervised by `xw-session` like every other session child. Three pieces
+cooperate; the design rule is that **the compositor contains no X11
+code** — it speaks only Wayland protocols, same as for native apps:
+
+1. **`xwayland_shell_v1`** (staging protocol, in the compositor):
+   Xwayland 24+ creates one `wl_surface` per X11 toplevel and assigns
+   it this role. The role maps windows through the SAME
+   `xw_wm_*` machinery as xdg toplevels — one focus/raise/stack/
+   workspace/taskbar model, no parallel X11 window path. There is no
+   configure/ack dance: a commit with a buffer maps the window at its
+   buffer size; a null commit unmaps it. `set_serial` records the
+   64-bit serial that correlates the surface with the X11 window
+   inside Xwayland.
+2. **`xw-xwm`** (session helper, `src/session/xw-xwm.c`): the X window
+   manager. Rootless Xwayland only creates wl_surfaces for windows a
+   WM has COMPOSITE-redirected, and X clients need SubstructureRedirect
+   on the root to map at all. xw-xwm speaks the **raw X11 wire protocol
+   over the unix socket — no Xlib, no xcb, libc only** (the same
+   library-free constraint as the session manager). It takes the WM_S0
+   selection, redirects the root's subwindows, answers MapRequest/
+   ConfigureRequest, reads the `WL_SURFACE_SERIAL` client messages
+   Xwayland sends, and mirrors compositor geometry into X11 (so X
+   input coordinates match — Xwayland computes them as
+   `X-window-position + surface-local`).
+3. **`xw_window_control_v1`** (private in-repo protocol): the
+   compositor → helper channel — geometry events (every move/resize/
+   maximize/tile) and close requests, keyed by the same serial. On
+   close, xw-xwm delivers `WM_DELETE_WINDOW` when the client supports
+   it, else destroys the window.
+
+The session manager owns the lifecycle: `-displayfd` readiness (the
+server writes the chosen display number; no fixed `:N` races), a
+per-session MIT-MAGIC-COOKIE-1 authority file written in libXau
+format, `$DISPLAY`/`$XAUTHORITY` exported to all session children
+(including `dbus-update-activation-environment`, so bus-activated
+services see them), restart supervision for both Xwayland (pairs with
+a fresh helper) and the helper, and the `xwayland` ctl command that
+prints the live diagnostic block (executable, pid, display, socket,
+ready, alive). `$XW_SESSION_XWAYLAND=0` opts out; a missing Xwayland
+binary is an honest logged absence, never a failure.
+
+Why not `-wm fd`: Xwayland supports handing the compositor an embedded
+WM over a socketpair, but that binds WM code into the compositor
+process (the exact coupling this project avoids) and would drag X11
+wire handling into the display server. The helper keeps the X11
+surface at arm's length, crash-isolated, restartable.
+
+Known v1 gaps, documented rather than hidden: X11 windows carry the
+app-id `xwayland` and a generic title (reads of X properties like
+WM_CLASS/WM_NAME belong in xw-xwm as a protocol extension — backlog);
+fullscreen X11 windows track compositor geometry, not per-output X
+modes.
+
 ## Real input (libinput source)
 
 Input is a **source**, deliberately orthogonal to the output
@@ -489,6 +545,19 @@ per output; `xw_output_repaint()` recomposites dirty regions, flushes
 frame callbacks, and updates the backbuffer. The renderer is order:
 background color, background/bottom layers, toplevels (bottom → top of
 the visible stack), top/overlay layers, then the software cursor.
+
+Buffer ownership: a surface holds a reference to its committed
+`wl_buffer` (a destroy listener keeps it valid) and sends
+`wl_buffer.release` the moment a commit replaces it — clients that
+rotate 2+ buffers from a pool treat release as reuse permission and
+freeze without it. `wl_subcompositor` is implemented: subsurfaces are
+positioned parent-relative, stacked above or below the parent's own
+buffer, synced (state applies at the parent's next commit — the spec
+default) or desynced; the renderer walks the whole child tree around
+the parent blit, and pointer hit-testing drills into children
+topmost-first. Client cursor images (`wl_pointer.set_cursor`) render
+through the same software-cursor path at `cursor - hotspot`, with the
+default arrow as fallback.
 
 ## Configuration persistence (xfconf-like)
 

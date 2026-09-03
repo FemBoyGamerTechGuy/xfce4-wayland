@@ -2031,3 +2031,103 @@ manual panel checklist in TESTING.md (names without missing letters,
 ChatGPT-style icon resolution, terminal+graphical launches, failed
 launch behavior, Ctrl+C terminal semantics, Ctrl+Alt+Del), then the
 backlog (notification daemon, output management, PAM unlock).
+
+---
+
+## 2026-09-03 — the real-client round: two physical-session root causes (native window death, XWayland absence)
+
+The user's physical NVIDIA testing refined the symptom picture into
+TWO distinct bugs — native Wayland windows appearing for a fraction of
+a second before the compositor "recovered" (restart), and X11
+applications not launching at all through XWayland — with the explicit
+instruction not to merge them into one generic launcher failure and
+not to mask the native bug with recovery. The container could not
+reproduce the compositor death with synthetic clients (the previous
+round's launch matrix passed 14/14); the missing ingredient was REAL
+toolkits. `scripts/fetch-test-apps.sh` downloads foot, zenity/GTK4,
+xterm, xeyes, Xwayland (+ recursive deps, no root needed) into the
+gitignored `.apps-root/` prefix — and running the real Xwayland
+against the compositor reproduced the abort in seconds.
+
+**Bug A root cause (native windows die → session restarts the
+compositor): `wl_pointer.set_cursor` had a NULL request handler.**
+libwayland-server ABORTS the whole process on any request dispatched
+to a NULL listener ("listener function for opcode 0 of wl_pointer is
+NULL"), and every real toolkit calls set_cursor the moment its window
+takes pointer focus — hence "visible for a fraction of a second".
+Reproduced in-container by Xwayland's own first set_cursor before any
+fix existed; the session manager's restart was the "recovery". The
+fix implements the request (cursor surface + hotspot, hide, roled-
+surface rejection), renders client cursor images through the
+software-cursor path (default arrow fallback), and forgets dying
+cursor surfaces. Two sibling defects from the same audit
+(`scripts/audit-interfaces.py`, now standing):
+- **`wl_buffer.release` was never sent.** Clients rotating 2+ shm
+  buffers (foot, GTK, XWayland) treat release as reuse permission and
+  stop committing once their pool is outstanding — apps froze after a
+  few frames with zero errors anywhere. A surface now holds its
+  committed buffer (destroy listener) and releases it at replacement.
+- **`wl_subcompositor` was absent** — foot refuses to start ("no sub
+  compositor"); GTK/Qt/Chromium use subsurfaces. Full implementation:
+  positions, sync (spec default: state at parent commit)/desync,
+  place_above/below, tree rendering around the parent blit, pointer
+  hit-test drilling, both destroy orderings. wl_touch also became a
+  real resource with a release handler (a client releasing it was a
+  fatal invalid-object error before).
+No masking: the compositor binary gained fatal-signal diagnostics
+(signal, fault address, state dump, backtrace, re-raised so the wait
+status stays honestly WIFSIGNALED), and every client/window lifecycle
+stage logs pid/surface/serial/geometry (client connected, surface
+created, window MAPPED/UNMAPPED with app-id+title+geometry+output+
+workspace, focus transitions).
+
+**Bug B root cause (X11 apps don't launch): nothing spoke to Xwayland
+24+ — three missing pieces.** (1) Xwayland maps X11 windows only in
+ROOTLESS mode (default is rootful since 24.1) and only through the
+xwayland_shell_v1 protocol (the xdg fallback was removed); (2) the
+session never started Xwayland at all; (3) rootless mode requires an
+X window manager that COMPOSITE-redirects the root's subwindows —
+without one, X clients connect and render but no wl_surface is ever
+created (the exact "no crash, no window" symptom). All three built:
+`xwayland_shell_v1` in the compositor (windows flow through the SAME
+xw_wm manage/map/focus/stack/workspace/taskbar path as native ones —
+no parallel X11 window-management model); `xw-session` starts Xwayland
+`-rootless -displayfd` with a per-session MIT-MAGIC-COOKIE-1 authority
+file, exports $DISPLAY/$XAUTHORITY (also through
+dbus-update-activation-environment), supervises both with bounded
+restarts, and prints the requested diagnostic block (executable, pid,
+display, socket, ready, alive, wm pid; live via `xw-session-ctl
+xwayland`); and `xw-xwm` — the X window manager as a separate session
+process speaking the RAW X11 wire protocol over the unix socket (no
+Xlib, no xcb, libc only, same constraint as the session manager):
+WM_S0 selection, Composite-RedirectSubwindows, SubstructureRedirect,
+Map/ConfigureRequest handling, WL_SURFACE_SERIAL correlation, geometry
+mirroring into X11 (Xwayland computes X input coords as window-pos +
+surface-local, so mirroring keeps clicks landing correctly), and
+WM_DELETE_WINDOW delivery. The compositor→helper channel is the new
+private `xw_window_control_v1` protocol (geometry + close events keyed
+by serial). Slow-start safety is pinned: no timeout exists anywhere —
+`xw-demo --delay-ms N` deliberately idles between connect and first
+commit, and the session must stay quiet.
+
+Hunting notes for the record: Xwayland's client-side debug
+(`WAYLAND_DEBUG=1`) showed the bind choice; its source (fetched as
+tarball) gave the three conditions above; the extension name is
+case-sensitive ("Composite", not "COMPOSITE" — the query was the last
+invisible failure); and the X setup reply's length field is 16-bit at
+offset 6 (reading 32 bits at offset 4 asks for 4096 bytes the server
+never sends — the handshake hang).
+
+**Validation**: 112/112 in-process (release, twice under
+MALLOC_PERTURB_, full ASan/UBSan/LSan round — including the
+pre-existing panel-taskbar flake now confirmed stable), 144/144
+process-level session tests, 51/51 build regressions, XWayland stack
+test PASS, full-session acceptance 21/21 (`scripts/test-realapps.sh`:
+two native GTK4 apps + one X11 app + slow starter, all alive, mixed
+workspace switching, clean logout, zero surviving processes). foot
+(the app that exposed the subcompositor gap) maps and stays.
+
+Next: physical NVIDIA acceptance per the new TESTING.md checklists
+(XWayland + real-client + the full sequence), then the backlog (X11
+titles via xw-xwm property reads, notification daemon, output
+management, PAM unlock).

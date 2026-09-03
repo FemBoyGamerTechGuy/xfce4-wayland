@@ -36,7 +36,7 @@ rules apply and are documented.
 | **libdrm** | DRM/KMS backend: device discovery, connector/CRTC/mode enumeration, dumb-buffer scanout, page flips, master management | 2.4.110+ | MIT | both (backend optional) | – | ✔ | – | **yes** (`XW_DRM`) | none |
 | **libseat** | optional seat-provider portability layer: wraps systemd-logind, elogind and seatd behind one API. Not required: the built-in seatd client and direct-VT provider cover the same ground without it | 0.7 | MIT | both (provider optional) | – | ✔ (one seat provider) | – | **yes** (`XW_LIBSEAT`) | none |
 | **libpng** | optional PNG icon decoding in `libxwcl`'s XDG icon pipeline (panel menus, taskbar, calendar arrows). Without it icons fall back to XPM + procedural tiles — the panel never breaks | 1.6 | libpng2/pngClrbk-style (permissive; linking imposes no source obligations) | both (optional) | – | – | – | **yes** (`XW_PNG`) | none |
-| **XWayland** | *(future)* optional compatibility server for legacy X11 applications only — never a foundation of this desktop | 22+ | MIT/X11 | future (Phase 8) | – | – | ✔ | **yes** (planned) | none |
+| **Xwayland** | optional compatibility server for legacy X11 applications: started rootless by `xw-session` and paired with our `xw-xwm` helper (raw X wire protocol — no Xlib/xcb linkage anywhere in this repo). Without it, X11 apps simply do not start (honest log line) | 22+ (24+ recommended: xwayland_shell_v1) | MIT/X11 | **runtime only** (never linked, never built) | – (parent session owns X) | ✔ | – | **yes** (`$XW_SESSION_XWAYLAND=0` disables; `$XW_XWAYLAND_CMD` overrides) | none |
 
 ✔ = required for that mode · – = not used in that mode.
 

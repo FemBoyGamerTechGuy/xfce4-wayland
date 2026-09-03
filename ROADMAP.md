@@ -255,8 +255,22 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
   Vendored in protocols/ (original implementation, MIT).
 
 ## M8 — XWayland compatibility
-- TODO optional XWayland startup for legacy X11 apps (never a
-  foundation; the core desktop does not use it).
+- DONE optional XWayland startup for legacy X11 apps (never a
+  foundation; the core desktop does not use it): `xw-session` starts
+  Xwayland rootless with `-displayfd` + a per-session authority
+  cookie, supervises it (restarts, paired with its helper), exports
+  `$DISPLAY`/`$XAUTHORITY` to session children. The compositor side is
+  `xwayland_shell_v1` (Xwayland 24+ per-window association) mapping X11
+  windows through the SAME WM/taskbar/workspace model as native ones.
+  `xw-xwm` (session helper, raw X wire protocol — no Xlib/xcb) is the
+  window manager Xwayland's rootless mode requires: COMPOSITE redirect,
+  SubstructureRedirect on the root, geometry mirroring,
+  WM_DELETE_WINDOW delivery via the private xw_window_control_v1
+  protocol. Regressions: `scripts/test-xwayland.sh`,
+  `scripts/test-realapps.sh`.
+- TODO X11 window titles/app-ids (X property reads in xw-xwm →
+  window-control protocol extension), per-output X mode tracking for
+  fullscreen X11 apps, X11 clipboard bridge.
 
 ## M9 — Hardening/quality
 - DONE zero-warning builds (-Wall -Wextra -Werror, also under -O1),
