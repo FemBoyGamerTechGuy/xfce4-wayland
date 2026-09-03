@@ -215,10 +215,19 @@ void xw_wm_unmanage(struct xw_wm *wm, struct xw_window *w, bool resources_gone) 
     wl_list_remove(&w->stack_link);
     struct xw_foreign_toplevel_res *fr, *fr2;
     wl_list_for_each_safe(fr, fr2, &w->toplevel_handles, link) {
-        struct wl_resource *res = fr->res;
-        zwlr_foreign_toplevel_handle_v1_send_closed(res);
-        wl_resource_destroy(res); /* handle destructor removes+frees node */
+        /* closed is sent; the handle is detached from the dying
+         * window but NOT destroyed server-side: the handle id lives
+         * in the server range (0xff000000+), and libwayland removes
+         * those ids outright on wl_resource_destroy — the client's
+         * legitimate destructor request after `closed` would then be
+         * a fatal "invalid object" error (connection killed). The
+         * client owns the final destroy; requests on the detached
+         * handle are inert (window_of_handle no longer matches). */
+        zwlr_foreign_toplevel_handle_v1_send_closed(fr->res);
+        wl_list_remove(&fr->link);
+        wl_list_init(&fr->link); /* survives until the client destroys it */
     }
+    xw_workspace_info_window_gone(wm->comp, w);
     free(w);
 }
 
@@ -316,6 +325,7 @@ void xw_wm_window_to_workspace(struct xw_wm *wm, struct xw_window *w, int idx) {
         return;
     xw_wm_damage_window(wm, w);
     w->ws = idx;
+    xw_workspace_info_notify(wm->comp, w);
     if (idx != wm->ws_current && wm->focused == w) {
         wm->focused = NULL;
         struct xw_seat *seat = xw_seat_first(wm->comp);

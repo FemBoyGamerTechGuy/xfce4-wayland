@@ -70,6 +70,8 @@ struct xwc {
     void *wsm;    /* ext_workspace_manager_v1 (lazily bound) */
     uint32_t ftm_global; /* registry global name (0 = not advertised) */
     uint32_t wsm_global;
+    uint32_t wsi_global; /* xw_workspace_info_v1 (lazily bound by the
+                            tasklist; annotates tasks with workspaces) */
 
     void *lock_mgr;       /* ext_session_lock_manager_v1 (bound eagerly;
                              xwc_lock_create needs it and a lock client
@@ -193,6 +195,11 @@ const char *xwc_task_title(struct xwc_task *task);
 const char *xwc_task_app_id(struct xwc_task *task);
 bool xwc_task_active(struct xwc_task *task);
 bool xwc_task_minimized(struct xwc_task *task);
+/* 0-based workspace of the window, from xw-workspace-info-v1 when the
+ * compositor offers it. -1 = sticky (on every workspace);
+ * -2 = unknown (compositor without the protocol, or before the first
+ * event). The pager treats -2 as "show on the current workspace". */
+int xwc_task_workspace(struct xwc_task *task);
 /* requests: focus (+ un-minimize) / close the window */
 void xwc_tasklist_activate(struct xwc_tasklist *tl, struct xwc_task *task);
 void xwc_tasklist_close(struct xwc_tasklist *tl, struct xwc_task *task);

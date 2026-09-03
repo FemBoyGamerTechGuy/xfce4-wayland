@@ -18,17 +18,20 @@
 #include "wayland-client.h"
 #include "wlr-foreign-toplevel-management-unstable-v1.h"
 #include "ext-workspace.h"
+#include "xw-workspace-info-v1.h"
 
 /* ------------------------------------------------------------ tasklist */
 
 struct xwc_task {
     struct zwlr_foreign_toplevel_handle_v1 *handle;
+    struct xw_workspace_toplevel_v1 *wsi; /* workspace annotation */
     char title[256];
     char app_id[256];
     bool active;
     bool minimized;
     bool maximized;
     bool fullscreen;
+    int ws; /* xw_workspace_info_v1 index; -1 sticky, -2 unknown */
     struct xwc_tasklist *tl;
     struct xwc_task *prev, *next;
 };
@@ -36,6 +39,7 @@ struct xwc_task {
 struct xwc_tasklist {
     struct xwc *c;
     struct zwlr_foreign_toplevel_manager_v1 *mgr;
+    struct xw_workspace_info_v1 *wsi; /* manager, when offered */
     struct xwc_task *head, *tail;
     void (*changed)(void *ud);
     void *ud;
@@ -117,6 +121,9 @@ static void handle_closed(void *data,
      * event has already been demarshalled (weston/GTK pattern) */
     zwlr_foreign_toplevel_handle_v1_destroy(h);
     task->handle = NULL;
+    if (task->wsi)
+        xw_workspace_toplevel_v1_destroy(task->wsi);
+    task->wsi = NULL;
     task_unlink(tl, task);
     free(task);
     tasklist_notify(tl);
@@ -156,6 +163,27 @@ static const struct zwlr_foreign_toplevel_handle_v1_listener handle_listener = {
     .parent = handle_parent,
 };
 
+/* ---------------------------------------- workspace annotation events */
+
+static void wsi_workspace_ev(void *data, struct xw_workspace_toplevel_v1 *w,
+                             int32_t index) {
+    (void)w;
+    struct xwc_task *task = data;
+    task->ws = index;
+}
+
+static void wsi_done_ev(void *data, struct xw_workspace_toplevel_v1 *w) {
+    (void)w;
+    struct xwc_task *task = data;
+    if (task->tl)
+        tasklist_notify(task->tl);
+}
+
+static const struct xw_workspace_toplevel_v1_listener wsi_task_listener = {
+    .workspace = wsi_workspace_ev,
+    .done = wsi_done_ev,
+};
+
 static void mgr_toplevel(void *data,
                          struct zwlr_foreign_toplevel_manager_v1 *mgr,
                          struct zwlr_foreign_toplevel_handle_v1 *handle) {
@@ -166,8 +194,18 @@ static void mgr_toplevel(void *data,
         return;
     task->handle = handle;
     task->tl = tl;
+    task->ws = -2; /* unknown until the annotation's first event */
     zwlr_foreign_toplevel_handle_v1_add_listener(handle, &handle_listener,
                                                  task);
+    /* annotate with the workspace when the compositor offers it; the
+     * initial workspace event arrives with the next dispatch */
+    if (tl->wsi) {
+        task->wsi = xw_workspace_info_v1_get_toplevel_workspace(tl->wsi,
+                                                                handle);
+        if (task->wsi)
+            xw_workspace_toplevel_v1_add_listener(task->wsi, &wsi_task_listener,
+                                                  task);
+    }
     task->prev = tl->tail;
     if (tl->tail)
         tl->tail->next = task;
@@ -209,6 +247,15 @@ struct xwc_tasklist *xwc_tasklist_create(struct xwc *c,
     tl->changed = changed;
     tl->ud = ud;
     zwlr_foreign_toplevel_manager_v1_add_listener(tl->mgr, &mgr_listener, tl);
+    /* bind the workspace annotator when advertised (compositors that
+     * predate it simply leave every task at ws = -2, unknown) */
+    if (c->wsi_global) {
+        tl->wsi = wl_registry_bind((struct wl_registry *)c->registry,
+                                   c->wsi_global,
+                                   &xw_workspace_info_v1_interface, 1);
+        if (tl->wsi)
+            c->wsi_global = 0; /* consumed */
+    }
     return tl;
 }
 
@@ -220,9 +267,13 @@ void xwc_tasklist_destroy(struct xwc_tasklist *tl) {
         struct xwc_task *next = task->next;
         if (task->handle)
             zwlr_foreign_toplevel_handle_v1_destroy(task->handle);
+        if (task->wsi)
+            xw_workspace_toplevel_v1_destroy(task->wsi);
         free(task);
         task = next;
     }
+    if (tl->wsi)
+        xw_workspace_info_v1_destroy(tl->wsi);
     if (tl->mgr)
         zwlr_foreign_toplevel_manager_v1_destroy(tl->mgr);
     free(tl);
@@ -248,6 +299,10 @@ bool xwc_task_active(struct xwc_task *task) { return task && task->active; }
 
 bool xwc_task_minimized(struct xwc_task *task) {
     return task && task->minimized;
+}
+
+int xwc_task_workspace(struct xwc_task *task) {
+    return task ? task->ws : -2;
 }
 
 void xwc_tasklist_activate(struct xwc_tasklist *tl, struct xwc_task *task) {

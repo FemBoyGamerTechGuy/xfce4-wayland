@@ -203,6 +203,76 @@ static void test_tasklist_client(struct xwt_ctx *t) {
     xwc_win_destroy(b);
 }
 
+
+/* xw-workspace-info-v1: every task is annotated with its workspace,
+ * moves arrive as events, sticky reports -1, and the annotation dies
+ * cleanly with the toplevel (the UAF guard for the pager's data). */
+static void test_tasklist_workspace(struct xwt_ctx *t) {
+    /* window mapped BEFORE the tasklist exists: the bind announces it
+     * and the annotation arrives right after */
+    struct xwc_win *a = xwt_window_solid(t, 0xff123456, 200, 100, "WsA");
+    XWT_ASSERT(a);
+
+    struct xwc_tasklist *tl =
+        xwc_tasklist_create(&t->client, tl_changed, NULL);
+    XWT_ASSERT(tl);
+    xwc_sync(&t->client);
+    XWT_WAIT(t, xwc_tasklist_first(tl) != NULL);
+    struct xwc_task *ka = xwc_tasklist_first(tl);
+    XWT_CHECK(strcmp(xwc_task_title(ka), "WsA") == 0, "tasklist sees WsA");
+
+    /* initial annotation = the window's current workspace (0) */
+    XWT_WAIT(t, xwc_task_workspace(ka) == 0);
+    XWT_CHECK(xwc_task_workspace(ka) == 0,
+              "initial workspace annotation is 0 (%d)",
+              xwc_task_workspace(ka));
+
+    /* server-side move: the event must reach the client */
+    struct xw_window *wa = t->comp->wm->focused;
+    XWT_ASSERT(wa && strcmp(wa->title, "WsA") == 0);
+    xw_wm_window_to_workspace(t->comp->wm, wa, 1);
+    XWT_WAIT(t, xwc_task_workspace(ka) == 1);
+    XWT_CHECK(xwc_task_workspace(ka) == 1, "move to ws 1 propagated (%d)",
+              xwc_task_workspace(ka));
+
+    /* sticky (-1) is pushed the same way */
+    wa->ws = -1;
+    xw_workspace_info_notify(t->comp, wa);
+    XWT_WAIT(t, xwc_task_workspace(ka) == -1);
+    XWT_CHECK(xwc_task_workspace(ka) == -1, "sticky reports -1");
+
+    /* a window mapped AFTER the tasklist binds is annotated too */
+    xw_wm_window_to_workspace(t->comp->wm, wa, 0);
+    struct xwc_win *b = xwt_window_solid(t, 0xff654321, 200, 100, "WsB");
+    XWT_ASSERT(b);
+    struct xwc_task *kb = NULL;
+    XWT_WAIT(t, (kb = xwc_task_next(xwc_tasklist_first(tl))) != NULL);
+    XWT_CHECK(strcmp(xwc_task_title(kb), "WsB") == 0, "late task tracked");
+    XWT_WAIT(t, xwc_task_workspace(kb) == 0);
+    XWT_CHECK(xwc_task_workspace(kb) == 0,
+              "late window annotated with its ws (%d)",
+              xwc_task_workspace(kb));
+
+    /* window gone: the toplevel closed event removes the task; the
+     * annotation must not outlive it (ASan watches this) */
+    xwc_win_destroy(a);
+    XWT_WAIT(t, xwc_tasklist_first(tl) && xwc_task_next(xwc_tasklist_first(tl)) == NULL);
+    XWT_CHECK(true, "annotation released with the closed toplevel");
+    xwc_win_destroy(b);
+    XWT_WAIT(t, xwc_tasklist_first(tl) == NULL);
+
+    /* keep the connection alive well past the closed events: the
+     * client's handle destructor requests must not kill the link (the
+     * "invalid object" regression — server-side destroy of a
+     * server-range id vs the client's legitimate destroy) */
+    for (int i = 0; i < 50 && !t->client_dead; i++) {
+        xwt_pump(t);
+        usleep(10000);
+    }
+    XWT_CHECK(!t->client_dead, "connection survives window teardown");
+    xwc_tasklist_destroy(tl);
+}
+
 static void test_workspaces_client(struct xwt_ctx *t) {
     struct xwc_wspaces *wl = xwc_wspaces_create(&t->client, ws_changed, NULL);
     XWT_ASSERT(wl);
@@ -1143,6 +1213,7 @@ static void test_compositor_without_panel(struct xwt_ctx *t) {
 
 static const struct xwt_test tests[] = {
     {"tasklist-client", test_tasklist_client},
+    {"tasklist-workspace", test_tasklist_workspace},
     {"workspace-client", test_workspaces_client},
     {"panel-maps", test_panel_maps},
     {"panel-clicks", test_panel_clicks},

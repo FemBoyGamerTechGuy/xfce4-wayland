@@ -432,6 +432,7 @@ struct xw_window {
 
     struct wl_list link;       /* wm.windows (management order) */
     struct wl_list stack_link; /* wm.stack — top at list head */
+    struct wl_list wsi_handles; /* xw_wsi_res.link (workspace annotation) */
 
     /* last configure sent */
     uint32_t last_serial;
@@ -634,6 +635,22 @@ void xw_ext_workspace_init(struct xw_compositor *c);
 void xw_ext_workspace_fin(struct xw_compositor *c);
 void xw_ext_workspace_changed(struct xw_compositor *c);
 
+/* ------------------------------------------------- xw workspace annotation */
+/* xw-workspace-info-v1: per-toplevel workspace events for panels and
+ * pagers (the wlr foreign toplevel protocol carries no workspace). */
+struct xw_wsi_res {
+    struct wl_resource *res; /* xw_workspace_toplevel_v1 */
+    struct xw_window *w;     /* NULL once the window is gone */
+    struct wl_list link;     /* window.wsi_handles */
+};
+void xw_workspace_info_init(struct xw_compositor *c);
+void xw_workspace_info_fin(struct xw_compositor *c);
+/* push w->ws (+done) to every annotation of the window */
+void xw_workspace_info_notify(struct xw_compositor *c, struct xw_window *w);
+/* the window is being destroyed: detach annotations (client proxies
+ * are released when their toplevel handles close) */
+void xw_workspace_info_window_gone(struct xw_compositor *c, struct xw_window *w);
+
 /* ------------------------------------------------------------- activation */
 void xw_activation_init(struct xw_compositor *c);
 void xw_activation_fin(struct xw_compositor *c);
@@ -742,6 +759,7 @@ struct xw_compositor {
     struct wl_list ddm_sources;   /* xw_data_source.link */
 
     struct wl_list ft_managers;      /* foreign toplevel managers */
+    struct wl_list wsi_managers;      /* xw workspace annotation managers */
     struct wl_list ws_managers;      /* ext workspace managers */
     struct wl_list activation_tokens; /* xw_activation_token.link */
 

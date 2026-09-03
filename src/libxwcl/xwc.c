@@ -157,6 +157,10 @@ static void registry_global(void *data, struct wl_registry *r, uint32_t name,
         /* same: xwc_wspaces_create binds on demand (1 group + N
          * workspace proxies arrive as new_id events on bind) */
         c->wsm_global = name;
+    } else if (strcmp(iface, "xw_workspace_info_v1") == 0) {
+        /* same pattern: the tasklist binds on demand and annotates its
+         * tasks with per-toplevel workspace events */
+        c->wsi_global = name;
     } else if (strcmp(iface, "ext_session_lock_manager_v1") == 0) {
         c->lock_mgr =
             wl_registry_bind(r, name, &ext_session_lock_manager_v1_interface,

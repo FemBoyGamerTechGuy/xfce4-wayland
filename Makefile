@@ -436,7 +436,8 @@ PROT_PAIRS := \
 	$(WP_DIR)/staging/ext-session-lock/ext-session-lock-v1.xml|ext-session-lock \
 	$(WP_DIR)/staging/ext-idle-notify/ext-idle-notify-v1.xml|ext-idle-notify \
 	protocols/wlr-layer-shell-unstable-v1.xml|wlr-layer-shell-unstable-v1 \
-	protocols/wlr-foreign-toplevel-management-unstable-v1.xml|wlr-foreign-toplevel-management-unstable-v1
+	protocols/wlr-foreign-toplevel-management-unstable-v1.xml|wlr-foreign-toplevel-management-unstable-v1 \
+	protocols/xw-workspace-info-v1.xml|xw-workspace-info-v1
 
 GEN := build/gen
 OBJ := build/obj
@@ -530,6 +531,7 @@ LIBXWCL_SRC := $(wildcard src/libxwcl/*.c)
 LIBXWCL_OBJ := $(patsubst src/libxwcl/%.c,$(OBJ)/libxwcl/%.o,$(LIBXWCL_SRC))
 
 LIBXWCL_PROTO := $(OBJ)/gen/xdg-shell-protocol.o \
+	$(OBJ)/gen/xw-workspace-info-v1-protocol.o \
 	$(OBJ)/gen/xdg-activation-protocol.o \
 	$(OBJ)/gen/wlr-layer-shell-unstable-v1-protocol.o \
 	$(OBJ)/gen/wlr-foreign-toplevel-management-unstable-v1-protocol.o \

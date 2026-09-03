@@ -794,6 +794,7 @@ static void xs_get_toplevel(struct wl_client *client, struct wl_resource *res,
     w->geo_x = -1;
     w->geo_y = -1;
     wl_list_init(&w->toplevel_handles);
+    wl_list_init(&w->wsi_handles);
     wl_resource_set_implementation(tl, &toplevel_impl, w,
                                    toplevel_resource_destroy);
     s->role = XW_SURFACE_ROLE_XDG_TOPLEVEL;

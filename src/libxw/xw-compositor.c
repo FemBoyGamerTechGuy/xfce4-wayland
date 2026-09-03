@@ -234,6 +234,7 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
     wl_list_init(&c->popups);
     wl_list_init(&c->ft_managers);
     wl_list_init(&c->ws_managers);
+    wl_list_init(&c->wsi_managers);
     wl_list_init(&c->activation_tokens);
 
     c->display = wl_display_create();
@@ -365,6 +366,7 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
     xw_idle_init(c);
     xw_foreign_toplevel_init(c);
     xw_ext_workspace_init(c);
+    xw_workspace_info_init(c);
     xw_activation_init(c);
     xw_data_device_init(c);
 
@@ -481,6 +483,7 @@ void xw_compositor_destroy(struct xw_compositor *c) {
     }
 
     xw_layer_shell_fin(c);
+    xw_workspace_info_fin(c);
     xw_session_lock_fin(c);
     xw_idle_fin(c);
     xw_activation_fin(c);

@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="xw_workspace_info_v1">
+  <copyright>
+    Copyright © 2026 the xfce4-wayland project
+
+    Permission to use, copy, modify, distribute, and sell this
+    software and its documentation for any purpose is hereby granted
+    without fee, provided that the above copyright notice appear in
+    all copies and that both that copyright notice and this permission
+    notice appear in supporting documentation, and that the name of
+    the copyright holders not be used in advertising or publicity
+    pertaining to distribution of the software without specific,
+    written prior permission.  The copyright holders make no
+    representations about the suitability of this software for any
+    purpose.  It is provided "as is" without express or implied
+    warranty.
+
+    THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
+    SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+    FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
+    AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+    ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+    THIS SOFTWARE.
+  </copyright>
+
+  <interface name="xw_workspace_info_v1" version="1">
+    <description summary="per-toplevel workspace annotation">
+      This companion protocol annotates zwlr_foreign_toplevel_handle_v1
+      objects with the workspace the compositor places them on. Panels
+      and pagers need it to draw a workspace-aware view of running
+      windows; the wlr foreign toplevel protocol itself carries no
+      workspace field, and ext-workspace does not assign toplevels.
+
+      The manager is read-only: workspaces are switched and windows
+      are moved with the established protocols (ext-workspace activate,
+      window manager rules). Binding an annotation costs one object per
+      tracked toplevel; unbinding the manager releases them all.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="release the manager">
+        Destroys the manager and every annotation object created from
+        it. The server side stops sending workspace events.
+      </description>
+    </request>
+
+    <request name="get_toplevel_workspace">
+      <description summary="annotate one toplevel">
+        Creates an annotation object for the given foreign toplevel
+        handle and immediately sends its current workspace, followed by
+        a done event. Later assignments emit workspace and done pairs.
+      </description>
+      <arg name="id" type="new_id" interface="xw_workspace_toplevel_v1"/>
+      <arg name="toplevel" type="object"
+           interface="zwlr_foreign_toplevel_handle_v1"/>
+    </request>
+  </interface>
+
+  <interface name="xw_workspace_toplevel_v1" version="1">
+    <description summary="workspace annotation of one toplevel">
+      Emits the workspace index of the annotated toplevel whenever the
+      compositor moves it. index is 0-based; -1 marks a sticky window
+      (present on every workspace).
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="stop tracking this toplevel">
+        After destroy, no further workspace events are sent for it.
+      </description>
+    </request>
+
+    <event name="workspace">
+      <arg name="index" type="int" summary="0-based workspace, -1 = sticky"/>
+    </event>
+
+    <event name="done">
+      <description summary="all events for the last change were sent">
+        Sent after the initial annotation and after each later
+        workspace event, so clients can coalesce relayouts.
+      </description>
+    </event>
+  </interface>
+</protocol>
