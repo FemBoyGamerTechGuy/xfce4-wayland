@@ -130,11 +130,21 @@ bool xw_seat_session_active(const struct xw_seat_session *s) {
     return s && s->active;
 }
 
-/* fire the registered callbacks (providers call these) */
+/* fire the registered callbacks (providers call these). disable with no
+ * registered callback acks immediately: the provider is still parked in
+ * a switch handoff (kernel VT_RELDISP wait / seatd DISABLE_SEAT) and a
+ * consumer-less disable must never wedge the console — the "trapped in
+ * the graphical session" failure mode. */
 static void seat_call_disable(struct xw_seat_session *s) {
     s->active = false;
-    if (s->events.disable)
+    if (s->events.disable) {
         s->events.disable(s->events_ud);
+        return;
+    }
+    xw_log(XW_LOG_INFO,
+           "seat: session disabled with no consumer registered — "
+           "acknowledging anyway so the VT switch completes");
+    xw_seat_session_ack_disable(s);
 }
 
 static void seat_call_enable(struct xw_seat_session *s) {
@@ -904,18 +914,27 @@ static int dr_switch_vt(struct xw_seat_session *s, int vt) {
 
 static int dr_ack_disable(struct xw_seat_session *s) {
     struct xw_seat_direct *d = dr_of(s);
-    /* permit the pending VT switch away */
+    /* permit the pending VT switch away — this ioctl is the ONLY thing
+     * standing between the user and the other VT (the kernel parked the
+     * switch when the release signal was delivered) */
     if (ioctl(d->tty_fd, VT_RELDISP, 1) < 0)
         xw_log(XW_LOG_WARN, "seat: direct: VT_RELDISP: %s", strerror(errno));
+    else
+        xw_log(XW_LOG_INFO, "seat: direct: VT release acknowledged "
+                            "(switch completes)");
     return 0;
 }
 
 /* kernel wants to switch away: notify the compositor (it drops DRM
- * master) — the compositor then acks via xw_seat_ack_disable */
+ * master) — the compositor then acks via xw_seat_ack_disable, which
+ * runs dr_ack_disable above (either from the DRM backend's disable
+ * callback or the consumer-less fallback in seat_call_disable) */
 static int dr_on_release(int sig, void *data) {
     (void)sig;
     struct xw_seat_direct *d = data;
-    xw_log(XW_LOG_INFO, "seat: direct: VT switch away requested (vt %d)",
+    xw_log(XW_LOG_INFO,
+           "seat: direct: VT switch away requested on vt %d "
+           "(Ctrl+Alt+Fn) — releasing the display, then acknowledging",
            d->vt_num);
     seat_call_disable(&d->base);
     return 0;
@@ -924,7 +943,7 @@ static int dr_on_release(int sig, void *data) {
 static int dr_on_acquire(int sig, void *data) {
     (void)sig;
     struct xw_seat_direct *d = data;
-    xw_log(XW_LOG_INFO, "seat: direct: our VT became active (vt %d)",
+    xw_log(XW_LOG_INFO, "seat: direct: our vt %d became active again",
            d->vt_num);
     ioctl(d->tty_fd, KDSETMODE, KD_GRAPHICS); /* may have been reset */
     seat_call_enable(&d->base);
@@ -1078,6 +1097,10 @@ static void seat_report_environment(void) {
 
 int xw_seat_session_ack_disable(struct xw_seat_session *s) {
     if (!s || !s->impl->ack_disable)
+        return 0;
+    /* a dead connection cannot carry the ack — nothing to hand the
+     * switch off to anymore (the provider logs why it died) */
+    if (s->dead)
         return 0;
     return s->impl->ack_disable(s);
 }

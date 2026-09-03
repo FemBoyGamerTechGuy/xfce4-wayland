@@ -688,7 +688,8 @@ struct xw_compositor {
     bool running;
     int exit_code;
 
-    struct wl_event_source *sigint_src, *sigterm_src, *sigchld_src;
+    struct wl_event_source *sigint_src, *sigterm_src, *sigchld_src,
+        *sighup_src;
     pid_t children[XW_MAX_CHILDREN];
     int n_children;
 

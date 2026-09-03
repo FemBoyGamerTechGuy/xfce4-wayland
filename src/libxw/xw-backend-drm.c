@@ -501,8 +501,17 @@ static int db_stats_timer_cb(void *data) {
 
 /* ------------------------------------------------------- session lifecycle */
 
-/* The seat session is going inactive: release scanout resources. The
- * caller (seat module) sends the disable ack after this returns. */
+/* The seat session is going inactive: release scanout resources NOW,
+ * then acknowledge the disable. The ack is what un-blocks the VT
+ * switch: with the direct provider the kernel sits in VT_RELDISP wait
+ * from the moment the user pressed Ctrl+Alt+Fn; with the seatd client
+ * the daemon holds its own VT handoff for the DISABLE_SEAT ack; with
+ * libseat the library expects libseat_disable_seat(). Skipping the ack
+ * (the state this code was in for the whole v0 cycle) parks the
+ * console mid-switch — Ctrl+Alt+F1..F12 appears dead and the user is
+ * trapped in the graphical session. This callback is synchronous and
+ * MUST stay synchronous: the ack has to reach the provider before the
+ * release signal handler returns to the event loop. */
 static void db_session_disable(void *ud) {
     struct drm_backend *db = ud;
     xw_log(XW_LOG_INFO, "drm: session inactive: dropping DRM master");
@@ -515,6 +524,12 @@ static void db_session_disable(void *ud) {
         drmDropMaster(db->drm_fd);
         db->master = false;
     }
+    /* the completion the seat provider is waiting for (VT_RELDISP /
+     * DISABLE_SEAT ack / libseat_disable_seat) — logged by the
+     * provider, one line, so the whole switch chain reads from the
+     * log: release requested -> resources dropped -> ack -> switch */
+    if (db->seat)
+        xw_seat_session_ack_disable(db->seat);
 }
 
 /* session active again: re-take master, repaint everything (another VT

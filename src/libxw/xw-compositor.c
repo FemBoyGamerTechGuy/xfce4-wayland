@@ -244,11 +244,19 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
     /* arm signals as early as possible: a TERM arriving during the rest
      * of create (backend handshake, shell setup) must still lead to a
      * clean exit instead of killing the process with the default
-     * disposition */
+     * disposition. SIGHUP is in the set for the real-session case: the
+     * controlling terminal going away (shell exited, agetty recycled
+     * the login) must run the FULL teardown — the direct seat provider
+     * restores KDSETMODE/VT_SETMODE/termios in its destroy path, and
+     * dying with SIGHUP's default disposition would leave the VT in
+     * graphics mode holding a dead owner (the trapped-console failure
+     * mode). */
     c->sigint_src = wl_event_loop_add_signal(c->loop, SIGINT, on_signal, c);
     c->sigterm_src = wl_event_loop_add_signal(c->loop, SIGTERM, on_signal, c);
+    c->sighup_src = wl_event_loop_add_signal(c->loop, SIGHUP, on_signal, c);
     c->sigchld_src = wl_event_loop_add_signal(c->loop, SIGCHLD, reap_children, c);
-    if (!c->sigint_src || !c->sigterm_src || !c->sigchld_src)
+    if (!c->sigint_src || !c->sigterm_src || !c->sighup_src ||
+        !c->sigchld_src)
         goto fail;
 
     if (wl_display_init_shm(c->display) < 0) {
@@ -438,6 +446,8 @@ void xw_compositor_destroy(struct xw_compositor *c) {
         wl_event_source_remove(c->sigint_src);
     if (c->sigterm_src)
         wl_event_source_remove(c->sigterm_src);
+    if (c->sighup_src)
+        wl_event_source_remove(c->sighup_src);
     if (c->sigchld_src)
         wl_event_source_remove(c->sigchld_src);
     if (c->repaint_idle)

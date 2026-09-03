@@ -12,12 +12,15 @@
  */
 #include "xw-internal.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#include <xkbcommon/xkbcommon-names.h>
 
 /* XFCE defaults: 500 ms delay, 30 repeats per second */
 #define XW_REPEAT_DELAY_DEFAULT_MS 500
@@ -483,6 +486,52 @@ static int interactive_repeat_cb(void *data) {
     return 0;
 }
 
+/* --------------------------------------------- VT switch keys (safety) */
+
+/* Ctrl+Alt+F1..F12 switches the virtual terminal. The kernel performs
+ * this itself while the console keyboard is in translated mode, but a
+ * compositor that consumes physical input is the more reliable owner
+ * of the combo (weston does the same in its DRM backend): with the
+ * direct provider the switch runs through our own VT_ACTIVATE; with
+ * seatd/elogind through the seat manager's session-switch call. It
+ * runs BEFORE the session-lock gate on purpose: VT switching is a
+ * system-level escape that every desktop honors even on a locked
+ * screen (the target VT's own login security applies there).
+ * Only the DRM backend has a seat session, so headless/nested tests
+ * and clients never see this path. */
+static bool seat_vt_switch_key(struct xw_seat *s, uint32_t keycode,
+                                bool down) {
+    if (!down || !s->comp->seat || !s->xkb_state)
+        return false;
+    static const struct {
+        uint32_t code;
+        int vt;
+    } vt_keys[] = {
+        {59, 1},  {60, 2},  {61, 3},  {62, 4},  {63, 5},  {64, 6},
+        {65, 7},  {66, 8},  {67, 9},  {68, 10}, {87, 11}, {88, 12},
+    };
+    int vt = 0;
+    for (size_t i = 0; i < sizeof(vt_keys) / sizeof(vt_keys[0]); i++) {
+        if (vt_keys[i].code == keycode) {
+            vt = vt_keys[i].vt;
+            break;
+        }
+    }
+    if (!vt)
+        return false;
+    if (!xkb_state_mod_name_is_active(s->xkb_state, XKB_MOD_NAME_CTRL,
+                                      XKB_STATE_MODS_DEPRESSED) ||
+        !xkb_state_mod_name_is_active(s->xkb_state, XKB_MOD_NAME_ALT,
+                                      XKB_STATE_MODS_DEPRESSED))
+        return false;
+    xw_log(XW_LOG_INFO, "seat: Ctrl+Alt+F%d -> requesting VT %d switch",
+           vt, vt);
+    if (xw_seat_session_switch_vt(s->comp->seat, vt) < 0)
+        xw_log(XW_LOG_WARN, "seat: VT %d switch request failed: %s", vt,
+               strerror(errno));
+    return true;
+}
+
 void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
     if (!s->xkb_state)
         return;
@@ -495,6 +544,15 @@ void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
     xw_idle_activity(s);
 
     uint32_t time = (uint32_t)xw_now_ms();
+
+    /* 0. VT switch keys (Ctrl+Alt+Fn, DRM backend only): consumed like
+     * a shortcut; the release is suppressed by the shared consumed-key
+     * handling below (a client never sees the press, so it must never
+     * see the release either) */
+    if (seat_vt_switch_key(s, keycode, down)) {
+        mark_consumed(s, keycode, true);
+        return;
+    }
 
     /* session lock: input goes ONLY to the focused lock surface — no
      * shortcuts, no interactive move/resize (security gate). The

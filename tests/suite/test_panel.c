@@ -586,6 +586,91 @@ static void test_panel_launcher(struct xwt_ctx *t) {
     close(lfd);
 }
 
+/* ------------------------------------------------------------------ */
+/* Start-button robustness: the user report behind this suite —
+ * "Start does nothing; clicking it repeatedly crashes xw-panel".
+ * Reproduced here as rapid repeated activation with a live fake
+ * session-manager ctl socket (each click = one blocking ctl round
+ * trip inside the panel's Wayland dispatch). */
+
+/* service one pending ctl connection: read the line, reply ok */
+static int ctl_service_one(int lfd, char *line, size_t line_n) {
+    struct pollfd pfd = {.fd = lfd, .events = POLLIN};
+    if (poll(&pfd, 1, 0) != 1)
+        return 0;
+    int cfd = accept(lfd, NULL, NULL);
+    if (cfd < 0)
+        return 0;
+    ssize_t n = read(cfd, line, line_n - 1);
+    int handled = 0;
+    if (n > 0) {
+        line[n] = 0;
+        char *nl = strchr(line, '\n');
+        if (nl)
+            *nl = 0;
+        dprintf(cfd, "ok spawned\n");
+        handled = 1;
+    }
+    shutdown(cfd, SHUT_WR);
+    close(cfd);
+    return handled;
+}
+
+static void test_panel_start_repeated(struct xwt_ctx *t) {
+    char ctl_path[192];
+    snprintf(ctl_path, sizeof(ctl_path), "%s/xw-session.sock",
+             g_runtimedir());
+    unlink(ctl_path);
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    int ncpy = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", ctl_path);
+    XWT_ASSERT(ncpy >= 0 && (size_t)ncpy < sizeof(addr.sun_path));
+    XWT_ASSERT(bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    XWT_ASSERT(listen(lfd, 16) == 0);
+    int fl = fcntl(lfd, F_GETFL, 0);
+    fcntl(lfd, F_SETFL, fl | O_NONBLOCK);
+
+    setenv("XW_TERMINAL", "/bin/true", 1); /* inherited by the panel */
+    pid_t pid = spawn_panel(t, "-start-rep");
+    unsetenv("XW_TERMINAL");
+    XWT_ASSERT(pid > 0);
+    PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
+
+    /* rapid-fire 40 press/release cycles on the launcher (x=3..39);
+     * the panel queues the clicks and services each ctl round trip as
+     * fast as the fake session manager replies */
+    xw_compositor_inject_pointer_motion(t->comp, 20, 14);
+    pump_ms(t, 60);
+    int handled = 0;
+    char line[128];
+    for (int round = 0; round < 40; round++) {
+        xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+        xwt_pump(t);
+        xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+        /* let the panel process the click + complete its ctl round
+         * trip before the next one lands (the real session manager
+         * replies within its 500ms poll cycle) */
+        for (int i = 0; i < 120; i++) {
+            xwt_pump(t);
+            handled += ctl_service_one(lfd, line, sizeof(line));
+            usleep(5000);
+        }
+        /* still alive at every round: a crash mid-sequence must fail
+         * here with the round number, not at the end */
+        if (kill(pid, 0) != 0) {
+            XWT_CHECK(false, "panel died during round %d of 40", round);
+            break;
+        }
+    }
+    XWT_CHECK(kill(pid, 0) == 0, "panel alive after 40 rapid Start clicks");
+    XWT_CHECK(handled >= 1, "ctl lines were exchanged (%d)", handled);
+
+    reap(&pid);
+    unlink(ctl_path);
+    close(lfd);
+}
+
 /* v0 documented behavior: the clock is display-only — a click neither
  * crashes the panel nor fires any session action */
 static void test_panel_clock_click(struct xwt_ctx *t) {
@@ -781,6 +866,7 @@ static const struct xwt_test tests[] = {
     {"panel-pointer-focus", test_panel_pointer_focus},
     {"late-pointer-enter-replay", test_late_pointer_enter_replay},
     {"panel-launcher", test_panel_launcher},
+    {"panel-start-repeated", test_panel_start_repeated},
     {"panel-clock-click", test_panel_clock_click},
     {"layer-before-outputs", test_layer_before_outputs},
     {"compositor-without-panel", test_compositor_without_panel},

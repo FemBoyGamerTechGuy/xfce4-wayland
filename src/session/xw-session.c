@@ -29,11 +29,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+
+#include <linux/kd.h>
+#include <linux/vt.h>
 
 #include "xw-power.h"
 #include <sys/wait.h>
@@ -212,10 +216,89 @@ static const char *resolve_backend(bool *fatal_on_fail) {
 /* -------------------------------------------------------------- utils */
 
 static void on_signal(int sig) {
-    if (sig == SIGINT || sig == SIGTERM)
+    /* SIGINT (Ctrl+C on the launching TTY), SIGTERM (shutdown paths)
+     * and SIGHUP (controlling terminal gone: shell exited, login
+     * recycled) all end the session CLEANLY — the default SIGHUP
+     * disposition would kill this manager instantly and leave the
+     * compositor orphaned on a graphics-mode console (user trapped). */
+    if (sig == SIGINT || sig == SIGTERM || sig == SIGHUP)
         g_terminate = 1;
     if (sig == SIGCHLD)
         g_child_event = 1;
+}
+
+/* install the signal dispositions explicitly (no SA_RESTART: the
+ * main-loop poll() must return EINTR the moment a termination signal
+ * lands, not sleep out its 500ms quantum) */
+static void install_signals(void) {
+    struct sigaction sa = {0};
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+    sigaction(SIGCHLD, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+}
+
+/* Emergency console restoration after a compositor CRASH (exit by
+ * signal). A crashed compositor never ran its seat teardown, so a
+ * direct-VT session leaves the console in KD_GRAPHICS (and possibly
+ * VT_PROCESS with a dead owner) — a black screen that looks like a
+ * bricked machine. The compositor's own clean-exit path restores the
+ * terminal (seat provider destroy); this is the net under it. Best
+ * effort by design: only touches /dev/tty when it is really a VT, and
+ * every step is logged so a failed restore is visible, not silent.
+ * KDSETMODE(KD_TEXT) is safe under every seat provider (a next
+ * compositor re-requests graphics mode); VT_SETMODE(VT_AUTO) is only
+ * applied when the session is ending — re-arming a live seatd/logind
+ * VT handoff would fight the seat manager. */
+static void restore_console_after_crash(void) {
+    int tty = open("/dev/tty", O_RDWR | O_CLOEXEC | O_NOCTTY);
+    if (tty < 0) {
+        log_msg("warn", "console restore: cannot open /dev/tty (%s) — "
+                        "if the screen stays black, switch VTs "
+                        "(Ctrl+Alt+F2..) or reboot",
+                strerror(errno));
+        return;
+    }
+    struct vt_stat vts;
+    if (ioctl(tty, VT_GETSTATE, &vts) < 0) {
+        /* not a virtual terminal (container, serial console) — nothing
+         * a compositor could have left in graphics mode */
+        close(tty);
+        return;
+    }
+    int kd = 0;
+    bool kd_changed = false;
+    if (ioctl(tty, KDGETMODE, &kd) == 0 && kd != KD_TEXT) {
+        if (ioctl(tty, KDSETMODE, KD_TEXT) == 0) {
+            kd_changed = true;
+            log_msg("info", "console restore: vt %d back in text mode "
+                            "(the compositor crashed in graphics mode)",
+                    vts.v_active);
+        } else {
+            log_msg("warn", "console restore: KDSETMODE(KD_TEXT) failed: %s",
+                    strerror(errno));
+        }
+    }
+    struct vt_mode vm;
+    if (ioctl(tty, VT_GETMODE, &vm) == 0 && vm.mode == VT_PROCESS &&
+        !S.restarting) {
+        struct vt_mode auto_mode = {.mode = VT_AUTO, .waitv = 0,
+                                    .relsig = 0, .acqsig = 0, .frsig = 0};
+        if (ioctl(tty, VT_SETMODE, &auto_mode) == 0)
+            log_msg("info", "console restore: VT ownership released "
+                            "(the crashed compositor never ran its seat "
+                            "teardown)");
+        else
+            log_msg("warn", "console restore: VT_SETMODE(VT_AUTO) failed: %s",
+                    strerror(errno));
+    }
+    if (kd_changed)
+        (void)!write(tty, "\r\n[xfce4-wayland] session manager restored "
+                          "the console after a compositor crash\r\n", 63);
+    close(tty);
 }
 
 static void log_msg(const char *level, const char *fmt, ...) {
@@ -1336,10 +1419,8 @@ int main(int argc, char **argv) {
     snprintf(S.runtime_dir, sizeof(S.runtime_dir), "%s", rtd);
     snprintf(S.ctl_path, sizeof(S.ctl_path), "%s/%s.sock", rtd, ctl_name);
 
-    signal(SIGINT, on_signal);
-    signal(SIGTERM, on_signal);
-    signal(SIGCHLD, on_signal);
     signal(SIGPIPE, SIG_IGN);
+    install_signals();
 
     /* 1. session d-bus — before the compositor, so every session child
      *    (compositor included) inherits $DBUS_SESSION_BUS_ADDRESS. A
@@ -1392,6 +1473,12 @@ int main(int argc, char **argv) {
                     S.comp_ready = false;
                     int64_t secs =
                         (now_ms() - S.comp_started_ms + 500) / 1000;
+                    if (WIFSIGNALED(status)) {
+                        /* crashed: no clean seat teardown ran — put the
+                         * console back before anything else (black
+                         * screen vs. visible log text) */
+                        restore_console_after_crash();
+                    }
                     if (S.shutting_down) {
                         /* expected during teardown */
                         log_msg("info", "compositor exited during shutdown "
