@@ -37,7 +37,8 @@
 #include <xkbcommon/xkbcommon-keysyms.h>
 
 #include "panel-menu.h"   /* pm_menu_*: the Start menu module */
-#include "panel-pager.h"  /* pm_pager_*: the workspace pager */
+#include "panel-pager.h"   /* pm_pager_*: the workspace pager */
+#include "panel-taskbar.h" /* pm_taskover_*: the overflow list */
 
 /* ------------------------------------------------------------------ */
 /* Terminal resolution for the no-applications fallback — the shared
@@ -214,6 +215,7 @@ static void layout(struct panel *p) {
             task_w = 240;
     }
     int n_shown = 0;
+    p->n_tasks_shown = 0;
     for (struct xwc_task *t = task; t && n_btns < MAX_BTNS; t = xwc_task_next(t)) {
         if (task_w < 44) {
             /* center too narrow: show only as many as fit icon-only,
@@ -241,6 +243,7 @@ static void layout(struct panel *p) {
         x += task_w + gap;
         n_shown++;
     }
+    p->n_tasks_shown = n_shown;
     if (n_shown < n_tasks && n_btns < MAX_BTNS) {
         /* overflow indicator */
         struct btn *b = &btns[n_btns++];
@@ -350,8 +353,12 @@ static void draw_btn(struct panel *p, uint32_t *pix, int stride, int bw,
         const char *in = NULL;
         if (app)
             in = app->icon[0] ? app->icon : app->desktop_id;
-        else if (b->kind == BTN_TASK)
-            in = xwc_task_app_id((struct xwc_task *)b->data);
+        else if (b->kind == BTN_TASK) {
+            const char *aid = xwc_task_app_id((struct xwc_task *)b->data);
+            const struct xwapp *ta =
+                aid && *aid ? xwapp_by_id(&p->apps, aid) : NULL;
+            in = ta ? (ta->icon[0] ? ta->icon : ta->desktop_id) : aid;
+        }
         const struct xwc_icon *ic =
             (in && *in && p->cfg.menu_icons) ? xwc_icon_get(in, icon) : NULL;
         if (ic) {
@@ -534,10 +541,24 @@ static void on_button(struct xwc_win *win, uint32_t button, bool down, int x,
         }
         break;
     case BTN_TASK:
-        if (button == BTN_MIDDLE || button == BTN_RIGHT)
+        if (button == BTN_MIDDLE || button == BTN_RIGHT) {
             xwc_tasklist_close(p->tl, b->data);
-        else if (button == BTN_LEFT)
-            xwc_tasklist_activate(p->tl, b->data);
+        } else if (button == BTN_LEFT) {
+            /* XFCE tasklist default: clicking the focused window's
+             * button minimizes it; clicking anything else focuses
+             * (and restores) that window */
+            struct xwc_task *tk = b->data;
+            if (xwc_task_active(tk) && !xwc_task_minimized(tk)) {
+                trace_log("activate action=task minimize");
+                xwc_tasklist_minimize(p->tl, tk);
+            } else {
+                xwc_tasklist_activate(p->tl, tk);
+            }
+        }
+        break;
+    case BTN_TASKOVER:
+        if (button == BTN_LEFT)
+            pm_taskover_toggle(p, b->x, 0, b->w, p->m.H, p->n_tasks_shown);
         break;
     case BTN_CLOCK:
         if (button == BTN_LEFT)
@@ -732,6 +753,7 @@ int main(int argc, char **argv) {
      * connection teardown */
     pm_menu_shutdown(&p);
     pm_clock_shutdown(&p);
+    pm_taskover_shutdown(&p);
     xwc_layer_destroy(p.layer);
     xwc_tasklist_destroy(p.tl);
     xwc_wspaces_destroy(p.wsp);

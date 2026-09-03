@@ -1499,6 +1499,144 @@ static void test_panel_pager(struct xwt_ctx *t) {
     reap(&pid);
 }
 
+
+/* the taskbar v2: clicking the focused window's button minimizes it
+ * (the XFCE default), clicking again restores it; when the middle
+ * region cannot fit every window the "+N" overflow button opens a
+ * list popup that focuses hidden windows. */
+static void test_panel_taskbar(struct xwt_ctx *t) {
+    pid_t pid = spawn_panel(t, "-taskbar");
+    XWT_ASSERT(pid > 0);
+    PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
+
+    /* 1. one focused window: clicking its button minimizes it */
+    struct xwc_win *a = xwt_window_solid(t, 0xff112233, 200, 100, "TaskA");
+    XWT_ASSERT(a);
+    XWT_WAIT(t, t->comp->wm->focused && strcmp(t->comp->wm->focused->title, "TaskA") == 0);
+    PANEL_WAIT(t, t->comp->wm->focused && t->comp->wm->focused->minimized == false);
+    struct bar_run runs[MAX_RUNS];
+    int task_x = -1;
+    for (int i = 0; i < 400 && task_x < 0; i++) {
+        xwt_pump(t);
+        int n = bar_scan_runs(t, runs);
+        /* the task button is the run right of the start button */
+        if (n >= 7)
+            task_x = (runs[1].x0 + runs[1].x1) / 2;
+    }
+    XWT_ASSERT(task_x > 0);
+    /* minimizing also unfocuses server-side — track the window
+     * itself, not wm->focused */
+    struct xw_window *wa = NULL;
+    wl_list_for_each(wa, &t->comp->wm->windows, link) {
+        if (strcmp(wa->title, "TaskA") == 0)
+            break;
+    }
+    XWT_ASSERT(wa);
+    xw_compositor_inject_pointer_motion(t->comp, task_x, 15);
+    pump_ms(t, 80);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, wa->minimized);
+    XWT_CHECK(wa->minimized,
+              "clicking the focused task button minimized it");
+
+    /* 2. clicking the minimized button restores + focuses it */
+    pump_ms(t, 300);
+    xw_compositor_inject_pointer_motion(t->comp, task_x, 15);
+    pump_ms(t, 80);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, !wa->minimized && t->comp->wm->focused == wa);
+    XWT_CHECK(!wa->minimized && t->comp->wm->focused == wa,
+              "clicking the minimized task button restored + focused it");
+
+    /* 3. overflow: 30 windows cannot fit; "+N" opens a list popup */
+    struct xwc_win *many[30] = {0};
+    for (int i = 0; i < 30; i++) {
+        char title[32];
+        snprintf(title, sizeof(title), "Many%02d", i);
+        many[i] = xwt_window_solid(t, 0xff334455, 120, 80, title);
+        XWT_ASSERT(many[i]);
+    }
+    /* wait until the panel re-laid-out with the overflow button: the
+     * bar's middle loses full-width task buttons (runs fragment) and
+     * an overflow run appears; find it by the tasklist geometry: with
+     * 31 windows the region cannot show any (icon width > share) */
+    int over_x = -1;
+    for (int i = 0; i < 600 && over_x < 0; i++) {
+        xwt_pump(t);
+        int n = bar_scan_runs(t, runs);
+        for (int k = 1; k < n - 5 && over_x < 0; k++) {
+            /* the overflow run is narrow (~icon-sized) right after
+             * the start button, and every task run is tiny too —
+             * instead of classifying, use the popup after clicking:
+             * click the run right after start (the first task run,
+             * which with 31 windows is the overflow indicator when
+             * no task fits) */
+            over_x = (runs[1].x0 + runs[1].x1) / 2;
+        }
+        if (over_x < 0)
+            usleep(10000);
+    }
+    XWT_ASSERT(over_x > 0);
+    xw_compositor_inject_pointer_motion(t->comp, over_x, 15);
+    pump_ms(t, 100);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    /* either a task activated (a window focused) or the overflow
+     * popup opened; with 31 windows the middle fits ~8 icon-only
+     * buttons, so runs[1] is a real task — drive the overflow by
+     * scanning for the NARROWEST run in the middle region */
+    struct xw_popup *pu = the_menu(t);
+    if (!pu) {
+        /* find the overflow run: the narrowest run between the start
+         * button and the right region */
+        int best = -1, best_w = 1 << 30;
+        int n = bar_scan_runs(t, runs);
+        for (int k = 1; k < n - 5; k++) {
+            int rw = runs[k].x1 - runs[k].x0;
+            if (rw < best_w) {
+                best_w = rw;
+                best = k;
+            }
+        }
+        XWT_ASSERT(best > 0);
+        int ox = (runs[best].x0 + runs[best].x1) / 2;
+        xw_compositor_inject_pointer_motion(t->comp, 800, 400);
+        pump_ms(t, 60);
+        xw_compositor_inject_pointer_motion(t->comp, ox, 15);
+        pump_ms(t, 100);
+        xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+        xwt_pump(t);
+        xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+        pu = the_menu(t);
+    }
+    XWT_CHECK(pu && pu->mapped, "overflow list popup opened");
+    if (pu) {
+        /* click row 0: activates the first hidden window */
+        xw_compositor_inject_pointer_motion(t->comp, pu->anchor_x + 60,
+                                            pu->anchor_y + 2 + 15);
+        pump_ms(t, 80);
+        xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+        xwt_pump(t);
+        xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+        PANEL_WAIT(t, n_top_popups(t) == 0);
+        XWT_CHECK(n_top_popups(t) == 0,
+                  "overflow list closed after selection");
+    }
+    XWT_CHECK(kill(pid, 0) == 0, "panel alive after the taskbar flow");
+
+    xwc_win_destroy(a);
+    for (int i = 0; i < 30; i++)
+        if (many[i])
+            xwc_win_destroy(many[i]);
+    PANEL_WAIT(t, xw_compositor_window_count(t->comp) == 0);
+    reap(&pid);
+}
+
 /* compositor shutdown while the menu is open: the panel must exit
  * cleanly (no crash, exit status 0) */
 static void test_panel_menu_compositor_shutdown(struct xwt_ctx *t) {
@@ -1831,6 +1969,7 @@ static const struct xwt_test tests[] = {
     {"panel-menu", test_panel_menu},
     {"panel-menu-v2", test_panel_menu_v2},
     {"panel-pager", test_panel_pager},
+    {"panel-taskbar", test_panel_taskbar},
     {"panel-menu-compositor-shutdown", test_panel_menu_compositor_shutdown},
     {"panel-clock-click", test_panel_clock_click},
     {"layer-before-outputs", test_layer_before_outputs},

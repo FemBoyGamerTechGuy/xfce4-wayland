@@ -96,6 +96,7 @@ struct panel {
     int x_start, w_start; /* start button + launchers */
     int x_tasks, w_tasks; /* taskbar (consumes the free middle) */
     int x_right, w_right; /* pager | clock | exit block, right-aligned */
+    int n_tasks_shown;    /* visible task buttons; the rest overflow */
 
     char clock[48];    /* formatted clock string */
     int bar_w, bar_h;  /* current surface geometry */

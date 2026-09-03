@@ -319,6 +319,12 @@ void xwc_tasklist_close(struct xwc_tasklist *tl, struct xwc_task *task) {
         zwlr_foreign_toplevel_handle_v1_close(task->handle);
 }
 
+void xwc_tasklist_minimize(struct xwc_tasklist *tl, struct xwc_task *task) {
+    (void)tl;
+    if (task && task->handle)
+        zwlr_foreign_toplevel_handle_v1_set_minimized(task->handle);
+}
+
 /* ---------------------------------------------------------- workspaces */
 
 struct xwc_ws {

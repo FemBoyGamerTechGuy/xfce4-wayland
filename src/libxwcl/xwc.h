@@ -208,8 +208,9 @@ bool xwc_task_minimized(struct xwc_task *task);
  * -2 = unknown (compositor without the protocol, or before the first
  * event). The pager treats -2 as "show on the current workspace". */
 int xwc_task_workspace(struct xwc_task *task);
-/* requests: focus (+ un-minimize) / close the window */
+/* requests: focus (+ un-minimize) / minimize / close the window */
 void xwc_tasklist_activate(struct xwc_tasklist *tl, struct xwc_task *task);
+void xwc_tasklist_minimize(struct xwc_tasklist *tl, struct xwc_task *task);
 void xwc_tasklist_close(struct xwc_tasklist *tl, struct xwc_task *task);
 
 /* ----------------------------------------- workspaces (ext-workspace) */
