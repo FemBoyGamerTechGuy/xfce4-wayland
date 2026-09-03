@@ -16,6 +16,8 @@
 #include "ext-session-lock-protocol.h"
 #include "ext-idle-notify-protocol.h"
 #include "wlr-foreign-toplevel-management-unstable-v1-protocol.h"
+#include "xwayland-shell-protocol.h"
+#include "xw-window-control-v1-protocol.h"
 
 #define XW_MAX_WS 12
 #define XW_MAX_WINDOWS 512
@@ -62,6 +64,8 @@ enum xw_surface_role {
     XW_SURFACE_ROLE_XDG_POPUP,
     XW_SURFACE_ROLE_LAYER,
     XW_SURFACE_ROLE_SESSION_LOCK,
+    XW_SURFACE_ROLE_SUBSURFACE,
+    XW_SURFACE_ROLE_XWAYLAND,
 };
 
 struct xw_surface {
@@ -78,6 +82,15 @@ struct xw_surface {
     int buf_w, buf_h;               /* committed buffer size */
     int scale;                      /* wl_surface.set_buffer_scale */
 
+    /* committed buffer ownership: the wl_buffer resource currently
+     * referenced by this surface. Released (wl_buffer.release) when a
+     * commit replaces it — clients rotating 2+ buffers stall forever
+     * without release events (foot/GTK/XWayland double-buffering).
+     * A destroy listener keeps the pointer valid if the client destroys
+     * the buffer first. */
+    struct wl_resource *committed_buffer;
+    struct wl_listener committed_buffer_destroy;
+
     /* pending state */
     struct wl_resource *pending_buffer;
     pixman_region16_t pending_damage;
@@ -85,10 +98,17 @@ struct xw_surface {
     pixman_region16_t input;        /* surface-local; empty = whole surface */
     bool input_set;
 
+    /* this surface is a wl_pointer cursor image (set via set_cursor) */
+    bool is_cursor;
+
     struct wl_list frames;          /* xw_frame.link */
 
     struct wl_resource *xdg_surface_res; /* role objects */
-    void *role_data;                /* xw_window / xw_popup / xw_layer_surface */
+    void *role_data;                /* xw_window / xw_popup / xw_layer_surface /
+                                       xw_subsurface */
+
+    /* subsurface children (role != SUBSURFACE keeps this empty) */
+    struct wl_list subsurfaces;     /* xw_subsurface.parent_link */
 
     bool mapped;                    /* role-specific map state */
     bool pending_config;            /* configure sent, awaiting ack+commit */
@@ -322,6 +342,12 @@ struct xw_seat {
     uint32_t serial;            /* input event serial */
     int32_t cursor_x, cursor_y;
 
+    /* client cursor (wl_pointer.set_cursor): the surface carrying the
+     * cursor image + hotspot. NULL → default arrow. Rendered by the
+     * software cursor path at (cursor_x - hot_x, cursor_y - hot_y). */
+    struct xw_surface *cursor_surface;
+    int cursor_hot_x, cursor_hot_y;
+
     /* key repeat (see xw.h struct xw_compositor_config): advertised to
      * clients via wl_keyboard.repeat_info; the server-side timer
      * repeats only keys consumed by interactive keyboard move/resize
@@ -394,6 +420,9 @@ void xw_seat_repointer(struct xw_compositor *c);
  * (ptr_focus/grab/kb-focus/drag origin); called by the surface destroy
  * path — leaving any of them set is a use-after-free */
 void xw_seat_forget_surface(struct xw_compositor *c, struct xw_surface *s);
+/* damage the current cursor image's extent on every output (motion,
+ * cursor swaps, cursor surface teardown) */
+void xw_seat_damage_cursor(struct xw_compositor *c);
 
 /* ------------------------------------------------------------ wm/window */
 struct xw_rect { int x, y, w, h; };
@@ -457,6 +486,12 @@ struct xw_window {
     } inter;
 
     struct wl_list toplevel_handles; /* xw_foreign_toplevel_res.link */
+
+    /* xwayland_surface_v1 serial: correlates this window with the X11
+     * window inside Xwayland (both sides receive the same value); the
+     * session's WM helper uses it to mirror geometry and deliver closes */
+    uint64_t xw_serial;
+    bool xw_has_serial;
 };
 
 enum { XW_EDGE_L = 1, XW_EDGE_R = 2, XW_EDGE_T = 4, XW_EDGE_B = 8 };
@@ -691,6 +726,69 @@ struct xw_popup {
 void xw_popup_reposition(struct xw_popup *p);
 void xw_popup_dismiss(struct xw_popup *p);
 
+/* -------------------------------------------------------- subcompositor */
+/* wl_subcompositor / wl_subsurface. Subsurfaces are wl_surface children
+ * of a parent wl_surface (window/popup/layer or another subsurface),
+ * positioned at (x, y) relative to the parent, stacked above or below
+ * the parent's own buffer by place_above/place_below. synced subsurfaces
+ * apply their state at the parent's next commit (we approximate the
+ * spec's atomicity by gating DAMAGE on the parent commit); desynced ones
+ * apply immediately. */
+struct xw_subsurface {
+    struct xw_compositor *comp;
+    struct xw_surface *surface;   /* the child surface (role SUBSURFACE) */
+    struct xw_surface *parent;    /* owner of the children list */
+    struct wl_resource *res;      /* wl_subsurface */
+    int x, y;                     /* committed position, parent-relative */
+    int pending_x, pending_y;
+    bool synced;                  /* default per spec */
+    bool below_parent;            /* stacked under the parent's buffer */
+    bool has_pending;             /* child committed while synced */
+    struct wl_list parent_link;   /* parent->subsurfaces (order = stacking,
+                                     tail = topmost) */
+    struct wl_list link;          /* comp->subsurfaces (global registry) */
+};
+
+void xw_subcompositor_init(struct xw_compositor *c);
+void xw_subcompositor_fin(struct xw_compositor *c);
+/* the parent committed: apply+damage synced children */
+void xw_subsurface_parent_committed(struct xw_surface *parent);
+/* the parent is being destroyed: unrole+damage all children */
+void xw_subsurface_parent_destroyed(struct xw_surface *parent);
+/* the seat needs to forget a dying cursor/subsurface reference */
+void xw_seat_forget_cursor_surface(struct xw_compositor *c,
+                                   struct xw_surface *s);
+/* role dispatch (xw-subcompositor.c, called from xw-surface.c) */
+void xw_subsurface_role_commit(struct xw_surface *s);
+void xw_subsurface_role_destroy(struct xw_surface *s);
+void xw_subsurface_get_pos(struct xw_surface *s, int *x, int *y, int *w,
+                           int *h);
+/* hit-test: topmost subsurface of parent at (gx,gy), else NULL */
+struct xw_surface *xw_subsurface_at(struct xw_surface *parent, int gx, int gy);
+
+/* ---------------------------------------------------- xwayland shell */
+/* xwayland_shell_v1: Xwayland (24+) requires this protocol for rootless
+ * windows — each X11 toplevel arrives as a wl_surface carrying the
+ * xwayland_surface role. The role behaves like a toplevel WITHOUT the
+ * xdg configure/ack dance: commit-with-buffer maps the window, a null
+ * commit or surface destroy unmaps it. set_serial is recorded for
+ * diagnostics only (the X-side correlation lives inside Xwayland).
+ * Windows created here are ordinary xw_windows: the SAME focus, raise,
+ * move, resize, workspace, taskbar (foreign-toplevel/workspace-info)
+ * and activation model as native toplevels — one window-management
+ * path, no parallel X11 special case. */
+void xw_xwayland_shell_init(struct xw_compositor *c);
+void xw_xwayland_shell_fin(struct xw_compositor *c);
+/* role dispatch (xw-xwayland-shell.c) */
+void xw_xwayland_role_commit(struct xw_surface *s);
+void xw_xwayland_role_destroy(struct xw_surface *s);
+/* taskbar/panel "close" on an Xwayland window: forwards to the session
+ * WM helper over xw_window_control_v1 (returns false when impossible) */
+bool xw_xwayland_window_close(struct xw_window *w);
+/* compositor geometry changed for an Xwayland window: mirror it to the
+ * WM helper (no-op for other roles / no serial yet) */
+void xw_xwayland_notify_geometry(struct xw_window *w);
+
 /* ------------------------------------------------------------ compositor */
 
 /* Children spawned by the compositor itself (xw_spawn_command). Only these
@@ -726,10 +824,13 @@ struct xw_compositor {
     struct wl_list surfaces;  /* xw_surface.link */
     struct wl_list seats;     /* xw_seat.link */
     struct wl_list popups;    /* xw_popup.link */
+    struct wl_list subcomps;  /* xw_subsurface.link (all live subsurfaces) */
 
     struct wl_global *g_compositor, *g_subcompositor, *g_seat, *g_shm;
     struct wl_global *g_data_device_manager;
     struct wl_global *g_xdg_wm_base;
+    struct wl_global *g_xwayland_shell;
+    struct wl_global *g_window_control;
     struct wl_global *g_single_pixel;
     /* sub-initializers register their own globals */
 
@@ -762,6 +863,7 @@ struct xw_compositor {
     struct wl_list wsi_managers;      /* xw workspace annotation managers */
     struct wl_list ws_managers;      /* ext workspace managers */
     struct wl_list activation_tokens; /* xw_activation_token.link */
+    struct wl_list wc_managers;       /* xw_wc_manager (window control) */
 
     /* resolved commands for spawn-based actions (actions.conf) */
     char cmd_terminal[256], cmd_appfinder[256], cmd_exit[256], cmd_lock[256];
@@ -776,6 +878,9 @@ struct xw_compositor {
 
 void xw_schedule_repaint(struct xw_compositor *c);
 void xw_render_output(struct xw_output *o);
+/* crash-time state summary: clients/windows/focused — printed by the
+ * fatal-signal diagnostics path in the compositor binary */
+void xw_compositor_dump_state(struct xw_compositor *c);
 /* straight (non-premultiplied) ARGB8888 rect fill */
 void xw_render_fill_rect(pixman_image_t *dst, pixman_op_t op, uint32_t color,
                          int x, int y, int w, int h);

@@ -1021,6 +1021,12 @@ static void base_pong(struct wl_client *client, struct wl_resource *res,
 void xw_xdg_send_configure(struct xw_window *w) {
     if (!w || !w->toplevel_res || !w->xdg_surface_res || !w->surface)
         return;
+    if (w->surface->role == XW_SURFACE_ROLE_XWAYLAND)
+        return; /* xwayland windows have NO configure channel (the role
+                    has no state events); size changes are applied
+                    compositor-side from the commit buffer directly.
+                    Sending xdg_toplevel events on the xwayland_surface
+                    object would be a wire error and kill the client. */
     struct wl_array states;
     wl_array_init(&states);
     uint32_t *st;
@@ -1127,6 +1133,12 @@ void xw_role_commit(struct xw_surface *s) {
     case XW_SURFACE_ROLE_SESSION_LOCK:
         xw_lock_role_commit(s);
         return;
+    case XW_SURFACE_ROLE_SUBSURFACE:
+        xw_subsurface_role_commit(s);
+        return;
+    case XW_SURFACE_ROLE_XWAYLAND:
+        xw_xwayland_role_commit(s);
+        return;
     default:
         return;
     }
@@ -1216,6 +1228,12 @@ void xw_role_destroy(struct xw_surface *s) {
         break;
     case XW_SURFACE_ROLE_SESSION_LOCK:
         xw_lock_role_destroy(s);
+        break;
+    case XW_SURFACE_ROLE_SUBSURFACE:
+        xw_subsurface_role_destroy(s);
+        break;
+    case XW_SURFACE_ROLE_XWAYLAND:
+        xw_xwayland_role_destroy(s);
         break;
     default:
         break;

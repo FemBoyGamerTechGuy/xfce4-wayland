@@ -161,6 +161,53 @@ static int on_signal(int sig, void *data) {
     return 0;
 }
 
+/* client lifecycle logging: every connection is identified by pid via
+ * the socket's SO_PEERCRED — the number the user correlates with the
+ * panel's launched applications and with `ps` on the real session. */
+static void on_client_created(struct wl_listener *l, void *data) {
+    (void)l;
+    struct wl_client *client = data;
+    pid_t pid = 0;
+    uid_t uid = 0;
+    wl_client_get_credentials(client, &pid, &uid, NULL);
+    xw_log(XW_LOG_INFO, "client connected: pid %d uid %d", (int)pid,
+           (int)uid);
+}
+
+static struct wl_listener client_created_listener = {
+    .notify = on_client_created,
+};
+
+/* crash/teardown diagnostics: the last thing printed before a fatal
+ * signal kills the process — window count, the focused window, the
+ * number of live surfaces. Called from the compositor binary's
+ * SIGSEGV/SIGABRT/... handler. */
+void xw_compositor_dump_state(struct xw_compositor *c) {
+    if (!c)
+        return;
+    int n_windows = 0, n_surfaces = 0;
+    struct xw_window *w;
+    if (c->wm) {
+        wl_list_for_each(w, &c->wm->windows, link)
+            n_windows++;
+    }
+    struct xw_surface *s;
+    wl_list_for_each(s, &c->surfaces, link)
+        n_surfaces++;
+    const char *focus = "(none)";
+    char focusbuf[300];
+    if (c->wm && c->wm->focused) {
+        snprintf(focusbuf, sizeof(focusbuf), "window %u '%.80s' app '%.80s'",
+                 c->wm->focused->id, c->wm->focused->title,
+                 c->wm->focused->app_id);
+        focus = focusbuf;
+    }
+    fprintf(stderr,
+            "[xw-fatal] compositor state: windows=%d surfaces=%d "
+            "outputs=%d focused=%s\n",
+            n_windows, n_surfaces, xw_compositor_n_outputs(c), focus);
+}
+
 static int reap_children(int sig, void *data) {
     /* Reap only children the compositor itself spawned. Embedder children
      * (harness, session manager) must stay reapable by their owner: a
@@ -232,15 +279,19 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
     wl_list_init(&c->surfaces);
     wl_list_init(&c->seats);
     wl_list_init(&c->popups);
+    wl_list_init(&c->subcomps);
     wl_list_init(&c->ft_managers);
     wl_list_init(&c->ws_managers);
     wl_list_init(&c->wsi_managers);
     wl_list_init(&c->activation_tokens);
+    wl_list_init(&c->wc_managers);
 
     c->display = wl_display_create();
     if (!c->display)
         goto fail;
     c->loop = wl_display_get_event_loop(c->display);
+    wl_display_add_client_created_listener(c->display,
+                                           &client_created_listener);
 
     /* arm signals as early as possible: a TERM arriving during the rest
      * of create (backend handshake, shell setup) must still lead to a
@@ -361,6 +412,8 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
     /* shells and desktop integration protocols */
     xw_actions_init(c);
     xw_xdg_shell_init(c);
+    xw_subcompositor_init(c);
+    xw_xwayland_shell_init(c);
     xw_layer_shell_init(c);
     xw_session_lock_init(c);
     xw_idle_init(c);
@@ -483,6 +536,8 @@ void xw_compositor_destroy(struct xw_compositor *c) {
     }
 
     xw_layer_shell_fin(c);
+    xw_subcompositor_fin(c);
+    xw_xwayland_shell_fin(c);
     xw_workspace_info_fin(c);
     xw_session_lock_fin(c);
     xw_idle_fin(c);

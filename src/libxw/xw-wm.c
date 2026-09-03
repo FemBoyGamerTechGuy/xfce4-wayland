@@ -108,6 +108,9 @@ void xw_wm_manage_toplevel(struct xw_wm *wm, struct xw_window *w) {
     wl_list_insert(wm->windows.prev, &w->link);
     wl_list_insert(wm->stack.prev, &w->stack_link); /* bottom of stack */
     w->id = ++wm->comp->next_window_id;
+    xw_log(XW_LOG_DEBUG, "wm: window %u managed (surface %u, app '%s')",
+           w->id, w->surface ? wl_resource_get_id(w->surface->res) : 0,
+           w->app_id);
 }
 
 void xw_wm_window_map(struct xw_wm *wm, struct xw_window *w) {
@@ -184,11 +187,19 @@ void xw_wm_window_map(struct xw_wm *wm, struct xw_window *w) {
     /* a window mapped under the stationary cursor takes pointer focus
      * immediately (motion would do it too, but not before then) */
     xw_seat_repointer(wm->comp);
+    xw_log(XW_LOG_INFO,
+           "wm: window %u MAPPED (surface %u, app '%s', title '%s', "
+           "%dx%d+%d+%d, output '%s', ws %d)",
+           w->id, w->surface ? wl_resource_get_id(w->surface->res) : 0,
+           w->app_id, w->title, w->w, w->h, w->x, w->y,
+           w->output ? w->output->name : "(unset)", w->ws);
 }
 
 void xw_wm_window_unmap(struct xw_wm *wm, struct xw_window *w) {
     if (!w->mapped)
         return;
+    xw_log(XW_LOG_INFO, "wm: window %u UNMAPPED (app '%s', title '%s')",
+           w->id, w->app_id, w->title);
     xw_wm_damage_window(wm, w);
     w->mapped = false;
     xw_foreign_toplevel_window_unmapped(wm->comp, w);
@@ -208,6 +219,8 @@ void xw_wm_window_unmap(struct xw_wm *wm, struct xw_window *w) {
 
 void xw_wm_unmanage(struct xw_wm *wm, struct xw_window *w, bool resources_gone) {
     (void)resources_gone;
+    xw_log(XW_LOG_DEBUG, "wm: window %u unmanaged (app '%s')", w->id,
+           w->app_id);
     if (w->mapped)
         xw_wm_window_unmap(wm, w);
     xw_foreign_toplevel_window_unmapped(wm->comp, w);
@@ -238,6 +251,8 @@ void xw_wm_focus_window(struct xw_wm *wm, struct xw_window *w, bool activate) {
         xw_log(XW_LOG_WARN, "wm: refusing to focus invisible window");
         return;
     }
+    xw_log(XW_LOG_DEBUG, "wm: focus -> window %u ('%s', app '%s')",
+           w ? w->id : 0, w ? w->title : "(none)", w ? w->app_id : "");
     struct xw_window *prev = wm->focused;
     wm->focused = w;
     if (prev && prev != w) {
@@ -451,6 +466,13 @@ void xw_wm_minimize(struct xw_wm *wm, struct xw_window *w, bool on) {
 
 void xw_wm_close(struct xw_wm *wm, struct xw_window *w) {
     (void)wm;
+    if (w->surface && w->surface->role == XW_SURFACE_ROLE_XWAYLAND) {
+        /* no xdg_toplevel to send close to; the X window is asked to go
+         * through the surface teardown path instead (see
+         * xw-xwayland-shell.c for the honest limits) */
+        xw_xwayland_window_close(w);
+        return;
+    }
     if (w->toplevel_res)
         xdg_toplevel_send_close(w->toplevel_res);
 }
@@ -641,8 +663,10 @@ void xw_wm_interactive_motion(struct xw_wm *wm, struct xw_window *w, int px,
             w->h = newh;
         }
         xw_xdg_send_configure(w);
+        xw_xwayland_notify_geometry(w);
     }
     xw_wm_damage_window(wm, w);
+    xw_xwayland_notify_geometry(w);
 }
 
 void xw_wm_interactive_end(struct xw_wm *wm, struct xw_window *w) {
@@ -654,6 +678,7 @@ void xw_wm_interactive_end(struct xw_wm *wm, struct xw_window *w) {
     w->inter.mode = 0;
     w->inter.snap = 0;
     w->inter.edges = 0;
+    xw_xwayland_notify_geometry(w);
 }
 
 struct xw_window *xw_wm_interactive_window(struct xw_wm *wm) {
