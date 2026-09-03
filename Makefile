@@ -435,9 +435,11 @@ PROT_PAIRS := \
 	$(WP_DIR)/staging/single-pixel-buffer/single-pixel-buffer-v1.xml|single-pixel-buffer \
 	$(WP_DIR)/staging/ext-session-lock/ext-session-lock-v1.xml|ext-session-lock \
 	$(WP_DIR)/staging/ext-idle-notify/ext-idle-notify-v1.xml|ext-idle-notify \
+	$(WP_DIR)/staging/xwayland-shell/xwayland-shell-v1.xml|xwayland-shell \
 	protocols/wlr-layer-shell-unstable-v1.xml|wlr-layer-shell-unstable-v1 \
 	protocols/wlr-foreign-toplevel-management-unstable-v1.xml|wlr-foreign-toplevel-management-unstable-v1 \
-	protocols/xw-workspace-info-v1.xml|xw-workspace-info-v1
+	protocols/xw-workspace-info-v1.xml|xw-workspace-info-v1 \
+	protocols/xw-window-control-v1.xml|xw-window-control-v1
 
 GEN := build/gen
 OBJ := build/obj
@@ -559,6 +561,12 @@ build/bin/xw-session: $(OBJ)/session/xw-session.o $(OBJ)/session/xw-power.o | bu
 build/bin/xw-session-ctl: $(OBJ)/session/xw-session-ctl.o | build/bin
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)/session/xw-session-ctl.o $(LDLIBS_M)
 
+build/bin/xw-xwm: $(OBJ)/session/xw-xwm.o $(GEN_PROTO_OBJ) | build/bin
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/session/xw-xwm.o $(GEN_PROTO_OBJ) $(LDLIBS_WLC) $(LDLIBS_M)
+
+$(OBJ)/session/xw-xwm.o: src/session/xw-xwm.c $(GEN_HEADERS) | $(OBJ)/session
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLC) -Ibuild/gen -c $< -o $@
+
 $(OBJ)/session/%.o: src/session/%.c | $(OBJ)/session
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) -c $< -o $@
 
@@ -665,7 +673,7 @@ $(OBJ)/tests/fdtest2.o: tests/fdtest2.c | $(OBJ)/tests
 	compositor panel session clients
 
 # session manager, exit dialog, panel, demo client
-SESSION_BINS := $(if $(wildcard src/session/xw-session.c),build/bin/xw-session build/bin/xw-session-ctl,)
+SESSION_BINS := $(if $(wildcard src/session/xw-session.c),build/bin/xw-session build/bin/xw-session-ctl build/bin/xw-xwm,)
 CLIENT_BINS := $(if $(wildcard src/clients/xw-demo.c),build/bin/xw-demo,) \
 	$(if $(wildcard src/clients/xw-exit.c),build/bin/xw-exit,) \
 	$(if $(wildcard src/clients/xw-lock.c),build/bin/xw-lock,) \
