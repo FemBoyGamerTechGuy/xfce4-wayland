@@ -2025,7 +2025,7 @@ static const struct mx_fixture mx_fixtures[] = {
      "mark c"},
     {"d-fields.desktop",
      "[Desktop Entry]\nType=Application\nName=D Fieldcodes\n"
-     "Exec=/bin/touch @DIR@/mark-d %f %U %k %c\nIcon=dicon\nCategories=Utility;\n",
+     "Exec=/bin/touch @DIR@/mark-d %f %U %k @DIR@/%c\nIcon=dicon\nCategories=Utility;\n",
      "mark-d"},
     {"e-terminal.desktop",
      "[Desktop Entry]\nType=Application\nName=E Terminal\nExec=/bin/touch @DIR@/mark-e\n"
@@ -2254,6 +2254,21 @@ static void test_panel_launch_matrix(struct xwt_ctx *t) {
         }
         XWT_CHECK(marked, "%s: marker created by the launched process (%s)",
                   nav[i].order, marker);
+        /* d-fields: %c must expand to the translated name as its own
+         * argv element. The fixture routes it through @DIR@/ so the
+         * artifact lands in the runtime dir — the old bare %c made
+         * touch create a stray "D Fieldcodes" in the test's CWD (the
+         * repo root), which the environment's auto-snapshot then
+         * committed as junk twice. */
+        if (strcmp(nav[i].order, "d-fields") == 0) {
+            char namefile[420];
+            snprintf(namefile, sizeof(namefile), "%s/D Fieldcodes",
+                     appdir);
+            bool named = access(namefile, F_OK) == 0;
+            XWT_CHECK(named,
+                      "d-fields: %%c expanded to the app name (%s)",
+                      namefile);
+        }
         PANEL_WAIT(t, n_top_popups(t) == 0);
         XWT_CHECK(n_top_popups(t) == 0, "%s: menu closed after launch",
                   nav[i].order);
