@@ -33,6 +33,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <time.h>
 
@@ -113,6 +114,19 @@ struct session {
         char name[300];
     } spawned[MAX_RUNTIME_CHILDREN];
     int n_spawned;
+
+    /* XWayland: the X server plus its window manager helper, both
+     * supervised like the compositor. X11 applications launched by the
+     * panel inherit $DISPLAY/$XAUTHORITY from the session manager. */
+    bool want_xwayland;       /* $XW_SESSION_XWAYLAND=0 opts out */
+    pid_t xwayland_pid;
+    pid_t xwm_pid;
+    int xwayland_display;     /* -1 until -displayfd reports it */
+    char xwayland_exe[256];
+    char xauthority_path[600];
+    int xwayland_restarts;
+    int xwm_restarts;
+    int64_t xwayland_started_ms;
 };
 
 static struct session S;
@@ -893,22 +907,34 @@ static void update_activation_env(void) {
         return; /* absent on minimal installs; nothing exported */
 
     bool real = strcmp(S.comp_backend, "drm") == 0;
+    bool have_xw = S.xwayland_display >= 0;
     pid_t pid = fork();
     if (pid < 0)
         return;
     if (pid == 0) {
         setenv("XDG_RUNTIME_DIR", S.runtime_dir, 1);
         setenv("WAYLAND_DISPLAY", S.socket_name, 1);
+        if (have_xw) {
+            char disp[16];
+            snprintf(disp, sizeof(disp), ":%d", S.xwayland_display);
+            setenv("DISPLAY", disp, 1);
+            if (S.xauthority_path[0])
+                setenv("XAUTHORITY", S.xauthority_path, 1);
+        }
         if (real) {
             setenv("XDG_SESSION_TYPE", "wayland", 1);
             setenv("XDG_CURRENT_DESKTOP", "XFCE", 1);
             setenv("XDG_SESSION_DESKTOP", "xfce", 1);
         }
-        const char *args[8];
+        const char *args[12];
         int n = 0;
         args[n++] = prog;
         args[n++] = "WAYLAND_DISPLAY";
         args[n++] = "XDG_RUNTIME_DIR";
+        if (have_xw) {
+            args[n++] = "DISPLAY";
+            args[n++] = "XAUTHORITY";
+        }
         if (real) {
             args[n++] = "XDG_SESSION_TYPE";
             args[n++] = "XDG_CURRENT_DESKTOP";
@@ -1001,6 +1027,289 @@ static const char *find_panel(void) {
                     "manager, in /usr/local/bin or on PATH — starting "
                     "without one (build it, or set $XW_PANEL_CMD)");
     return NULL;
+}
+
+/* ------------------------------------------------------------ XWayland */
+
+/* Find the Xwayland server binary: explicit override, the binary next
+ * to the session manager (build trees), /usr/local/bin, PATH. NULL +
+ * an honest log line when absent (X11 apps then simply do not start,
+ * same as any missing runtime dependency). */
+static const char *find_xwayland(void) {
+    const char *env = getenv("XW_XWAYLAND_CMD");
+    if (env && *env) {
+        if (strcmp(env, "none") == 0 || strcmp(env, "off") == 0)
+            return NULL;
+        return env;
+    }
+    static char path[1024];
+    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 32);
+    if (n > 0) {
+        path[n] = 0;
+        char *slash = strrchr(path, '/');
+        if (slash) {
+            snprintf(slash + 1, sizeof(path) - (slash + 1 - path),
+                     "Xwayland");
+            if (access(path, X_OK) == 0)
+                return path;
+        }
+    }
+    if (search_path("Xwayland", path, sizeof(path)))
+        return path;
+    return NULL;
+}
+
+/* the WM helper (same resolution order as the panel) */
+static const char *find_xwm(void) {
+    static char path[1024];
+    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 32);
+    if (n > 0) {
+        path[n] = 0;
+        char *slash = strrchr(path, '/');
+        if (slash) {
+            snprintf(slash + 1, sizeof(path) - (slash + 1 - path), "xw-xwm");
+            if (access(path, X_OK) == 0)
+                return path;
+        }
+    }
+    if (search_path("xw-xwm", path, sizeof(path)))
+        return path;
+    return NULL;
+}
+
+/* Write a one-entry Xauthority file (big-endian field lengths, the
+ * libXau file format): family=WILD, empty address, empty number,
+ * name "MIT-MAGIC-COOKIE-1", 16 random bytes. The same cookie is
+ * presented by every session-side X client (xw-xwm and the apps the
+ * panel launches, which read $XAUTHORITY). */
+static bool write_xauthority(const char *path) {
+    unsigned char cookie[16];
+    FILE *r = fopen("/dev/urandom", "rb");
+    if (!r || fread(cookie, 1, sizeof(cookie), r) != sizeof(cookie)) {
+        if (r)
+            fclose(r);
+        return false;
+    }
+    fclose(r);
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return false;
+    const char *name = "MIT-MAGIC-COOKIE-1";
+    unsigned char head[10];
+    uint16_t fields[5] = {0xFFFF /* FamilyWild */, 0, 0,
+                          (uint16_t)strlen(name), 16};
+    for (int i = 0; i < 5; i++) {
+        head[i * 2] = fields[i] >> 8;      /* big-endian */
+        head[i * 2 + 1] = fields[i] & 0xff;
+    }
+    bool ok = fwrite(head, 1, 10, f) == 10 &&
+              fwrite(name, 1, strlen(name), f) == strlen(name) &&
+              fwrite(cookie, 1, 16, f) == 16;
+    fclose(f);
+    if (!ok)
+        unlink(path);
+    return ok;
+}
+
+/* the user-facing diagnostic block (startup + ctl "xwayland") */
+static void xwayland_report(const char *state) {
+    char sock[64] = "(none)";
+    char dispname[16] = "(none)";
+    if (S.xwayland_display >= 0) {
+        snprintf(sock, sizeof(sock), "/tmp/.X11-unix/X%d",
+                 S.xwayland_display);
+        snprintf(dispname, sizeof(dispname), ":%d", S.xwayland_display);
+    }
+    bool alive = S.xwayland_pid > 0 && kill(S.xwayland_pid, 0) == 0;
+    log_msg("info",
+            "XWayland:\n"
+            "  executable: %s\n"
+            "  pid: %d\n"
+            "  display: %s\n"
+            "  socket: %s\n"
+            "  ready: %s\n"
+            "  alive: %s\n"
+            "  wm helper (xw-xwm) pid: %d",
+            S.xwayland_exe[0] ? S.xwayland_exe : "(not found)",
+            (int)(S.xwayland_pid > 0 ? S.xwayland_pid : 0), dispname, sock,
+            state, alive ? "yes" : "no",
+            (int)(S.xwm_pid > 0 ? S.xwm_pid : 0));
+}
+
+/* Start Xwayland ROOTLESS with -displayfd (the modern readiness
+ * mechanism: the server writes the chosen display number to the fd
+ * once the socket exists — no racing a fixed :N) plus a per-session
+ * authority cookie. On success $DISPLAY and $XAUTHORITY are exported
+ * into the session manager's environment, so every supervised child
+ * (panel, autostart, ctl-spawned apps) inherits them. */
+static int start_xwayland(void) {
+    const char *exe = find_xwayland();
+    if (!exe) {
+        log_msg("info", "XWayland: no Xwayland binary found — X11 "
+                        "applications will not start (install Xwayland "
+                        "or set $XW_XWAYLAND_CMD)");
+        return 0;
+    }
+    snprintf(S.xwayland_exe, sizeof(S.xwayland_exe), "%.240s", exe);
+
+    if (snprintf(S.xauthority_path, sizeof(S.xauthority_path),
+                 "%s/xw-xauthority", S.runtime_dir) >=
+        (int)sizeof(S.xauthority_path))
+        return 0;
+    if (!write_xauthority(S.xauthority_path)) {
+        log_msg("warn", "XWayland: cannot write %s — starting without "
+                        "access control",
+                S.xauthority_path);
+        S.xauthority_path[0] = 0;
+    }
+
+    int dfd[2];
+    if (pipe(dfd) < 0)
+        return 0;
+
+    const char *args[12] = {0};
+    int nargs = 0;
+    args[nargs++] = exe;
+    args[nargs++] = "-rootless"; /* per-window integration: each X11
+                                    toplevel becomes a compositor window */
+    args[nargs++] = "-noreset";
+    args[nargs++] = "-displayfd";
+    args[nargs++] = "3"; /* inherited below */
+    if (S.xauthority_path[0]) {
+        args[nargs++] = "-auth";
+        args[nargs++] = S.xauthority_path;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(dfd[0]);
+        close(dfd[1]);
+        return 0;
+    }
+    if (pid == 0) {
+        setenv("XDG_RUNTIME_DIR", S.runtime_dir, 1);
+        setenv("WAYLAND_DISPLAY", S.socket_name, 1);
+        setenv("XDG_SESSION_TYPE", "wayland", 1);
+        unsetenv("DISPLAY"); /* no host display leaks into the X server */
+        unsetenv("XAUTHORITY");
+        /* hand the write end to fd 3 WITHOUT closing it again: pipe()
+         * typically returns 3,4, so a naive close(dfd[0]) after the
+         * dup2 would close the descriptor we just installed */
+        if (dfd[1] != 3)
+            dup2(dfd[1], 3);
+        if (dfd[0] != 3)
+            close(dfd[0]);
+        if (dfd[1] != 3)
+            close(dfd[1]);
+        execv(exe, (char *const *)args);
+        log_msg("error", "execv(Xwayland) failed: %s", strerror(errno));
+        _exit(127);
+    }
+    close(dfd[1]);
+
+    /* read the display number ("-displayfd" writes ASCII + newline) */
+    char disp[8] = {0};
+    struct pollfd pfd = {.fd = dfd[0], .events = POLLIN};
+    ssize_t total = 0;
+    while (poll(&pfd, 1, 10000) == 1 && total < (ssize_t)sizeof(disp) - 1) {
+        ssize_t n = read(dfd[0], disp + total, sizeof(disp) - 1 - total);
+        if (n <= 0)
+            break;
+        total += n;
+        if (strchr(disp, '\n'))
+            break;
+    }
+    close(dfd[0]);
+    disp[sizeof(disp) - 1] = 0;
+    /* display 0 is valid: validate on the content, not the number */
+    bool digits = disp[0] >= '0' && disp[0] <= '9';
+    int display = digits ? atoi(disp) : -1;
+    if (display < 0) {
+        log_msg("error", "XWayland: -displayfd reported no display number "
+                         "(read '%.8s') — X11 support disabled",
+                disp);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        return 0;
+    }
+
+    S.xwayland_pid = pid;
+    S.xwayland_display = display;
+    S.xwayland_started_ms = now_ms();
+
+    char sock[64];
+    snprintf(sock, sizeof(sock), "/tmp/.X11-unix/X%d", display);
+    if (access(sock, F_OK) != 0)
+        log_msg("warn", "XWayland: socket %s not visible yet", sock);
+
+    char dispname[16];
+    snprintf(dispname, sizeof(dispname), ":%d", display);
+    setenv("DISPLAY", dispname, 1);
+    if (S.xauthority_path[0])
+        setenv("XAUTHORITY", S.xauthority_path, 1);
+
+    log_msg("info", "XWayland started (pid %d, display %s, %s)", (int)pid,
+            dispname, sock);
+    xwayland_report("yes");
+    return pid;
+}
+
+/* Start the X window manager helper; it connects to the freshly
+ * created display (with the session cookie) and to the compositor
+ * (window-control channel). */
+static int start_xwm(void) {
+    if (S.xwayland_display < 0)
+        return 0;
+    const char *exe = find_xwm();
+    if (!exe) {
+        log_msg("warn", "XWayland: no xw-xwm helper found next to the "
+                        "session manager — X11 windows will not appear "
+                        "(rebuild the project)");
+        return 0;
+    }
+    char disparg[16];
+    snprintf(disparg, sizeof(disparg), ":%d", S.xwayland_display);
+
+    const char *args[10] = {0};
+    int nargs = 0;
+    args[nargs++] = exe;
+    args[nargs++] = "-d";
+    args[nargs++] = disparg;
+    args[nargs++] = "-w";
+    args[nargs++] = S.socket_name;
+    if (S.xauthority_path[0]) {
+        args[nargs++] = "-a";
+        args[nargs++] = S.xauthority_path;
+    }
+    if (S.verbose)
+        args[nargs++] = "-v";
+
+    pid_t pid = fork();
+    if (pid < 0)
+        return 0;
+    if (pid == 0) {
+        setenv("XDG_RUNTIME_DIR", S.runtime_dir, 1);
+        setenv("WAYLAND_DISPLAY", S.socket_name, 1);
+        execv(exe, (char *const *)args);
+        log_msg("error", "execv(xw-xwm) failed: %s", strerror(errno));
+        _exit(127);
+    }
+    S.xwm_pid = pid;
+    log_msg("info", "XWayland: window manager helper started (pid %d)",
+            (int)pid);
+    return pid;
+}
+
+/* Stop both, best effort (shutdown path). */
+static void stop_xwayland(void) {
+    if (S.xwm_pid > 0)
+        kill(S.xwm_pid, SIGTERM);
+    if (S.xwayland_pid > 0)
+        kill(S.xwayland_pid, SIGTERM);
+    if (S.xauthority_path[0])
+        unlink(S.xauthority_path);
+    S.xwayland_pid = -1;
+    S.xwm_pid = -1;
 }
 
 /* Start the panel unless disabled, already running (re-login/restart
@@ -1104,6 +1413,7 @@ static void session_shutdown(bool restart) {
     S.restarting = restart;
     log_msg("info", "session %s", restart ? "restarting" : "ending");
     stop_autostart_apps();
+    stop_xwayland();
     stop_compositor();
     /* the bus dies last: children closing down may still talk to it */
     stop_session_dbus();
@@ -1126,12 +1436,20 @@ static void handle_ctl_line(int fd, char *line) {
         return;
 
     if (strcmp(line, "status") == 0) {
-        char buf[256];
+        char buf[512];
+        char xw[64] = "xwayland=off";
+        if (S.xwayland_display >= 0) {
+            bool alive = S.xwayland_pid > 0 && kill(S.xwayland_pid, 0) == 0;
+            snprintf(xw, sizeof(xw), "xwayland=:%d pid=%d alive=%s",
+                     S.xwayland_display,
+                     S.xwayland_pid > 0 ? (int)S.xwayland_pid : 0,
+                     alive ? "yes" : "no");
+        }
         snprintf(buf, sizeof(buf),
-                 "ok compositor=%s pid=%d restarts=%d autostart=%d",
+                 "ok compositor=%s pid=%d restarts=%d autostart=%d %s",
                  S.comp_ready ? "running" : "stopped",
                  S.comp_pid > 0 ? (int)S.comp_pid : 0, S.comp_restarts,
-                 S.n_autostart);
+                 S.n_autostart, xw);
         send_line(fd, buf);
         return;
     }
@@ -1196,6 +1514,18 @@ static void handle_ctl_line(int fd, char *line) {
                      err[0] ? ": " : "", err);
             send_line(fd, reply);
         }
+        return;
+    }
+    if (strcmp(line, "xwayland") == 0) {
+        /* detailed XWayland diagnostics (the startup block, live) */
+        if (S.xwayland_display < 0) {
+            send_line(fd, "error xwayland not started (no binary, "
+                          "$XW_SESSION_XWAYLAND=0, or it hit the restart "
+                          "limit)");
+            return;
+        }
+        xwayland_report(S.want_xwayland ? "yes" : "disabled");
+        send_line(fd, "ok see log");
         return;
     }
     if (strcmp(line, "exit-dialog") == 0) {
@@ -1343,6 +1673,10 @@ int main(int argc, char **argv) {
     S.verbose = false;
     S.want_panel = true;
     S.backend = SB_AUTO;
+    S.xwayland_pid = -1;
+    S.xwm_pid = -1;
+    S.xwayland_display = -1;
+    S.want_xwayland = true; /* $XW_SESSION_XWAYLAND=0 opts out */
 
     static const struct option longopts[] = {
         {"ctl-name", required_argument, NULL, 'S'},
@@ -1438,6 +1772,19 @@ int main(int argc, char **argv) {
         cleanup_sockets();
         return 1;
     }
+
+    /* 2b. XWayland + its window manager helper — before the panel and
+     *    autostart so X11 applications inherit $DISPLAY/$AUTHORITY */
+    {
+        const char *xw = getenv("XW_SESSION_XWAYLAND");
+        if (xw && (strcmp(xw, "0") == 0 || strcmp(xw, "no") == 0 ||
+                   strcmp(xw, "off") == 0))
+            S.want_xwayland = false;
+    }
+    if (S.want_xwayland && !S.nested) {
+        if (start_xwayland() > 0)
+            start_xwm();
+    }
     update_activation_env();
 
     /* 3. control socket */
@@ -1515,7 +1862,63 @@ int main(int argc, char **argv) {
                         g_exit_code = 1;
                     }
                 } else {
-                    if (pid == S.dbus_pid) {
+                    if (pid == S.xwayland_pid) {
+                        int64_t ran = (now_ms() - S.xwayland_started_ms +
+                                       500) / 1000;
+                        S.xwayland_pid = -1;
+                        /* the WM helper's X connection dies with the
+                         * server — stop it so the restart pairs them */
+                        if (S.xwm_pid > 0) {
+                            kill(S.xwm_pid, SIGTERM);
+                            S.xwm_pid = -1;
+                        }
+                        if (S.shutting_down) {
+                            log_msg("info", "XWayland exited during "
+                                            "shutdown (%s, ran %llds)",
+                                    wait_desc(status), (long long)ran);
+                        } else if (S.want_xwayland &&
+                                   S.xwayland_restarts < 3) {
+                            S.xwayland_restarts++;
+                            log_msg("warn",
+                                    "XWayland exited (%s, ran %llds) — "
+                                    "restarting (%d/3) so X11 apps keep "
+                                    "working; the X11 apps themselves "
+                                    "reconnect or exit per their own "
+                                    "behavior",
+                                    wait_desc(status), (long long)ran,
+                                    S.xwayland_restarts);
+                            usleep(300000);
+                            if (start_xwayland() > 0)
+                                start_xwm();
+                        } else {
+                            log_msg("error",
+                                    "XWayland exited (%s, ran %llds) and "
+                                    "hit the restart limit — X11 "
+                                    "applications will not start for "
+                                    "the rest of the session",
+                                    wait_desc(status), (long long)ran);
+                            S.xwayland_display = -1;
+                        }
+                    } else if (pid == S.xwm_pid) {
+                        S.xwm_pid = -1;
+                        if (S.shutting_down) {
+                            /* expected */
+                        } else if (S.xwayland_pid > 0 &&
+                                   S.xwm_restarts < 3) {
+                            S.xwm_restarts++;
+                            log_msg("warn",
+                                    "XWayland: the WM helper exited (%s) "
+                                    "— restarting (%d/3): without it X11 "
+                                    "windows stop appearing",
+                                    wait_desc(status), S.xwm_restarts);
+                            usleep(300000);
+                            start_xwm();
+                        } else if (S.xwayland_pid > 0) {
+                            log_msg("error",
+                                    "XWayland: the WM helper kept exiting "
+                                    "— X11 windows will not appear");
+                        }
+                    } else if (pid == S.dbus_pid) {
                         S.dbus_pid = -1;
                         log_msg("warn",
                                 "session d-bus: the session bus daemon "
