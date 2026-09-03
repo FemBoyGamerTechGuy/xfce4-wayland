@@ -121,5 +121,7 @@ int xwt_run_all(void);
 /* create a window that fills itself with a solid color and commits */
 struct xwc_win *xwt_window_solid(struct xwt_ctx *t, uint32_t color, int w,
                                  int h, const char *title);
+/* bind wl_subcompositor on a test client (raw core-protocol tests) */
+void xwt_bind_subcompositor(struct xwt_ctx *t, struct wl_subcompositor **out);
 
 #endif /* XWTEST_H */
