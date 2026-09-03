@@ -211,11 +211,8 @@ static void draw_cat_row(struct panel *p, uint32_t *pix, int stride, int bw,
                      tints[cat % 14], tints[cat % 14]);
     }
     char label[XWAPP_NAME_MAX];
-    snprintf(label, sizeof(label), "%s", xwapp_cat_name(cat));
-    for (int used = panel_text_width(p, label);
-         used > MENU_CAT_W - 16 && strlen(label) > 1;
-         used = panel_text_width(p, label))
-        label[strlen(label) - 1] = 0;
+    panel_text_fit(p, label, sizeof(label), xwapp_cat_name(cat),
+                   MENU_CAT_W - 16);
     panel_draw_text(p, pix, stride, bw, bh, MENU_PAD + 6 + icon + 8,
                     y + (g_menu.row_h - p->m.font_h) / 2 + 1, label,
                     COL_MENU_TEXT);
@@ -248,11 +245,7 @@ static void draw_app_row(struct panel *p, uint32_t *pix, int stride, int bw,
                           ic, icon);
     }
     char label[XWAPP_NAME_MAX];
-    snprintf(label, sizeof(label), "%.120s", a->name);
-    for (int used = panel_text_width(p, label);
-         used > MENU_APP_W - 20 && strlen(label) > 1;
-         used = panel_text_width(p, label))
-        label[strlen(label) - 1] = 0;
+    panel_text_fit(p, label, sizeof(label), a->name, MENU_APP_W - 20);
     panel_draw_text(p, pix, stride, bw, bh, x + 8 + icon + 8,
                     y + (g_menu.row_h - p->m.font_h) / 2 + 1, label,
                     COL_MENU_TEXT);

@@ -76,11 +76,8 @@ static void to_draw(void) {
         const char *title = xwc_task_title(t);
         if (!*title)
             title = app_id;
-        snprintf(label, sizeof(label), "%.60s", *title ? title : "(window)");
-        for (int used = panel_text_width(p, label);
-             used > TASKOVER_W - 16 && strlen(label) > 1;
-             used = panel_text_width(p, label))
-            label[strlen(label) - 1] = 0;
+        panel_text_fit(p, label, sizeof(label),
+                       *title ? title : "(window)", TASKOVER_W - 16);
         panel_draw_text(p, pix, stride, w, h, 6 + icon + 8, iy + ty_off, label,
                         i == g_to.hover ? 0xffffffff : COL_TO_TEXT);
     }

@@ -1029,6 +1029,17 @@ static void test_panel_menu(struct xwt_ctx *t) {
     static const int KEY_OF_LETTER[26] = {
         30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24,
         25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44};
+    /* type one word (letters + spaces) into the menu search */
+    #define MX_TYPE_WORD(t, word)                                                \
+        do {                                                                     \
+            for (const char *c_ = (word); *c_; c_++) {                           \
+                uint32_t code_ = *c_ == ' ' ? 57 : KEY_OF_LETTER[*c_ - 'a'];     \
+                xw_compositor_inject_key(t->comp, code_, true);                  \
+                xwt_pump(t);                                                     \
+                xw_compositor_inject_key(t->comp, code_, false);                 \
+                pump_ms(t, 30);                                                  \
+            }                                                                    \
+        } while (0)
     const char *word = "beta";
     for (const char *c = word; *c; c++) {
         uint32_t code = KEY_OF_LETTER[*c - 'a'];
@@ -1955,6 +1966,336 @@ static void test_compositor_without_panel(struct xwt_ctx *t) {
     g_nopanel_win = NULL;
 }
 
+/* ------------------------------------------------------ launch matrix */
+/* The Phase-1 crash reproduction: realistic .desktop fixtures (quoted
+ * and escaped Exec arguments, field codes, Terminal=true, a unicode
+ * name, long names, every icon flavor, a nonexistent executable, a
+ * malformed Exec) are each launched from the menu. After every launch
+ * the panel process must still be ALIVE (waitpid, not kill(2), so a
+ * segfault is actually detected), the menu must have closed, and the
+ * ctl wire must have carried the expected command. */
+static bool panel_alive(pid_t pid, int *status) {
+    int st = 0;
+    pid_t r = waitpid(pid, &st, WNOHANG);
+    if (status)
+        *status = st;
+    if (r == pid) {
+        printf("  panel process %d died: %s (status 0x%x)\n", (int)pid,
+               WIFSIGNALED(st) ? strsignal(WTERMSIG(st)) : "normal exit", st);
+        return false;
+    }
+    return r == 0;
+}
+
+struct mx_fixture {
+    const char *file;
+    const char *body;
+    const char *expect_ctl; /* NULL = launch must be refused */
+};
+
+static const struct mx_fixture mx_fixtures[] = {
+    {"a-simple.desktop",
+     "[Desktop Entry]\nType=Application\nName=A Simple\nExec=/bin/simple\n"
+     "Categories=Utility;\n",
+     "run /bin/simple"},
+    {"b-args.desktop",
+     "[Desktop Entry]\nType=Application\nName=B Argline\n"
+     "Exec=/bin/args --flag -x 42\nCategories=Utility;\n",
+     "run /bin/args --flag -x 42"},
+    {"c-quoted.desktop",
+     "[Desktop Entry]\nType=Application\nName=C Quoted Str\n"
+     "Exec=quotedapp \"one two\" three\\ four\nCategories=Utility;\n",
+     "run quotedapp 'one two' 'three four'"},
+    {"d-fields.desktop",
+     "[Desktop Entry]\nType=Application\nName=D Fieldcodes\n"
+     "Exec=fieldapp %f %U %i %c\nIcon=dicon\nCategories=Utility;\n",
+     "run fieldapp --icon dicon 'D Fieldcodes'"},
+    {"e-terminal.desktop",
+     "[Desktop Entry]\nType=Application\nName=E Terminal\nExec=vimalike %F\n"
+     "Terminal=true\nCategories=Utility;\n",
+     "run /bin/sh -e vimalike"},
+    {"f-long.desktop",
+     "[Desktop Entry]\nType=Application\n"
+     "Name=F Very Long Application Name That Overflows The Pane\n"
+     "Exec=longapp\nCategories=Utility;\n",
+     "run longapp"},
+    {"g-iconpng.desktop",
+     "[Desktop Entry]\nType=Application\nName=G Iconpng\nExec=gicon\n"
+     "Icon=testicon\nCategories=Utility;\n",
+     "run gicon"},
+    {"h-iconabs.desktop",
+     "[Desktop Entry]\nType=Application\nName=H Iconabs\nExec=hicon\n"
+     "Icon=%s/icons/hicolor/48x48/apps/testicon.png\nCategories=Utility;\n",
+     "run hicon"},
+    {"i-iconext.desktop",
+     "[Desktop Entry]\nType=Application\nName=I Iconext\nExec=iicon\n"
+     "Icon=testicon.png\nCategories=Utility;\n",
+     "run iicon"},
+    {"j-svgonly.desktop",
+     "[Desktop Entry]\nType=Application\nName=J Svgonly\nExec=jsvg\n"
+     "Icon=chatgpt\nCategories=Utility;\n",
+     "run jsvg"},
+    {"k-noicon.desktop",
+     "[Desktop Entry]\nType=Application\nName=K Missingicon\nExec=knoicon\n"
+     "Categories=Utility;\n",
+     "run knoicon"},
+    {"l-nonexistent.desktop",
+     "[Desktop Entry]\nType=Application\nName=L Nonexistent\n"
+     "Exec=/nonexistent/definitely-not-here\nCategories=Utility;\n",
+     "run /nonexistent/definitely-not-here"},
+    {"m-malformed.desktop",
+     "[Desktop Entry]\nType=Application\nName=M Malformed\n"
+     "Exec=badexec \"unterminated\nCategories=Utility;\n",
+     NULL},
+    {"z-unicode.desktop",
+     "[Desktop Entry]\nType=Application\nName=Zz \xc3\x9c\xc3\xa9 Caf\xc3\xa9\n"
+     "Exec=utfapp\nIcon=testicon\nCategories=Utility;\n",
+     "run utfapp"},
+};
+
+static void test_panel_launch_matrix(struct xwt_ctx *t) {
+    /* the appdir + a real icon theme under it */
+    char appdir[300];
+    snprintf(appdir, sizeof(appdir), "%s/mx-%d", g_runtimedir(), (int)getpid());
+    mkdir(appdir, 0755);
+    char appsub[340], themedir[512];
+    snprintf(appsub, sizeof(appsub), "%.320s/applications", appdir);
+    mkdir(appsub, 0755);
+    snprintf(themedir, sizeof(themedir), "%.480s/icons/hicolor/48x48/apps",
+             appdir);
+    for (char *p = themedir; (p = strchr(p + 1, '/')); )
+        *p = 0, mkdir(themedir, 0755), *p = '/';
+    mkdir(themedir, 0755);
+    /* a real PNG into the theme + an SVG-only ChatGPT stand-in */
+    char pngdst[600];
+    snprintf(pngdst, sizeof(pngdst), "%.560s/testicon.png", themedir);
+    FILE *src = fopen("tests/assets/blue32.png", "rb");
+    if (!src)
+        src = fopen("../tests/assets/blue32.png", "rb");
+    XWT_ASSERT(src);
+    FILE *dst = fopen(pngdst, "wb");
+    XWT_ASSERT(dst);
+    char cpbuf[4096];
+    size_t rn;
+    while ((rn = fread(cpbuf, 1, sizeof(cpbuf), src)) > 0)
+        fwrite(cpbuf, 1, rn, dst);
+    fclose(src);
+    fclose(dst);
+    char svgdir[512], svgpath[600];
+    snprintf(svgdir, sizeof(svgdir), "%.480s/icons/hicolor/scalable/apps",
+             appdir);
+    for (char *p = svgdir; (p = strchr(p + 1, '/')); )
+        *p = 0, mkdir(svgdir, 0755), *p = '/';
+    mkdir(svgdir, 0755);
+    snprintf(svgpath, sizeof(svgpath), "%.560s/chatgpt.svg", svgdir);
+    FILE *sf = fopen(svgpath, "w");
+    if (sf) {
+        fputs("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"48\" "
+              "height=\"48\"/></svg>\n",
+              sf);
+        fclose(sf);
+    }
+
+    /* the .desktop fixtures (h-iconabs needs the absolute icon path) */
+    char empty[300];
+    snprintf(empty, sizeof(empty), "%s/mxempty-%d", g_runtimedir(),
+             (int)getpid());
+    mkdir(empty, 0755);
+    for (size_t i = 0; i < sizeof(mx_fixtures) / sizeof(mx_fixtures[0]); i++) {
+        char path[512], body[1024];
+        const struct mx_fixture *fx = &mx_fixtures[i];
+        if (strstr(fx->body, "%s/icons/"))
+            snprintf(body, sizeof(body), fx->body, appdir);
+        else
+            snprintf(body, sizeof(body), "%s", fx->body);
+        snprintf(path, sizeof(path), "%s/%s", appsub, fx->file);
+        FILE *f = fopen(path, "w");
+        XWT_ASSERT(f);
+        fputs(body, f);
+        fclose(f);
+    }
+    setenv("XDG_DATA_HOME", appdir, 1);
+    setenv("XDG_DATA_DIRS", empty, 1);
+    setenv("XW_TERMINAL", "/bin/sh", 1); /* deterministic Terminal=true wrap */
+
+    /* the fake session manager socket */
+    char ctl_path[192];
+    snprintf(ctl_path, sizeof(ctl_path), "%s/xw-session.sock",
+             g_runtimedir());
+    unlink(ctl_path);
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    int ncpy = snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", ctl_path);
+    XWT_ASSERT(ncpy >= 0 && (size_t)ncpy < sizeof(addr.sun_path));
+    XWT_ASSERT(bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    XWT_ASSERT(listen(lfd, 8) == 0);
+
+    pid_t pid = spawn_panel(t, "-launchmx");
+    unsetenv("XDG_DATA_HOME");
+    unsetenv("XDG_DATA_DIRS");
+    unsetenv("XW_TERMINAL");
+    XWT_ASSERT(pid > 0);
+    PANEL_WAIT(t, first_top_layer(t) && first_top_layer(t)->mapped);
+
+    int alive_st = 0;
+    XWT_CHECK(panel_alive(pid, &alive_st), "panel alive at start");
+
+    /* drain any pending ctl connections (leftover async round trips) */
+    for (int i = 0; i < 3; i++) {
+        char drain[256];
+        bool any = false;
+        handled_ctl_line(lfd, drain, sizeof(drain), &any);
+        pump_ms(t, 60);
+    }
+
+    /* launch every runnable fixture. Navigation is by SEARCH (type the
+     * name, Enter launches the first hit) — geometry-free, exercises the
+     * same launch path a row click uses. After every launch: the ctl
+     * line must carry the expected command, the menu must close, and
+     * the panel process must still be alive (waitpid detects a crash). */
+    struct mx_nav {
+        const char *order;   /* fixture prefix */
+        const char *search;  /* what to type */
+    };
+    static const struct mx_nav nav[] = {
+        {"a-simple", "simple"}, {"b-args", "argline"},
+        {"c-quoted", "quoted"}, {"d-fields", "fieldcodes"},
+        {"e-terminal", "terminal"}, {"f-long", "very long"},
+        {"g-iconpng", "iconpng"}, {"h-iconabs", "iconabs"},
+        {"i-iconext", "iconext"}, {"j-svgonly", "svgonly"},
+        {"k-noicon", "missingicon"}, {"l-nonexistent", "nonexistent"},
+        {"z-unicode", "nicode"},
+    };
+    static const int KEY_OF_LETTER[26] = {
+        30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24,
+        25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44};
+    /* type one word (letters + spaces) into the menu search */
+    #define MX_TYPE_WORD(t, word)                                                \
+        do {                                                                     \
+            for (const char *c_ = (word); *c_; c_++) {                           \
+                uint32_t code_ = *c_ == ' ' ? 57 : KEY_OF_LETTER[*c_ - 'a'];     \
+                xw_compositor_inject_key(t->comp, code_, true);                  \
+                xwt_pump(t);                                                     \
+                xw_compositor_inject_key(t->comp, code_, false);                 \
+                pump_ms(t, 30);                                                  \
+            }                                                                    \
+        } while (0)
+    for (size_t i = 0; i < sizeof(nav) / sizeof(nav[0]); i++) {
+        /* open (the 300ms pacing clears the dismissal suppression) */
+        xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
+        pump_ms(t, 300);
+        xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+        xwt_pump(t);
+        xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+        if (!PANEL_WAIT(t, n_top_popups(t) == 1)) {
+            XWT_CHECK(false, "%s: menu did not open", nav[i].order);
+            break;
+        }
+        PANEL_WAIT(t, xw_seat_first(t->comp) &&
+                           xw_seat_first(t->comp)->grab_surface ==
+                               the_menu(t)->surface);
+        /* type the search word */
+        MX_TYPE_WORD(t, nav[i].search);
+        pump_ms(t, 60);
+        /* Enter launches the first (only) hit */
+        xw_compositor_inject_key(t->comp, 28 /* KEY_ENTER */, true);
+        xwt_pump(t);
+        xw_compositor_inject_key(t->comp, 28, false);
+
+        char line[256] = {0};
+        bool got = false;
+        for (int w = 0; w < 400 && !got; w++) {
+            xwt_pump(t);
+            handled_ctl_line(lfd, line, sizeof(line), &got);
+            usleep(10000);
+        }
+        const struct mx_fixture *fx = NULL;
+        for (size_t k = 0; k < sizeof(mx_fixtures) / sizeof(mx_fixtures[0]);
+             k++)
+            if (strncmp(mx_fixtures[k].file, nav[i].order,
+                        strlen(nav[i].order)) == 0)
+                fx = &mx_fixtures[k];
+        XWT_ASSERT(fx);
+        XWT_CHECK(got && strcmp(line, fx->expect_ctl) == 0,
+                  "%s -> ctl '%s' (expected '%s')", nav[i].order,
+                  got ? line : "(none)", fx->expect_ctl);
+        PANEL_WAIT(t, n_top_popups(t) == 0);
+        XWT_CHECK(n_top_popups(t) == 0, "%s: menu closed after launch",
+                  nav[i].order);
+        if (!panel_alive(pid, &alive_st)) {
+            XWT_CHECK(false, "PANEL CRASHED launching '%s'", nav[i].order);
+            break;
+        }
+    }
+    XWT_CHECK(panel_alive(pid, &alive_st),
+              "panel alive after launching every fixture");
+
+    /* the malformed Exec: refused — menu stays open, panel alive */
+    xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
+    pump_ms(t, 300);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, n_top_popups(t) == 1);
+    PANEL_WAIT(t, xw_seat_first(t->comp) &&
+                       xw_seat_first(t->comp)->grab_surface ==
+                           the_menu(t)->surface);
+    MX_TYPE_WORD(t, "malformed");
+    pump_ms(t, 60);
+    xw_compositor_inject_key(t->comp, 28, true);
+    xwt_pump(t);
+    xw_compositor_inject_key(t->comp, 28, false);
+    pump_ms(t, 400);
+    XWT_CHECK(n_top_popups(t) == 1,
+              "malformed Exec refused, menu stayed open");
+    XWT_CHECK(panel_alive(pid, &alive_st),
+              "panel alive after refused launch");
+    /* two Escapes: the first clears the search, the second closes */
+    for (int esc = 0; esc < 2; esc++) {
+        xw_compositor_inject_key(t->comp, K_ESC, true);
+        xwt_pump(t);
+        xw_compositor_inject_key(t->comp, K_ESC, false);
+        pump_ms(t, 80);
+    }
+    PANEL_WAIT(t, n_top_popups(t) == 0);
+
+    /* rapid relaunch burst: 8 launch cycles back to back */
+    for (int round = 0; round < 8; round++) {
+        xw_compositor_inject_pointer_motion(t->comp, START_CX, 15);
+        pump_ms(t, 220);
+        xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+        xwt_pump(t);
+        xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+        if (!PANEL_WAIT(t, n_top_popups(t) == 1))
+            break;
+        PANEL_WAIT(t, xw_seat_first(t->comp) &&
+                           xw_seat_first(t->comp)->grab_surface ==
+                               the_menu(t)->surface);
+        MX_TYPE_WORD(t, "simple");
+        xw_compositor_inject_key(t->comp, 28, true);
+        xwt_pump(t);
+        xw_compositor_inject_key(t->comp, 28, false);
+        char line[256] = {0};
+        bool got = false;
+        for (int w = 0; w < 200 && !got; w++) {
+            xwt_pump(t);
+            handled_ctl_line(lfd, line, sizeof(line), &got);
+            usleep(10000);
+        }
+        if (!panel_alive(pid, &alive_st)) {
+            XWT_CHECK(false, "PANEL CRASHED in rapid relaunch round %d",
+                      round);
+            break;
+        }
+    }
+    XWT_CHECK(panel_alive(pid, &alive_st), "panel alive after the burst");
+
+    reap(&pid);
+    unlink(ctl_path);
+    close(lfd);
+}
+
 static const struct xwt_test tests[] = {
     {"tasklist-client", test_tasklist_client},
     {"tasklist-workspace", test_tasklist_workspace},
@@ -1968,6 +2309,7 @@ static const struct xwt_test tests[] = {
     {"panel-start-repeated", test_panel_start_repeated},
     {"panel-menu", test_panel_menu},
     {"panel-menu-v2", test_panel_menu_v2},
+    {"panel-launch-matrix", test_panel_launch_matrix},
     {"panel-pager", test_panel_pager},
     {"panel-taskbar", test_panel_taskbar},
     {"panel-menu-compositor-shutdown", test_panel_menu_compositor_shutdown},

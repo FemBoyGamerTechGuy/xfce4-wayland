@@ -461,7 +461,7 @@ $(foreach p,$(PROT_PAIRS),$(eval $(call PROT_RULE,$(word 1,$(subst |, ,$(p))),$(
 # assets/fonts/README.md). XW_FONT=PATH overrides the source file for
 # packagers who want to rasterize their own font (needs Pillow).
 XW_FONT ?=
-XW_FONT_DEP := $(if $(XW_FONT),$(XW_FONT),assets/fonts/DejaVuSans-ascii.ttf)
+XW_FONT_DEP := $(if $(XW_FONT),$(XW_FONT),assets/fonts/DejaVuSans-latin.ttf)
 GEN_HEADERS += $(GEN)/xw-font-data.h
 
 $(GEN)/xw-font-data.h: tools/genfont.py $(XW_FONT_DEP) | $(GEN)

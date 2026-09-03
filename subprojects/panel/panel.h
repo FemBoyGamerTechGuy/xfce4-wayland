@@ -117,6 +117,11 @@ struct panel {
 int panel_text_width(const struct panel *p, const char *s);
 int panel_draw_text(const struct panel *p, uint32_t *pix, int stride, int w,
                     int h, int x, int y, const char *s, uint32_t color);
+/* UTF-8-safe ellipsized fit: copies src into dst[n] peeling whole
+ * codepoints until panel_text_width(dst) <= room, appending "…" (U+2026)
+ * when anything was cut. Never splits a multibyte character. */
+void panel_text_fit(const struct panel *p, char *dst, size_t n,
+                    const char *src, int room);
 
 /* the clock format engine (panel-clock.c): strftime-lite with an
  * ASCII-safe token set (%a %b %d %m %H %I %M %S %p %y %Y %%) */

@@ -126,20 +126,11 @@ static int exit_w(const struct panel *p) {
     return p->m.icon + 8 + panel_text_width(p, "Exit") + 2 * p->m.btn_pad_x;
 }
 
-/* truncate into b->label so the text fits `room` px, with a trailing
- * '~' ellipsis stand-in (ASCII font) */
+/* truncate into b->label so the text fits `room` px (UTF-8-safe, real
+ * ellipsis — panel_text_fit) */
 static void fit_label(const struct panel *p, char *label, size_t n,
-                       const char *text, int room) {
-    snprintf(label, n, "%.46s", text);
-    for (int used = panel_text_width(p, label);
-         used > room && strlen(label) > 1;
-         used = panel_text_width(p, label))
-        label[strlen(label) - 1] = 0;
-    size_t len = strlen(label);
-    if (len + 1 < n && strcmp(label, text) != 0) {
-        label[len] = '~';
-        label[len + 1] = 0;
-    }
+                      const char *text, int room) {
+    panel_text_fit(p, label, n, text, room);
 }
 
 /* rebuild btns[] + the region records from the current state */
