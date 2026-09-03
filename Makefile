@@ -568,10 +568,22 @@ $(OBJ)/session/%.o: src/session/%.c | $(OBJ)/session
 # from the CLIENT stack only: libxwcl + xw-ctl. It never links or
 # compiles anything from libxw — `make panel` works without the
 # compositor and the compositor never references it.
-build/bin/xw-panel: $(OBJ)/panel/xw-panel.o $(OBJ)/clients/xw-ctl.o build/lib/libxwcl.a | build/bin
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/panel/xw-panel.o $(OBJ)/clients/xw-ctl.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_PNG) $(LDLIBS_M)
+#
+# panel modules (menu, clock, pager, taskbar, apps database, config)
+# are archived into libpanelcore.a; xw-panel.c is the thin main. The
+# test suite links the same archive, so the modules are unit-tested
+# without spawning the binary.
+PANEL_MAIN := subprojects/panel/xw-panel.c
+PANEL_CORE_SRC := $(filter-out $(PANEL_MAIN),$(wildcard subprojects/panel/*.c))
+PANEL_CORE_OBJ := $(PANEL_CORE_SRC:subprojects/panel/%.c=$(OBJ)/panel/%.o)
 
-$(OBJ)/panel/%.o: subprojects/panel/%.c src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/panel
+build/lib/libpanelcore.a: $(PANEL_CORE_OBJ) | build/lib
+	$(AR) rcs $@ $(PANEL_CORE_OBJ)
+
+build/bin/xw-panel: $(OBJ)/panel/xw-panel.o build/lib/libpanelcore.a $(OBJ)/clients/xw-ctl.o build/lib/libxwcl.a | build/bin
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/panel/xw-panel.o build/lib/libpanelcore.a $(OBJ)/clients/xw-ctl.o build/lib/libxwcl.a $(LDLIBS_WLC) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_PNG) $(LDLIBS_M)
+
+$(OBJ)/panel/%.o: subprojects/panel/%.c src/libxwcl/*.h subprojects/panel/*.h $(GEN_HEADERS) | $(OBJ)/panel
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLC) $(CFLAGS_PIX) -c $< -o $@
 
 build/bin/xw-exit: $(OBJ)/clients/xw-exit.o $(OBJ)/clients/xw-ctl.o $(OBJ)/session/xw-power.o build/lib/libxwcl.a | build/bin
@@ -588,11 +600,11 @@ $(OBJ)/clients/%.o: src/clients/%.c src/clients/*.h src/libxwcl/*.h $(GEN_HEADER
 
 # ---------------------------------------------------------------- tests
 TEST_SRC := $(wildcard tests/suite/*.c)
-build/tests/run-tests: $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a | build/tests
-	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_WLC) $(LDLIBS_X11) $(LDLIBS_LIBINPUT) $(LDLIBS_LIBUDEV) $(LDLIBS_DRM) $(LDLIBS_LIBSEAT) $(LDLIBS_PNG) $(LDLIBS_M)
+build/tests/run-tests: $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a build/lib/libpanelcore.a | build/tests
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/harness.o $(OBJ)/tests/client.o $(patsubst tests/suite/%.c,$(OBJ)/tests/%.o,$(TEST_SRC)) build/lib/libxw.a build/lib/libxwcl.a build/lib/libpanelcore.a $(LDLIBS_WLS) $(LDLIBS_XKB) $(LDLIBS_PIX) $(LDLIBS_WLC) $(LDLIBS_X11) $(LDLIBS_LIBINPUT) $(LDLIBS_LIBUDEV) $(LDLIBS_DRM) $(LDLIBS_LIBSEAT) $(LDLIBS_PNG) $(LDLIBS_M)
 
-$(OBJ)/tests/%.o: tests/suite/%.c tests/harness/xwtest.h $(LIBXW_DEPS) src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/tests
-	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_WLC) $(CFLAGS_PIX) $(CFLAGS_XKB) $(HAVE_X11) $(HAVE_LIBINPUT) $(HAVE_LIBSEAT) $(HAVE_DRM) -c $< -o $@
+$(OBJ)/tests/%.o: tests/suite/%.c tests/harness/xwtest.h $(LIBXW_DEPS) src/libxwcl/*.h subprojects/panel/*.h $(GEN_HEADERS) | $(OBJ)/tests
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) -Isubprojects/panel $(CFLAGS_WLS) $(CFLAGS_WLC) $(CFLAGS_PIX) $(CFLAGS_XKB) $(HAVE_X11) $(HAVE_LIBINPUT) $(HAVE_LIBSEAT) $(HAVE_DRM) -c $< -o $@
 
 $(OBJ)/tests/harness.o: tests/harness/harness.c tests/harness/xwtest.h $(LIBXW_DEPS) src/libxwcl/*.h $(GEN_HEADERS) | $(OBJ)/tests
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLS) $(CFLAGS_XKB) $(CFLAGS_PIX) -c $< -o $@
