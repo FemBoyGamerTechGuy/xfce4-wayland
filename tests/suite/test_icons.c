@@ -149,6 +149,67 @@ static void test_font2(struct xwt_ctx *t) {
     XWT_CHECK(pix[5 * 80 + 10] == 0xff00ff00, "vline fills its column");
 }
 
+/* UTF-8 rendering: accented Latin glyphs must rasterize (the old
+ * ASCII-only font drew them as invisible blank gaps — application
+ * names appeared to be missing letters), the ellipsis must exist, and
+ * uncovered codepoints render a visible fallback box instead of
+ * vanishing. Truncation must never split a multibyte sequence. */
+static int lit_pixels(const uint32_t *pix, size_t n) {
+    int lit = 0;
+    for (size_t i = 0; i < n; i++)
+        if ((pix[i] >> 24) > 0x80)
+            lit++;
+    return lit;
+}
+
+static void test_utf8_render(struct xwt_ctx *t) {
+    (void)t;
+    /* Latin coverage: these codepoints are inside the rasterized
+     * ranges and MUST draw pixels */
+    static const struct {
+        const char *label;
+        const char *text;
+    } cases[] = {
+        {"e-acute", "Caf\xc3\xa9"},
+        {"u-umlaut", "Gr\xc3\xb6\xc3\x9f" "e"},
+        {"eszett", "Stra\xc3\x9f" "e"},
+        {"c-caron", "\xc4\x8d\xc3\xa8\xc5\xa1"},
+        {"euro", "\xe2\x82\xac"},
+        {"ellipsis", "\xe2\x80\xa6"},
+        {"en-dash", "\xe2\x80\x93"},
+        {"degree", "45\xc2\xb0"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint32_t pix[200 * 40];
+        memset(pix, 0, sizeof(pix));
+        xwc_draw_text(pix, 200, 200, 40, 4, 4, cases[i].text, 0xffffffff);
+        int lit = lit_pixels(pix, 200 * 40);
+        XWT_CHECK(lit > 4, "%s rasterized (%d px)", cases[i].label, lit);
+    }
+
+    /* a codepoint outside the coverage (CJK): a visible fallback box,
+     * not an invisible blank gap */
+    uint32_t pix[100 * 40];
+    memset(pix, 0, sizeof(pix));
+    xwc_draw_text(pix, 100, 100, 40, 4, 4, "\xe6\xbc\xa2", 0xffffffff);
+    int cjk_lit = lit_pixels(pix, 100 * 40);
+    XWT_CHECK(cjk_lit >= 8, "uncovered codepoint draws a fallback box (%d)",
+              cjk_lit);
+
+    /* widths are codepoint-aware: multibyte characters are not
+     * byte-counted */
+    XWT_CHECK(xwc_text_width("\xc3\xa9") == xwc_text_width("\xc3\xa8"),
+              "two accented e's share one advance");
+    XWT_CHECK(xwc_text_width("\xe2\x80\xa6") > 0, "ellipsis has width");
+
+    /* malformed UTF-8 (a sequence cut mid-character) never draws
+     * garbage and never reads past the terminator */
+    memset(pix, 0, sizeof(pix));
+    xwc_draw_text(pix, 100, 100, 40, 4, 4, "abc\xc3", 0xffffffff);
+    XWT_CHECK(lit_pixels(pix, 100 * 40) > 8, "prefix before a cut sequence "
+              "still renders");
+}
+
 static void test_xpm_direct(struct xwt_ctx *t) {
     (void)t;
     snprintf(t_dir, sizeof(t_dir), "/tmp/xwt-icons-%d", (int)getpid());
@@ -429,6 +490,7 @@ static const struct xwt_test tests[] = {
     {"client-font2", test_font2},
     {"client-icon-xpm-direct", test_xpm_direct},
     {"client-icon-png-direct", test_png_direct},
+    {"client-font-utf8", test_utf8_render},
     {"client-icon-theme-lookup", test_theme_lookup},
     {"client-icon-theme-inherit", test_theme_inherit},
     {"client-icon-theme-gtk", test_theme_gtk_discovery},

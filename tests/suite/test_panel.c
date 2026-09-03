@@ -12,6 +12,7 @@
  *     "exit-dialog" line).
  */
 #include "xwtest.h"
+#include "panel.h" /* panel_text_fit (libpanelcore) */
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -2363,6 +2364,61 @@ static void test_panel_launch_matrix(struct xwt_ctx *t) {
     reap(&pid);
 }
 
+/* panel_text_fit: UTF-8-safe ellipsized truncation — never splits a
+ * multibyte character, appends a real "…" when it had to cut, and
+ * leaves short strings untouched */
+static void test_panel_text_fit(struct xwt_ctx *t) {
+    (void)t;
+    struct panel p = {0};
+    p.m.big_font = false;
+
+    char out[64];
+
+    /* short string passes through verbatim */
+    panel_text_fit(&p, out, sizeof(out), "Vim", 200);
+    XWT_CHECK(strcmp(out, "Vim") == 0, "short name untouched (got '%s')",
+              out);
+
+    /* long ASCII name: cut with an ellipsis */
+    panel_text_fit(&p, out, sizeof(out),
+                   "Very Long Application Name That Cannot Fit", 90);
+    size_t len = strlen(out);
+    XWT_CHECK(len > 3 && strcmp(out + len - 3, "\xe2\x80\xa6") == 0,
+              "ASCII cut ends with an ellipsis (got '%s')", out);
+    XWT_CHECK(panel_text_width(&p, out) <= 90, "fitted width (%d)",
+              panel_text_width(&p, out));
+
+    /* unicode name: the cut lands on a codepoint boundary and the
+     * result is a valid UTF-8 string ending in an ellipsis */
+    panel_text_fit(&p, out, sizeof(out),
+                   "\xc3\x89\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9"
+                   "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9"
+                   "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9",
+                   60);
+    XWT_CHECK(strcmp(out + strlen(out) - 3, "\xe2\x80\xa6") == 0,
+              "unicode cut ends with an ellipsis (got '%s')", out);
+    /* no dangling continuation bytes: every trailing sequence is
+     * complete (a parser walk must land on ASCII or a lead byte) */
+    bool valid = true;
+    for (size_t i = 0; i < strlen(out);) {
+        unsigned char b = (unsigned char)out[i];
+        if (b < 0x80) {
+            i++;
+        } else if ((b & 0xE0) == 0xC0 && strlen(out) - i >= 2) {
+            i += 2;
+        } else if ((b & 0xF0) == 0xE0 && strlen(out) - i >= 3) {
+            i += 3;
+        } else {
+            valid = false; /* cut mid-sequence */
+            break;
+        }
+    }
+    XWT_CHECK(valid, "unicode cut stays on codepoint boundaries ('%s')",
+              out);
+    XWT_CHECK(panel_text_width(&p, out) <= 60, "unicode fitted width (%d)",
+              panel_text_width(&p, out));
+}
+
 static const struct xwt_test tests[] = {
     {"tasklist-client", test_tasklist_client},
     {"tasklist-workspace", test_tasklist_workspace},
@@ -2383,6 +2439,7 @@ static const struct xwt_test tests[] = {
     {"panel-clock-click", test_panel_clock_click},
     {"layer-before-outputs", test_layer_before_outputs},
     {"compositor-without-panel", test_compositor_without_panel},
+    {"panel-text-fit", test_panel_text_fit},
 };
 
 __attribute__((constructor)) static void register_tests(void) {
