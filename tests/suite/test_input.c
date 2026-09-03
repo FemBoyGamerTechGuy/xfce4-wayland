@@ -28,18 +28,33 @@ struct rec {
     int axes;
     uint32_t last_axis;
     double last_axis_value;
+    xkb_keysym_t last_sym;
+    uint32_t last_mods;
+    uint32_t last_press_mods; /* modifier mask at the last key PRESS */
+    bool saw_delete;          /* any Delete keysym delivered */
+    int c_events;             /* key events carrying the 'c' keysym */
+    uint32_t c_press_mods;    /* modifiers on the 'c' press */
 };
 
 static void rec_key(struct xwc_win *w, uint32_t keycode, bool down,
                     xkb_keysym_t sym, uint32_t mods, void *ud) {
     (void)w;
     (void)keycode;
-    (void)sym;
-    (void)mods;
     struct rec *r = ud;
     r->keys++;
     if (down)
         r->key_downs++;
+    r->last_sym = sym;
+    r->last_mods = mods;
+    if (down)
+        r->last_press_mods = mods;
+    if (sym == XKB_KEY_Delete)
+        r->saw_delete = true;
+    if (sym == XKB_KEY_c) {
+        r->c_events++;
+        if (down)
+            r->c_press_mods = mods;
+    }
 }
 
 static void rec_button(struct xwc_win *w, uint32_t button, bool down, int x,
@@ -474,12 +489,89 @@ static void test_input_acquisition_report(struct xwt_ctx *t) {
 
 #endif /* XW_HAVE_LIBINPUT */
 
+    /* Ctrl+C must NOT be a desktop shortcut: no compositor action may
+ * fire and the focused window's client receives the key with its
+ * modifier state intact (normal terminal/application semantics).
+ * Ctrl+Alt+Delete — the session action dialog binding — must keep
+ * working (it is consumed, the client never sees the Delete). */
+static int g_ca_actions[8];
+static int g_ca_n;
+static bool ca_action_hook(int action, const char *arg, void *ud) {
+    (void)arg;
+    (void)ud;
+    if (g_ca_n < 8)
+        g_ca_actions[g_ca_n++] = action;
+    return false; /* suppress the built-in handler (hook convention) */
+}
+
+static void test_ctrlc_passthrough(struct xwt_ctx *t) {
+    (void)t;
+    struct ictx ic = {0};
+    XWT_ASSERT(ictx_start(&ic, NULL, NULL));
+
+    g_ca_n = 0;
+    xw_compositor_set_action_hook(ic.comp, ca_action_hook, NULL);
+
+    /* 1. Ctrl+C: the key belongs to the client */
+    xw_compositor_inject_key(ic.comp, K_LEFTCTRL, true);
+    xw_compositor_inject_key(ic.comp, 46 /* KEY_C */, true);
+    for (int i = 0; i < 20; i++) {
+        xw_compositor_dispatch(ic.comp, 0);
+        xwc_drain(&ic.client);
+    }
+    xw_compositor_inject_key(ic.comp, 46, false);
+    xw_compositor_inject_key(ic.comp, K_LEFTCTRL, false);
+    for (int i = 0; i < 20; i++) {
+        xw_compositor_dispatch(ic.comp, 0);
+        xwc_drain(&ic.client);
+    }
+    XWT_CHECK(g_ca_n == 0, "no desktop shortcut fires on Ctrl+C (got %d)",
+              g_ca_n);
+    XWT_CHECK(ic.rec.c_events == 2,
+              "the client saw exactly the 'c' press+release (got %d)",
+              ic.rec.c_events);
+    if (ic.rec.c_events >= 2) {
+        XWT_CHECK(ic.rec.c_press_mods != 0,
+                  "the 'c' press carries the Ctrl modifier (0x%x)",
+                  ic.rec.c_press_mods);
+    }
+
+    /* 2. Ctrl+Alt+Delete: the session action dialog, preserved */
+    g_ca_n = 0;
+    ic.rec.keys = 0;
+    xw_compositor_inject_key(ic.comp, K_LEFTCTRL, true);
+    xw_compositor_inject_key(ic.comp, K_LEFTALT, true);
+    xw_compositor_inject_key(ic.comp, K_DELETE, true);
+    for (int i = 0; i < 20; i++) {
+        xw_compositor_dispatch(ic.comp, 0);
+        xwc_drain(&ic.client);
+    }
+    xw_compositor_inject_key(ic.comp, K_DELETE, false);
+    xw_compositor_inject_key(ic.comp, K_LEFTALT, false);
+    xw_compositor_inject_key(ic.comp, K_LEFTCTRL, false);
+    for (int i = 0; i < 20; i++) {
+        xw_compositor_dispatch(ic.comp, 0);
+        xwc_drain(&ic.client);
+    }
+    XWT_CHECK(g_ca_n >= 1 && g_ca_actions[0] == XW_ACTION_EXIT_DIALOG,
+              "Ctrl+Alt+Delete opens the session action dialog (got %d "
+              "actions, first %d)",
+              g_ca_n, g_ca_n ? g_ca_actions[0] : -1);
+    XWT_CHECK(!ic.rec.saw_delete,
+              "the consumed Delete never reaches the client (modifier "
+              "keys themselves are ordinary keys and may pass)");
+
+    xw_compositor_set_action_hook(ic.comp, NULL, NULL);
+    ictx_stop(&ic);
+}
+
 __attribute__((constructor)) static void register_input(void) {
-    static const struct xwt_test tests[] = {
+static const struct xwt_test tests[] = {
         {"repeat-info", test_repeat_info},
         {"repeat-info-config", test_repeat_info_config},
         {"wm-key-repeat", test_wm_key_repeat},
         {"client-no-double-repeat", test_client_no_double_repeat},
+        {"ctrlc-passthrough", test_ctrlc_passthrough},
 #ifdef XW_HAVE_LIBINPUT
         {"input-lifecycle", test_input_lifecycle},
         {"input-auto-off", test_input_auto_off},
