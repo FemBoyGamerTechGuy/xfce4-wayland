@@ -1955,3 +1955,79 @@ session: Ctrl+Alt+F2 away + back, Ctrl+C from the launching TTY,
 Start menu open/launch, repeated Start clicking), then continue the
 XFCE parity list (ROADMAP: icons, categories, favorites, clock
 popup).
+
+---
+
+## 2026-09-03 — panel polish round: launching, icons, text, and a teardown use-after-free
+
+The user report: applications missing icons, menu names with missing
+letters, and xw-panel crashing when launching an application; plus the
+explicit constraints — Ctrl+C must NOT be a desktop shortcut, Ctrl+Alt+Del
+must keep opening the session action dialog.
+
+**Reproduction first.** Built `panel-launch-matrix`: 14 realistic
+.desktop fixtures (quoted/escaped Exec, field codes, Terminal=true,
+unicode names, every icon flavor, nonexistent executable, malformed
+Exec) launched end-to-end through the real menu, with waitpid-based
+panel death detection. The client-side launch path turned out robust
+(19 launches, zero crashes) — the in-container reproduction could not
+reproduce the user's exact crash (no real DRM/apps here), so the fix
+strategy was to eliminate the entire fragile launch class instead
+(see below). Along the way the reproduction DID flush out a real
+allocator bug (below) and several test-infrastructure defects.
+
+**Root causes found and fixed:**
+
+1. **Missing letters**: the bundled font raster covered only ASCII
+   0x20..0x7E and the blitter iterated BYTES — every accented letter
+   in a .desktop Name rendered as an invisible blank gap, and the
+   label fitters cut raw bytes, splitting multibyte characters. New
+   `DejaVuSans-latin.ttf` asset (Latin-1 + Latin Extended-A/B +
+   punctuation incl. U+2026), codepoint-indexed tables, UTF-8 decoder
+   in the renderer, visible tofu box for uncovered codepoints,
+   `panel_text_fit` (UTF-8-boundary truncation + real ellipsis) used
+   everywhere. (fba5e11)
+2. **The launch path**: replaced the fork-inside-dispatch +
+   session-ctl-relay + `/bin/sh -c` chain with direct `posix_spawn` of
+   the spec-parsed Exec argv (panel-launch.c): SETSIGDEF/SETSIGMASK,
+   stdio on /dev/null, executable sanity checked, visible failures
+   (red status line + diagnostics), menu lifecycle hardened (data
+   copied first, closed only after success). Terminal=true hosting
+   now passes the application argv directly for -x/--/positional
+   terminal styles. (d8e5b64)
+3. **Missing icons**: (a) the libxwcl compile rule never passed
+   -DXW_HAVE_PNG — PNG decoding was compiled out entirely even with
+   libpng present (the .features stamp said png=y; the decode test
+   silently skipped); (b) the active theme was never discovered from
+   GTK/XFCE settings; (c) Inherit= chains were not followed; (d)
+   Icon= values with an extension never matched. All fixed; misses
+   log once and render a generic app-grid glyph. The audit also
+   caught that xw-compositor needed the PNG libs on its link line.
+   (e799ded, 1102436)
+4. **A latent teardown use-after-free**: wl_seat bindings had no
+   resource destructor; wl_display_destroy_clients (which runs before
+   seat teardown) freed them, and xw_seat_destroy's cleanup walk
+   wl_list_remove'd the freed links — a heap-corrupting write that
+   surfaced as rare glibc "double free or corruption" aborts once the
+   font tables shifted the heap layout. Found via a deterministic
+   MALLOC_PERTURB_ reproduction + LD_PRELOAD backtracer (no gdb in
+   the container); bisected to the first font commit purely by
+   layout. Destructors added; the destroy walk removed. (1432868)
+5. **%k field code** implemented (the .desktop file's location).
+   (2ca72d4)
+
+**Keyboard contract**: verified no Ctrl+C desktop shortcut exists
+anywhere (defaults, examples, code); new `ctrlc-passthrough` test
+proves Ctrl+C fires no compositor action and the focused client
+receives the key with its modifier state, while Ctrl+Alt+Delete still
+dispatches the exit-dialog action and is consumed. (d54039e)
+
+**Validation**: 108/108 in-process (release, twice under
+MALLOC_PERTURB_, full ASan/UBSan/LSan round), 144/144 process-level
+session tests, 51/51 build regressions, 8/8 link audits.
+
+Next: hardware verification on the user's NVIDIA box per the new
+manual panel checklist in TESTING.md (names without missing letters,
+ChatGPT-style icon resolution, terminal+graphical launches, failed
+launch behavior, Ctrl+C terminal semantics, Ctrl+Alt+Del), then the
+backlog (notification daemon, output management, PAM unlock).
