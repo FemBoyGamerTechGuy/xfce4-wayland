@@ -297,14 +297,23 @@ panel-clock.c   clock format engine + the calendar popup
 panel-pager.c   the graphical workspace pager (miniature desktops)
 panel-taskbar.c the window-button overflow list
 panel-config.c  the panel.conf INI reader + defaults
-panel-util.c    shared trace/ctl/time/metrics/text helpers
+panel-util.c    shared trace/ctl/time/metrics + UTF-8-safe text
+                fitting (panel_text_fit: codepoint-boundary
+                truncation with a real ellipsis) and the generic
+                fallback icon glyph
+panel-launch.c  the application launcher: executes the parsed
+                desktop-entry argv directly (posix_spawn, no shell,
+                no session relay), resets the child's signal state,
+                reports failures visibly on the bar
 ```
 
 **Layout** is metric-driven, not pixel-hardcoded: the bar height
 derives from the output's *logical* size (auto mode, 30 px at 720p
 class up to 52 at 4K; `height=` overrides) so it stays proportional
 when the compositor exposes a scale; fonts pick the 16 or 24 px
-raster, icons and paddings derive from the height. The region order
+raster (UTF-8 decoded; Latin-1 + Latin Extended + punctuation
+coverage — codepoints beyond it render a visible fallback box),
+icons and paddings derive from the height. The region order
 is the XFCE one — `[Start|launchers] [taskbar…] [pager][clock][Exit]`
 — with the taskbar consuming the flexible middle; overlap is
 impossible by construction (one flat widget array laid out from both

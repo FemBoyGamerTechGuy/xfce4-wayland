@@ -1051,7 +1051,7 @@ your distribution's package (`python3-pil` / `python-pillow` /
 `python3-pillow`) or run `python3 -m pip install --user pillow`
 (no root needed).
 
-**`the bundled font asset assets/fonts/DejaVuSans-ascii.ttf is missing`**
+**`the bundled font asset assets/fonts/DejaVuSans-latin.ttf is missing`**
 The checkout is damaged (the font ships in the repository and no
 system font is ever searched). Restore it with
 `git checkout -- assets/fonts` or re-extract the release archive.

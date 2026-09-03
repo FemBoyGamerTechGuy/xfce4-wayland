@@ -224,6 +224,24 @@ one.
   clicks switch workspaces end-to-end, exit button sends the ctl
   `exit-dialog` line (fake session manager accepts it), panel survives
   the action
+- **panel launch matrix (this round): 14 realistic .desktop fixtures
+  (quoted/escaped Exec arguments, field codes, Terminal=true through a
+  stub terminal, unicode names, long names, every icon flavor,
+  nonexistent executable, malformed Exec) each launched end-to-end
+  from the menu — the real child process must create its marker file,
+  the menu must close, and `waitpid` must prove the panel survived;
+  refused launches keep the menu open and show the red status line;
+  an 8-round rapid relaunch burst spawns 8 processes back-to-back.
+  Companion unit suites: apps-spawn (posix_spawn contract: marker,
+  PATH lookup, visible failures), ctrlc-passthrough (Ctrl+C fires no
+  compositor action and the client receives the key with its modifier
+  state; Ctrl+Alt+Delete still opens the exit dialog and is consumed),
+  client-font-utf8 (accented Latin/euro/ellipsis glyphs rasterize; a
+  CJK codepoint draws the fallback box; cut sequences never draw
+  garbage), panel-text-fit (UTF-8-boundary truncation with a real
+  ellipsis), theme-inherit / theme-gtk / theme-xfce / ext-strip
+  (Inherit= chains, gtk-3.0/xfconf theme discovery,
+  extension-stripped icon names)**
 - **panel interaction lifecycle (panel-interact round): pointer
   enter/leave transitions on the real forked bar with hover-fill
   rendering through the full enter+motion+redraw path (checked clear
@@ -365,6 +383,32 @@ tests). Verify on real hardware, in this order:
 6. Repeated with: seatd (and the built-in client), libseat over
    logind, libseat over elogind where available, and `--seat-provider=direct`
    from the TTY login. Any provider you could not test, say so.
+
+### Manual panel checklist (application launching, this round)
+
+On the real DRM session, after the generic checks above:
+
+1. Panel visible; Start menu opens; application names render without
+   missing letters (check entries with accents — Éditeur, Größe —
+   and a long name that must end with an ellipsis, not a cut glyph).
+2. Icons render for common apps AND for apps whose icons only exist
+   in the configured (GTK/XFCE) icon theme — e.g. a ChatGPT-style
+   AppImage/AUR entry: it resolves through the same generic theme
+   path, no special-casing. An icon that only exists as SVG renders
+   the generic app-grid glyph (documented deviation).
+3. Launch a terminal, a graphical application, an app with
+   spaces/quotes in its Exec, one with field codes, one with
+   Terminal=true: xw-panel stays alive (check
+   `pgrep -x xw-panel`), the menu closes after each success.
+4. Launch an app whose executable is missing: the panel survives, a
+   red status line appears next to Start, the menu stays open.
+5. Rapid Start clicks + repeated launches: no crash, no freeze.
+6. Ctrl+C inside the launched terminal interrupts programs in that
+   terminal normally (it is NOT a desktop shortcut; the compositor
+   never eats it). Ctrl+Alt+Del still opens the session action
+   dialog (logout/reboot/shutdown); Escape dismisses it; the panel
+   keeps working afterward.
+7. Clock, calendar, pager, taskbar, Exit button still function.
 
 ## Regression policy
 

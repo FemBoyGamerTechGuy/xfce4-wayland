@@ -229,9 +229,19 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
   scale-aware icons), the XFCE region order [Start|launchers]
   [taskbar] [pager][clock][Exit], top/bottom position, panel.conf
   configuration with complete defaults.
+- DONE panel hardening (M-panel-polish): direct application
+  launching (posix_spawn of the spec-parsed Exec argv — no shell, no
+  session relay, signal state reset, visible failure status line),
+  UTF-8 text rendering with Latin coverage + safe ellipsized
+  truncation (missing/clipped letters fixed), icon-theme resolution
+  following Inherit= chains and the desktop's configured theme
+  (GTK/XFCE), PNG decode actually wired into the build, missing-icon
+  fallback glyph + one-shot miss logging; Ctrl+C verified to pass
+  through to clients (never a desktop shortcut) while Ctrl+Alt+Del
+  keeps opening the session action dialog.
 - PART remaining limits: single output; fixed plugin order; no
   plugin API; SVG icons not renderable (no vector stack — PNG/XPM
-  only, procedural fallbacks); calendar days display-only (no event
+  only, generic fallback glyph); calendar days display-only (no event
   list); menu does not cascade flyout submenus (two-pane instead);
   no recent-apps tracking.
 - TODO panel plugin API, notification daemon, desktop icons,
