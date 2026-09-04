@@ -55,6 +55,8 @@
 /* the window-control manager binding (defined with the Wayland code;
  * the X event handlers send identity updates through it) */
 static struct xw_window_control_manager_v1 *wc;
+static uint32_t wc_version = 1; /* the bound protocol version — v3
+                                    requests are only sent on v3 */
 #define XWM_LOG(lvl, ...)                                                      \
     do {                                                                       \
         if (g_verbose || (lvl)[0] == 'e') {                                    \
@@ -79,6 +81,7 @@ static uint32_t atom_wm_state, atom_wm_hints, atom_wm_normal_hints;
 static uint32_t atom_wm_take_focus, atom_utf8_string, atom_net_close_window;
 static uint32_t atom_net_supported, atom_net_client_list, atom_net_active_window;
 static uint32_t atom_net_current_desktop, atom_net_number_of_desktops;
+static uint32_t atom_net_wm_state, atom_net_wm_state_fs;
 static uint32_t atom_atom, atom_window_type; /* property type atoms */
 static uint32_t op_composite = 0;
 
@@ -102,6 +105,11 @@ struct xw_win {
     bool take_focus; /* WM_TAKE_FOCUS listed */
     bool wants_input;  /* WM_HINTS InputHint value (default true) */
     bool has_input_hint;
+    /* EWMH _NET_WM_STATE_FULLSCREEN bookkeeping: what the X side asked
+     * and what we told the compositor (the compositor is the state
+     * authority; our copy exists to resolve TOGGLE messages and to
+     * keep the X property in sync) */
+    bool fullscreen;
     /* last geometry WE applied with ConfigureWindow (loop guard: a
      * client that re-requests its own size after our mirror must not
      * make us reconfigure identical geometry forever) */
@@ -116,6 +124,18 @@ struct xw_win {
      * through bw. */
     int32_t x, y, w, h;
     int32_t bw;
+    /* Xwayland surface-space calibration, MEASURED per window: does
+     * Xwayland size this window's wl_surface to the X11 extent
+     * (interior + 2*bw — observed for x11client/xterm-style windows)
+   * or to the interior alone (observed for Xaw apps like xeyes)?
+     * Learned by comparing the compositor's mirrored size against
+     * the X truth (CreateNotify/ConfigureNotify); every conversion
+     * between compositor space and X11 space then uses the measured
+     * relation. Without this, the interior-convention windows lose
+     * 2*border pixels per mirror round — the border ratchet that
+     * shrank real clients to nothing. 0 = not yet measured,
+     * 1 = surface is the extent, 2 = surface is the interior. */
+    int8_t surf_mode;
 };
 
 static struct xw_win wins[XWM_MAX_WINDOWS];
@@ -975,6 +995,140 @@ static void win_read_properties(struct xw_win *w) {
 
 /* push identity + hints + OR state to the compositor, if the serial
  * association has landed (the requests are keyed by serial) */
+/* ------------------------------------------------- surface-space calibrate */
+
+/* Measure which space Xwayland sizes this window's wl_surface to:
+ * the X11 extent (interior + 2*bw) or the interior alone. Both
+ * conventions occur in the wild with the same Xwayland build
+ * (measured: x11client/xterm-style windows get the extent; Xaw apps
+ * like xeyes get the interior). The relation is derived per window
+ * from the X truth (CreateNotify/ConfigureNotify) versus the size
+ * the compositor mirrors — the surface buffer IS the compositor's
+ * model, so comparing the two reveals the convention. Re-measured
+ * whenever the current mode's prediction fails AND one matches
+ * exactly, so a client that changes its own geometry cannot wedge
+ * the calibration. */
+static void win_calibrate(struct xw_win *w, int32_t mw, int32_t mh) {
+    if (w->bw < 0)
+        w->bw = 0;
+    bool is_extent = (mw == w->w + 2 * w->bw && mh == w->h + 2 * w->bw);
+    bool is_interior = (mw == w->w && mh == w->h);
+    int8_t measured = is_extent ? 1 : (is_interior ? 2 : 0);
+    if (measured && measured != w->surf_mode) {
+        w->surf_mode = measured;
+        XWM_LOG("info",
+                "window 0x%x: Xwayland sizes its surface to the X11 %s "
+                "(measured %dx%d vs interior %dx%d border %d)",
+                w->xid, measured == 1 ? "extent (interior + 2*border)"
+                                     : "interior",
+                mw, mh, w->w, w->h, w->bw);
+    } else if (!w->surf_mode) {
+        w->surf_mode = 1; /* no exact match (client self-resized):
+                             the documented extent convention */
+    }
+}
+
+/* compositor(surface) space -> X11 interior space */
+static int32_t surf_to_interior(struct xw_win *w, int32_t v) {
+    return w->surf_mode == 2 ? v : v - 2 * (w->bw > 0 ? w->bw : 0);
+}
+
+/* compositor(surface) origin -> X11 window position: for
+ * extent-space windows the interior origin sits bw inside the
+ * surface; interior-space windows put the window right at it */
+static int32_t surf_to_pos(struct xw_win *w, int32_t v) {
+    return w->surf_mode == 2 ? v : v + (w->bw > 0 ? w->bw : 0);
+}
+
+/* X11 interior -> compositor(surface) space (for the set_geometry
+ * push: the compositor model must equal what Xwayland's surface will
+ * actually be) */
+static int32_t interior_to_surf(struct xw_win *w, int32_t v) {
+    return w->surf_mode == 2 ? v : v + 2 * (w->bw > 0 ? w->bw : 0);
+}
+
+static int32_t interior_pos_to_surf(struct xw_win *w, int32_t v) {
+    return w->surf_mode == 2 ? v : v - (w->bw > 0 ? w->bw : 0);
+}
+
+/* ------------------------------------------------ EWMH fullscreen state */
+
+/* read _NET_WM_STATE (ATOM list) and record whether FULLSCREEN is set —
+ * the map-time EWMH path: games/players set the property before
+ * mapping instead of sending the runtime message */
+static void win_read_fs(struct xw_win *w) {
+    if (!atom_net_wm_state || !atom_net_wm_state_fs)
+        return;
+    int32_t n = x_get_property(w->xid, atom_net_wm_state, atom_atom,
+                               sizeof(prop_val) / 4);
+    if (n <= 0) {
+        w->fullscreen = false;
+        return;
+    }
+    w->fullscreen = false;
+    for (int32_t i = 0; i + 4 <= n; i += 4)
+        if (get32(prop_val, (size_t)i) == atom_net_wm_state_fs) {
+            w->fullscreen = true;
+            break;
+        }
+}
+
+/* forward the state request to the compositor (the authority): on=1
+ * enter, 0 leave, 2 toggle (the compositor resolves it). v2 bindings
+ * have no set_fullscreen — logged honestly instead of silently
+ * dropped. */
+static void win_send_fs(struct xw_win *w, uint32_t action) {
+    if (!w || !w->serial)
+        return;
+    if (!wc)
+        return;
+    if (wc_version < 3) {
+        XWM_LOG("warn",
+                "window 0x%x fullscreen request dropped: compositor "
+                "offers window-control v%u (need 3)",
+                w->xid, wc_version);
+        return;
+    }
+    XWM_LOG("info", "window 0x%x EWMH fullscreen %s -> compositor",
+            w->xid, action == 1 ? "enter" : action == 0 ? "leave"
+                                                        : "toggle");
+    xw_window_control_manager_v1_set_fullscreen(
+        wc, (uint32_t)(w->serial >> 32), (uint32_t)w->serial, action);
+}
+
+/* keep _NET_WM_STATE in sync with the granted state (EWMH: the WM owns
+ * the property). Atoms we do not understand are preserved verbatim —
+ * another state the client set stays untouched. */
+static void win_sync_fs_prop(struct xw_win *w) {
+    if (!atom_net_wm_state || !atom_net_wm_state_fs)
+        return;
+    /* read the CURRENT list (up to 63 atoms, bounded by prop_val) */
+    int32_t n = x_get_property(w->xid, atom_net_wm_state, atom_atom,
+                               sizeof(prop_val) / 4);
+    uint32_t atoms[64];
+    int count = 0;
+    bool has_fs = false;
+    if (n > 0) {
+        for (int32_t i = 0; i + 4 <= n && count < 63; i += 4) {
+            uint32_t a = get32(prop_val, (size_t)i);
+            if (a == atom_net_wm_state_fs) {
+                has_fs = true;
+                if (w->fullscreen)
+                    atoms[count++] = a; /* keep */
+                /* else: drop it — that is the sync */
+            } else {
+                atoms[count++] = a; /* preserve foreign state */
+            }
+        }
+    }
+    if (w->fullscreen && !has_fs)
+        atoms[count++] = atom_net_wm_state_fs;
+    if (!w->fullscreen && !has_fs && count == 0 && n == 0)
+        return; /* nothing there, nothing to remove */
+    x_change_property_32(w->xid, atom_net_wm_state, atom_atom,
+                         (uint32_t)count, atoms);
+}
+
 static void win_send_identity(struct xw_win *w) {
     if (!wc || !w || !w->serial)
         return;
@@ -1044,10 +1198,9 @@ void xwm_handle_event(const uint8_t *ev) {
             w->w = get16(ev, 16);
             w->h = get16(ev, 18);
             w->bw = get16(ev, 20);
-            if (w->override)
-                XWM_LOG("info", "CreateNotify: 0x%x override-redirect "
-                        "%dx%d+%d+%d border %d (popup-class)", window,
-                        w->w, w->h, w->x, w->y, w->bw);
+            XWM_LOG("info", "CreateNotify: 0x%x %dx%d+%d+%d border %u%s",
+                    window, w->w, w->h, w->x, w->y, w->bw,
+                    w->override ? " (override-redirect)" : "");
         }
         break;
     }
@@ -1161,16 +1314,18 @@ void xwm_handle_event(const uint8_t *ev) {
         wi->w = gw;
         wi->h = gh;
         /* the granted resize is X truth the compositor must adopt:
-         * push it as the window's EXTENT (Xwayland only sends a new
-         * surface buffer when the client draws — an undrawn resize
-         * would otherwise leave the compositor's model stale, and
-         * the taskbar/snap geometry wrong). Not echoed back: the X
-         * side already has this state. */
+         * push it in the space the surface actually uses (measured —
+         * see win_calibrate) so the model equals Xwayland's next
+         * buffer (Xwayland only sends a new surface buffer when the
+         * client draws — an undrawn resize would otherwise leave
+         * the compositor's model stale, and the taskbar/snap
+         * geometry wrong). Not echoed back: the X side already has
+         * this state. */
         if (wi->serial && wc) {
-            int32_t bwx = wi->bw > 0 ? wi->bw : 0;
             xw_window_control_manager_v1_set_geometry(
                 wc, (uint32_t)(wi->serial >> 32), (uint32_t)wi->serial,
-                px - bwx, py - bwx, gw + 2 * bwx, gh + 2 * bwx);
+                interior_pos_to_surf(wi, px), interior_pos_to_surf(wi, py),
+                interior_to_surf(wi, gw), interior_to_surf(wi, gh));
         }
         break;
     }
@@ -1191,25 +1346,41 @@ void xwm_handle_event(const uint8_t *ev) {
                         (unsigned long long)serial);
                 /* identity now that the compositor can key on it */
                 win_send_identity(w);
+                /* the map-time EWMH state: apps that start fullscreen
+                 * set _NET_WM_STATE before mapping (no runtime
+                 * message). Forward it so the compositor applies its
+                 * own fullscreen logic; the property already carries
+                 * it, so no sync is needed here. */
+                win_read_fs(w);
+                if (w->fullscreen) {
+                    XWM_LOG("info", "window 0x%x starts fullscreen "
+                            "(_NET_WM_STATE at map)", window);
+                    win_send_fs(w, 1);
+                }
                 /* apply any geometry the compositor sent before this
                  * association arrived, so the X position matches our
                  * placement (input coordinates) from the first click */
                 struct pending_geom pg;
                 if (pend_take(serial, &pg)) {
-                    /* pendings are extent-space (compositor coords) */
-                    int32_t pbw = w->bw > 0 ? w->bw : 0;
-                    int32_t piw = pg.w - 2 * pbw, pih = pg.h - 2 * pbw;
+                    /* calibrate against this mirror first: the pending
+                     * IS a (stashed) compositor mirror, and the
+                     * conversion below depends on the measured
+                     * convention */
+                    win_calibrate(w, pg.w, pg.h);
+                    /* pendings are compositor(surface) coords */
+                    int32_t piw = surf_to_interior(w, pg.w);
+                    int32_t pih = surf_to_interior(w, pg.h);
                     if (piw < 1) piw = 1;
                     if (pih < 1) pih = 1;
                     XWM_LOG("info",
                             "  applying pending geometry %dx%d+%d+%d "
                             "(interior %dx%d)",
                             pg.w, pg.h, pg.x, pg.y, piw, pih);
-                    x_configure_window(window, pg.x + pbw, pg.y + pbw, piw,
-                                       pih);
+                    x_configure_window(window, surf_to_pos(w, pg.x),
+                                       surf_to_pos(w, pg.y), piw, pih);
                     w->have_last_geom = true;
-                    w->last_x = pg.x + pbw;
-                    w->last_y = pg.y + pbw;
+                    w->last_x = surf_to_pos(w, pg.x);
+                    w->last_y = surf_to_pos(w, pg.y);
                     w->last_w = piw;
                     w->last_h = pih;
                 }
@@ -1238,6 +1409,34 @@ void xwm_handle_event(const uint8_t *ev) {
                     "_NET_ACTIVE_WINDOW request for 0x%x - no channel "
                     "to the compositor focus model yet",
                     get32(ev, 16));
+            break;
+        }
+        if (type == atom_net_wm_state) {
+            /* the runtime EWMH state change — exactly what GTK/Qt/SDL
+             * send: l[0]=1 add / 0 remove / 2 toggle, l[1] and l[2] the
+             * state atoms involved, l[3]=1 source=application. We
+             * manage FULLSCREEN; other atoms arrive (MAXIMIZED etc.)
+             * and are honestly logged as unimplemented. */
+            uint32_t action = get32(ev, 12);
+            uint32_t a1 = get32(ev, 16), a2 = get32(ev, 20);
+            struct xw_win *w = win_find_xid(window);
+            if (w && w->managed) {
+                if (a1 == atom_net_wm_state_fs || a2 == atom_net_wm_state_fs) {
+                    if (action == 2)
+                        w->fullscreen = !w->fullscreen;
+                    else
+                        w->fullscreen = (action == 1);
+                    win_send_fs(w, action);
+                    win_sync_fs_prop(w);
+                } else {
+                    XWM_LOG("info",
+                            "_NET_WM_STATE request for 0x%x with an "
+                            "atom we do not manage (%u/%u) - not "
+                            "implemented, ignored honestly",
+                            window, a1, a2);
+                }
+            }
+            break;
         }
         break;
     }
@@ -1363,16 +1562,19 @@ static void wc_geometry(void *data,
          * nothing authoritative to say about it */
         return;
     }
-    /* The compositor speaks EXTENT (the wl_surface covers the X11
-     * window including its border); ConfigureWindow speaks INTERIOR.
-     * Converting naively (as v0 did) reconfigures the window to its
-     * own extent, the new extent lands as a bigger surface, the
-     * compositor mirrors back, and the window grows 2*border per
-     * round — the border ratchet. interior = extent + bw, because
-     * the X11 interior origin sits bw pixels INSIDE the extent. */
-    int32_t bw = w->bw > 0 ? w->bw : 0;
-    int32_t ix = x + bw, iy = y + bw;
-    int32_t iw = width - 2 * bw, ih = height - 2 * bw;
+    /* calibrate FIRST: the conversion below must use the measured
+     * surface convention, or interior-space windows get resized on
+     * every mirror (the border ratchet) */
+    win_calibrate(w, width, height);
+    /* The compositor speaks the SURFACE (whatever Xwayland sizes it
+     * to for this window — see win_calibrate); ConfigureWindow speaks
+     * the X11 INTERIOR. The measured conversion keeps the round trip
+     * stable: surface -> interior -> Xwayland's next surface == the
+     * same size, so no echo storm can shrink the window. */
+    int32_t bw2 = 2 * (w->bw > 0 ? w->bw : 0);
+    int32_t ix = surf_to_pos(w, x), iy = surf_to_pos(w, y);
+    int32_t iw = width - (w->surf_mode == 2 ? 0 : bw2);
+    int32_t ih = height - (w->surf_mode == 2 ? 0 : bw2);
     if (iw < 1) iw = 1;
     if (ih < 1) ih = 1;
     if (w->have_last_geom && w->last_x == ix && w->last_y == iy &&
@@ -1426,11 +1628,16 @@ static void registry_global(void *data, struct wl_registry *r, uint32_t name,
             XWM_LOG("warn",
                     "compositor offers window-control v%u (need 2 for "
                     "identity/focus) — binding anyway", version);
+        if (version >= 2 && version < 3)
+            XWM_LOG("info",
+                    "compositor offers window-control v2 (v3 adds EWMH "
+                    "fullscreen forwarding) — binding v2");
+        uint32_t bindv = version >= 3 ? 3 : (version >= 2 ? 2 : version);
         wc = wl_registry_bind(
-            r, name, &xw_window_control_manager_v1_interface,
-            version >= 2 ? 2 : version);
+            r, name, &xw_window_control_manager_v1_interface, bindv);
+        wc_version = bindv;
         xw_window_control_manager_v1_add_listener(wc, &wc_listener, NULL);
-        XWM_LOG("info", "window-control manager bound");
+        XWM_LOG("info", "window-control manager bound (v%u)", bindv);
     }
 }
 
@@ -1601,6 +1808,8 @@ int main(int argc, char **argv) {
     atom_net_active_window = x_intern_atom("_NET_ACTIVE_WINDOW");
     atom_net_current_desktop = x_intern_atom("_NET_CURRENT_DESKTOP");
     atom_net_number_of_desktops = x_intern_atom("_NET_NUMBER_OF_DESKTOPS");
+    atom_net_wm_state = x_intern_atom("_NET_WM_STATE");
+    atom_net_wm_state_fs = x_intern_atom("_NET_WM_STATE_FULLSCREEN");
     atom_atom = x_intern_atom("ATOM");
     atom_window_type = x_intern_atom("WINDOW");
     x_change_attributes(x_root, 0x800 /* CWEventMask */,
@@ -1618,12 +1827,21 @@ int main(int argc, char **argv) {
      * one desktop; the compositor's workspace model is not mirrored
      * into EWMH (documented remaining work). */
     if (atom_net_supported && atom_atom) {
-        uint32_t supported[4];
+        uint32_t supported[8];
         uint32_t n = 0;
         supported[n++] = atom_net_client_list;
         supported[n++] = atom_net_active_window;
         supported[n++] = atom_net_close_window;
         supported[n++] = atom_net_current_desktop;
+        /* advertising _NET_WM_STATE(+FULLSCREEN) means HONORING it:
+        * every state change request routes to the compositor's one
+        * window model, and the property stays in sync with the
+        * granted state (well-behaved GTK/Qt/SDL clients check this
+        * list before sending fullscreen requests at all) */
+        if (atom_net_wm_state && atom_net_wm_state_fs) {
+            supported[n++] = atom_net_wm_state;
+            supported[n++] = atom_net_wm_state_fs;
+        }
         x_change_property_32(x_root, atom_net_supported, atom_atom, n,
                              supported);
         uint32_t v1[1];
@@ -1638,7 +1856,8 @@ int main(int argc, char **argv) {
                              atom_window_type, 1, v1);
         client_list_write();
         XWM_LOG("info", "EWMH: _NET_SUPPORTED (%u atoms), "
-                "_NET_CLIENT_LIST, _NET_ACTIVE_WINDOW, 1 desktop", n);
+                "_NET_CLIENT_LIST, _NET_ACTIVE_WINDOW, 1 desktop, "
+                "_NET_WM_STATE_FULLSCREEN", n);
     }
 
     /* 2. composite-redirect every root subwindow: Xwayland only creates

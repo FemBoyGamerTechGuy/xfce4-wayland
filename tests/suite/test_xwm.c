@@ -903,6 +903,114 @@ static void test_xwm_xterm_real(struct xwt_ctx *t) {
     stack_down(t, &s);
 }
 
+static void test_xwm_fullscreen(struct xwt_ctx *t) {
+    if (!s_apps_ok) {
+        XWT_SKIP("apps-root not populated (XWayland tests)");
+        return;
+    }
+    struct xw_stack s;
+    XWT_ASSERT(stack_up(t, &s));
+    struct xw_proc c;
+    XWT_ASSERT(client_spawn(&c, t, s.display, "240x140"));
+    XWT_ASSERT(client_wait(t, &c, "MAPPED", 400));
+    struct xw_window *w = NULL;
+    for (int i = 0; i < 600 && !(w = win_by_title(t, "Probe Initial")); i++) {
+        xwt_pump(t);
+        usleep(10 * 1000);
+    }
+    XWT_ASSERT(w);
+    struct xw_output *o =
+        wl_container_of(t->comp->outputs.next, o, link);
+
+    /* 1. the runtime EWMH request — exactly what GTK/Qt/SDL apps send:
+     * ClientMessage(_NET_WM_STATE, ADD, _NET_WM_STATE_FULLSCREEN) */
+    proc_cmd(&c, "fullscreen\n");
+    bool fs = false;
+    for (int i = 0; i < 600 &&
+                    !(fs = (w->fullscreen && w->w == o->width &&
+                            w->h == o->height && w->x == o->x &&
+                            w->y == o->y));
+         i++) {
+        xwt_pump(t);
+        usleep(10 * 1000);
+    }
+    XWT_CHECK(fs, "fullscreen applied: state=%d geometry %dx%d+%d+%d "
+                  "(want output %dx%d+%d+%d)",
+              w->fullscreen, w->w, w->h, w->x, w->y, o->width, o->height,
+              o->x, o->y);
+    /* the granted fullscreen geometry must reach the X client as a
+     * ConfigureNotify (interior = extent - 2x1 border) */
+    char conf[48];
+    snprintf(conf, sizeof(conf), "CONFIGURE %dx%d", o->width - 2,
+             o->height - 2);
+    XWT_CHECK(client_wait(t, &c, conf, 600),
+              "ConfigureNotify %s reached the client", conf);
+    /* the WM must keep the EWMH property in sync (EWMH: the WM owns
+     * _NET_WM_STATE once it manages the window) */
+    XWT_CHECK(client_wait(t, &c, "STATE _NET_WM_STATE_FULLSCREEN", 600),
+              "the helper synced the _NET_WM_STATE property");
+
+    /* 2. leave fullscreen: the saved geometry comes back */
+    proc_cmd(&c, "unfullscreen\n");
+    bool restored = false;
+    for (int i = 0; i < 600 &&
+                    !(restored = (!w->fullscreen && w->w == 242 &&
+                                  w->h == 142));
+         i++) {
+        xwt_pump(t);
+        usleep(10 * 1000);
+    }
+    XWT_CHECK(restored, "unfullscreen restore: state=%d extent %dx%d "
+                        "(want 242x142: 240x140 + 2x1 border)",
+              w->fullscreen, w->w, w->h);
+    XWT_CHECK(client_wait(t, &c, "STATE (none)", 600) ||
+                  client_wait(t, &c, "STATE (get-failed)", 100),
+              "_NET_WM_STATE cleared after unfullscreen");
+
+    /* 3. the map-time path: apps that START fullscreen set the property
+     * before mapping (games, players) — no runtime message at all.
+     * Both clients share the title "Probe Initial", so the wait must
+     * look for a SECOND window (the first is w); the pump is what gives
+     * the compositor the cycles to dispatch g's surface association. */
+    struct xw_proc g;
+    XWT_ASSERT(client_spawn(&g, t, s.display, "200x100 fullscreen"));
+    XWT_ASSERT(client_wait(t, &g, "MAPPED", 400));
+    struct xw_window *w2 = NULL;
+    for (int i = 0; i < 600 && !w2; i++) {
+        struct xw_window *it;
+        wl_list_for_each(it, &t->comp->wm->windows, link) {
+            if (it != w && strcmp(it->title, "Probe Initial") == 0) {
+                w2 = it;
+                break;
+            }
+        }
+        if (!w2) {
+            xwt_pump(t);
+            usleep(10 * 1000);
+        }
+    }
+    XWT_ASSERT(w2);
+    bool fs2 = false;
+    for (int i = 0; i < 600 &&
+                    !(fs2 = (w2->fullscreen && w2->w == o->width &&
+                             w2->h == o->height));
+         i++) {
+        xwt_pump(t);
+        usleep(10 * 1000);
+    }
+    XWT_CHECK(fs2, "map-time fullscreen: state=%d geometry %dx%d",
+              w2->fullscreen, w2->w, w2->h);
+
+    proc_cmd(&c, "exit\n");
+    proc_cmd(&g, "exit\n");
+    usleep(100 * 1000);
+    for (int i = 0; i < 100; i++)
+        xwt_pump(t);
+    proc_close(&c);
+    proc_close(&g);
+    stack_down(t, &s);
+}
+
 static const struct xwt_test tests[] = {
     {"xwm-configure-mask", test_xwm_configure_mask},
     {"xwm-identity", test_xwm_identity},
@@ -912,6 +1020,7 @@ static const struct xwt_test tests[] = {
     {"xwm-override-redirect", test_xwm_override_redirect},
     {"xwm-close-delete", test_xwm_close_delete},
     {"xwm-close-kill", test_xwm_close_kill},
+    {"xwm-fullscreen", test_xwm_fullscreen},
     {"xwm-teardown", test_xwm_teardown},
     {"xwm-xterm-real", test_xwm_xterm_real},
 };

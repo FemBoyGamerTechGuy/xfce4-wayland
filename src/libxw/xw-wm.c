@@ -469,6 +469,10 @@ void xw_wm_maximize(struct xw_wm *wm, struct xw_window *w, bool on) {
         w->h = w->restore.h;
     }
     xw_xdg_send_configure(w);
+    /* same as fullscreen: X11 windows learn geometry through the
+     * window-control channel, not xdg configure */
+    if (w->surface && w->surface->role == XW_SURFACE_ROLE_XWAYLAND)
+        xw_xwayland_notify_geometry(w);
     xw_foreign_toplevel_notify(wm->comp, w);
     xw_wm_damage_window(wm, w);
 }
@@ -497,6 +501,13 @@ void xw_wm_fullscreen(struct xw_wm *wm, struct xw_window *w, bool on) {
         w->h = w->restore.h;
     }
     xw_xdg_send_configure(w);
+    /* xdg configure is a no-op for XWAYLAND-role windows (they have no
+     * configure channel); their "configure" IS the geometry event,
+     * which the helper mirrors into an X11 ConfigureWindow. Without
+     * this, an EWMH fullscreen request changed the compositor model
+     * but the X window kept its old size: half-screen fullscreen. */
+    if (w->surface && w->surface->role == XW_SURFACE_ROLE_XWAYLAND)
+        xw_xwayland_notify_geometry(w);
     xw_foreign_toplevel_notify(wm->comp, w);
     xw_wm_damage_window(wm, w);
 }

@@ -4,11 +4,14 @@
  *
  * Modes (argv): map [WxH] [flags...] | or X Y WxH
  *   map flags: nodelete (no WM_DELETE protocol), takefocus (WM_TAKE_FOCUS
- *   listed), noinput (WM_HINTS input=False)
+ *   listed), noinput (WM_HINTS input=False), fullscreen (initial
+ *   _NET_WM_STATE contains _NET_WM_STATE_FULLSCREEN — the map-time
+ *   EWMH path)
  *
  * The client prints lifecycle events to stdout (line-buffered, every
  * line flushed) and then executes stdin commands, one per line:
- *   resize WxH | title NAME | move X Y | queryfocus | wait | exit
+ *   resize WxH | title NAME | move X Y | queryfocus | fullscreen |
+ *   unfullscreen | state | wait | exit
  * Output lines the tests assert on:
  *   WINDOW 0x...     (the toplevel id, right after creation)
  *   MAPPED
@@ -16,6 +19,9 @@
  *   DELETE           (WM_DELETE_WINDOW received — client exits itself)
  *   TAKEFOCUS        (WM_TAKE_FOCUS received)
  *   FOCUS 0x...      (XGetInputFocus result)
+ *   STATE a,b,...    (_NET_WM_STATE atoms; "STATE (none)" when empty —
+ *                     printed on demand AND on every PropertyNotify of
+ *                     _NET_WM_STATE, so tests can see the WM sync it)
  *   EXIT
  */
 #include <stdarg.h>
@@ -33,6 +39,7 @@
 /* WM_DELETE_WINDOW / WM_TAKE_FOCUS are NOT predefined atoms — they are
  * interned by name (the same way the WM helper interns them) */
 static Atom atom_wm_delete, atom_wm_take_focus;
+static Atom atom_net_wm_state, atom_fs;
 
 static void say(const char *fmt, ...) {
     va_list ap;
@@ -46,6 +53,61 @@ static void say(const char *fmt, ...) {
 static void set_str_prop(Display *dpy, Window w, Atom prop, const char *val) {
     XChangeProperty(dpy, w, prop, XA_STRING, 8, PropModeReplace,
                     (const unsigned char *)val, (int)strlen(val));
+}
+
+/* print _NET_WM_STATE as comma-separated atom names — the EWMH state
+ * the WM maintains; tests assert the fullscreen atom appears/disappears
+ * exactly when the WM grants the transition */
+static void report_state(Display *dpy, Window w) {
+    Atom actual;
+    int fmt;
+    unsigned long n, bytes;
+    unsigned char *raw = NULL;
+    if (XGetWindowProperty(dpy, w, atom_net_wm_state, 0, 64, False,
+                           XA_ATOM, &actual, &fmt, &n, &bytes, &raw)
+            != Success) {
+        say("STATE (get-failed)");
+        return;
+    }
+    if (n == 0 || !raw) {
+        say("STATE (none)");
+        if (raw)
+            XFree(raw);
+        return;
+    }
+    char buf[512] = "";
+    size_t off = 0;
+    Atom *atoms = (Atom *)raw;
+    for (unsigned long i = 0; i < n && off + 2 < sizeof(buf); i++) {
+        char *nm = XGetAtomName(dpy, atoms[i]);
+        int w = snprintf(buf + off, sizeof(buf) - off, "%s%s",
+                         i ? "," : "", nm ? nm : "?");
+        if (w > 0)
+            off += (size_t)w;
+        if (nm)
+            XFree(nm);
+    }
+    XFree(raw);
+    say("STATE %s", buf);
+}
+
+/* the EWMH runtime state change request — exactly what GTK/Qt/SDL apps
+ * send: ClientMessage(_NET_WM_STATE) with l[0]=1 add / 0 remove / 2
+ * toggle, l[1]=the state atom, l[3]=1 (source: application) */
+static void send_state_msg(Display *dpy, Window w, long action) {
+    XEvent ev = {0};
+    ev.xclient.type = ClientMessage;
+    ev.xclient.window = w;
+    ev.xclient.message_type = atom_net_wm_state;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = action;
+    ev.xclient.data.l[1] = (long)atom_fs;
+    ev.xclient.data.l[2] = 0;
+    ev.xclient.data.l[3] = 1;
+    ev.xclient.data.l[4] = 0;
+    XSendEvent(dpy, DefaultRootWindow(dpy), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+    XFlush(dpy);
 }
 
 int main(int argc, char **argv) {
@@ -63,6 +125,8 @@ int main(int argc, char **argv) {
     }
     atom_wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
     atom_wm_take_focus = XInternAtom(dpy, "WM_TAKE_FOCUS", False);
+    atom_net_wm_state = XInternAtom(dpy, "_NET_WM_STATE", False);
+    atom_fs = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
     Window root = DefaultRootWindow(dpy);
 
     if (strcmp(argv[2], "or") == 0) {
@@ -115,6 +179,7 @@ int main(int argc, char **argv) {
         h = atoi(x_ + 1);
     }
     bool want_delete = true, want_takefocus = false, want_input = true;
+    bool want_fs = false;
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "nodelete") == 0)
             want_delete = false;
@@ -122,6 +187,8 @@ int main(int argc, char **argv) {
             want_takefocus = true;
         if (strcmp(argv[i], "noinput") == 0)
             want_input = false;
+        if (strcmp(argv[i], "fullscreen") == 0)
+            want_fs = true;
     }
 
     XSetWindowAttributes attrs;
@@ -146,6 +213,14 @@ int main(int argc, char **argv) {
         protocols[nprot++] = atom_wm_take_focus;
     if (nprot)
         XSetWMProtocols(dpy, win, protocols, nprot);
+    if (want_fs) {
+        /* map-time EWMH state: apps that start fullscreen (games,
+         * players) set the property before mapping instead of sending
+         * the runtime message */
+        Atom st[1] = {atom_fs};
+        XChangeProperty(dpy, win, atom_net_wm_state, XA_ATOM, 32,
+                        PropModeReplace, (const unsigned char *)st, 1);
+    }
 
     XMapWindow(dpy, win);
     XFlush(dpy);
@@ -171,6 +246,12 @@ int main(int argc, char **argv) {
                     return 0;
                 } else if ((Atom)ev.xclient.data.l[0] == atom_wm_take_focus) {
                     say("TAKEFOCUS");
+                }
+            } else if (ev.type == PropertyNotify) {
+                if ((Atom)ev.xproperty.atom == atom_net_wm_state &&
+                    ev.xproperty.window == win) {
+                    /* the WM re-synced the EWMH state property */
+                    report_state(dpy, win);
                 }
             } else if (ev.type == DestroyNotify) {
                 say("DESTROYED");
@@ -199,6 +280,24 @@ int main(int argc, char **argv) {
             } else if (strncmp(line, "title ", 6) == 0) {
                 line[strcspn(line, "\n")] = 0;
                 set_str_prop(dpy, win, XA_WM_NAME, line + 6);
+            } else if (strncmp(line, "draw", 4) == 0) {
+                /* paint the whole window + flush: forces Xwayland to
+                 * re-attach a fresh damage-driven buffer (the probe
+                 * normally never draws, which is exactly what makes it
+                 * different from every real X11 client) */
+                XGCValues gcv = {.foreground = 0x3366CC};
+                GC gc = XCreateGC(dpy, win, GCForeground, &gcv);
+                XFillRectangle(dpy, win, gc, 0, 0, (unsigned)w,
+                               (unsigned)h);
+                XFreeGC(dpy, gc);
+                XFlush(dpy);
+                say("DREW %dx%d", w, h);
+            } else if (strncmp(line, "fullscreen", 10) == 0) {
+                send_state_msg(dpy, win, 1 /* _NET_WM_STATE_ADD */);
+            } else if (strncmp(line, "unfullscreen", 12) == 0) {
+                send_state_msg(dpy, win, 0 /* _NET_WM_STATE_REMOVE */);
+            } else if (strncmp(line, "state", 5) == 0) {
+                report_state(dpy, win);
             } else if (strncmp(line, "queryfocus", 10) == 0) {
                 Window focus = None;
                 int revert = 0;

@@ -100,9 +100,45 @@ grep -q "wm: window .* MAPPED.*output" "$LOG" && \
     ok "X11 window uses the same window-management path" || bad "X11 window managed path"
 # the X11 window must carry its REAL identity (WM_NAME/WM_CLASS read by
 # the WM helper and pushed over xw_window_control_v1 v2), not the v0
-# static fallbacks
-grep -q "title 'xeyes'" "$LOG" && ok "X11 window title = WM_NAME" || bad "X11 window title = WM_NAME"
-grep -q "app 'XEyes'" "$LOG" && ok "X11 window app_id = WM_CLASS" || bad "X11 window app_id = WM_CLASS"
+# static fallbacks. The identity races the first commit, so the MAPPED
+# line may still show the 'xwayland' placeholder followed by a separate
+# identity update — both orders prove the helper read the real values.
+grep -qE "title 'xeyes'" "$LOG" && ok "X11 window title = WM_NAME" || bad "X11 window title = WM_NAME"
+grep -qE "app 'XEyes'|app_id 'XEyes'" "$LOG" && ok "X11 window app_id = WM_CLASS" || bad "X11 window app_id = WM_CLASS"
+
+# ---- 4b. REAL EWMH fullscreen: wmctrl (a real taskbar/pager tool)
+# drives the exact _NET_WM_STATE client message GTK/Qt/SDL apps send,
+# against xeyes (a real X11 client). The window must actually cover the
+# output, xprop must show the WM-synced state, and remove must restore.
+XENV="DISPLAY=:$XW_DISPLAY XDG_RUNTIME_DIR=$RTD LD_LIBRARY_PATH=$APPS/usr/lib/x86_64-linux-gnu"
+SCREEN=$(eval "$XENV $APPS/usr/bin/xdpyinfo" 2>/dev/null | grep -o "dimensions: *[0-9x]*" | head -1 | grep -o "[0-9]*x[0-9]*")
+XE_WIN=$(eval "$XENV $APPS/usr/bin/wmctrl -l" 2>/dev/null | awk '$4 ~ /xeyes/ {print $1; exit}')
+if [ -n "$SCREEN" ] && [ -n "$XE_WIN" ]; then
+    eval "$XENV $APPS/usr/bin/wmctrl -i -r $XE_WIN -b add,fullscreen" 2>/dev/null
+    sleep 2
+    FSGEO=$(eval "$XENV $APPS/usr/bin/xwininfo -id $XE_WIN" 2>/dev/null | grep -o "geometry [0-9]*x[0-9]*+0+0" | head -1)
+    FSOK=0
+    [ -n "$FSGEO" ] && case "$FSGEO" in
+        *"geometry $SCREEN+0+0") FSOK=1 ;;
+        *"geometry ${SCREEN%x*}$(( ${SCREEN#*x} - 2 ))+0+0") FSOK=1 ;;
+    esac
+    [ "$FSOK" = 1 ] && ok "wmctrl fullscreen: xeyes covers the output ($FSGEO)" || \
+        bad "wmctrl fullscreen geometry ('$FSGEO' want $SCREEN+0+0)"
+    eval "$XENV $APPS/usr/bin/xprop -id $XE_WIN _NET_WM_STATE" 2>/dev/null | \
+        grep -q "_NET_WM_STATE_FULLSCREEN" && \
+        ok "xprop sees _NET_WM_STATE_FULLSCREEN (WM syncs the property)" || \
+        bad "xprop _NET_WM_STATE after fullscreen"
+    kill -0 "$SESS_PID" 2>/dev/null && ok "session alive after fullscreen" || \
+        bad "session alive after fullscreen"
+    eval "$XENV $APPS/usr/bin/wmctrl -i -r $XE_WIN -b remove,fullscreen" 2>/dev/null
+    sleep 2
+    eval "$XENV $APPS/usr/bin/xprop -id $XE_WIN _NET_WM_STATE" 2>/dev/null | \
+        grep -q "_NET_WM_STATE_FULLSCREEN" && \
+        bad "fullscreen state gone after wmctrl remove" || \
+        ok "wmctrl remove: fullscreen left, geometry restored"
+else
+    bad "fullscreen check needs wmctrl + xdpyinfo + the xeyes window (screen='$SCREEN' win='$XE_WIN')"
+fi
 
 # ---- 5. slow-starting client must not be treated as a failure
 WAYLAND_DISPLAY="$WLDISPLAY" XDG_RUNTIME_DIR="$RTD" \

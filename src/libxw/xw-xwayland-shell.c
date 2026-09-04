@@ -60,10 +60,15 @@ struct xw_pending_ident {
     int or_x, or_y, or_w, or_h;
     int gx, gy, gw, gh;
     bool has_title, has_app_id, has_hints, has_or, has_geom;
+    uint8_t fs_action; /* v3: 0 none, 1 enter, 2 leave — stashed when
+                          the request races ahead of set_serial */
     struct wl_list link; /* comp.xw_pending_idents */
 };
 
 #define XW_MAX_PENDING_IDENTS 64
+
+static void wc_fs_apply(struct xw_compositor *c, struct xw_window *w,
+                         uint32_t action);
 
 static void wc_apply_or(struct xw_window *w, int x, int y, int width,
                         int height); /* fwd: pending paths use it */
@@ -148,6 +153,10 @@ static void pending_ident_apply(struct xw_compositor *c,
             w->h = p->gh;
         }
     }
+    /* last: the geometry above is what "restore" should save, so the
+     * fullscreen request (deferred pre-map) must be stashed after it */
+    if (p->fs_action)
+        wc_fs_apply(c, w, p->fs_action);
     wl_list_remove(&p->link);
     free(p);
 }
@@ -379,6 +388,61 @@ static void wc_set_geometry(struct wl_client *client,
      * guard on every client-initiated resize */
 }
 
+/* apply a v3 fullscreen request to a resolved window: now when it is
+ * already mapped, deferred to just-after-map when the request raced
+ * the first buffer commit (the helper reads _NET_WM_STATE at serial
+ * association, which can precede it) */
+static void wc_fs_apply(struct xw_compositor *c, struct xw_window *w,
+                         uint32_t action) {
+    if (w->xw_override_redirect) {
+        xw_log(XW_LOG_INFO,
+               "xwayland: ignoring fullscreen request for popup-class "
+               "window %u (override-redirect windows are X-owned)",
+               w->id);
+        return;
+    }
+    if (w->mapped) {
+        bool on = action == 2 ? !w->fullscreen : (action == 1);
+        xw_log(XW_LOG_INFO,
+               "xwayland: window %u (serial %08x%08x) EWMH fullscreen "
+               "%s — applying the one model's fullscreen",
+               w->id, (uint32_t)(w->xw_serial >> 32),
+               (uint32_t)w->xw_serial, on ? "enter" : "leave");
+        xw_wm_fullscreen(c->wm, w, on);
+    } else {
+        w->xw_fs_pending = (uint8_t)(action == 2 ? 1 : action);
+        xw_log(XW_LOG_INFO,
+               "xwayland: window %u EWMH fullscreen request before map "
+               "— deferring to first commit", w->id);
+    }
+}
+
+static void wc_set_fullscreen(struct wl_client *client,
+                              struct wl_resource *res, uint32_t serial_hi,
+                              uint32_t serial_lo, uint32_t fullscreen) {
+    (void)client;
+    struct xw_wc_manager *m = wl_resource_get_user_data(res);
+    struct xw_compositor *c = m->comp;
+    uint64_t serial = ((uint64_t)serial_hi << 32) | serial_lo;
+    if (fullscreen > 2) {
+        wl_resource_post_error(res, 2 /* our private EINVAL-style code */,
+                               "set_fullscreen: action %u is not "
+                               "0/1/2", fullscreen);
+        return;
+    }
+    struct xw_window *w = wc_target(c, serial_hi, serial_lo);
+    if (w) {
+        wc_fs_apply(c, w, fullscreen);
+        return;
+    }
+    /* the helper can win the set_serial race (different sockets); the
+     * request becomes part of the pending identity applied at
+     * association — same pattern as title/app_id/geometry */
+    struct xw_pending_ident *p = pending_ident_get(c, serial);
+    if (p)
+        p->fs_action = (uint8_t)(fullscreen == 2 ? 1 : fullscreen);
+}
+
 static const struct xw_window_control_manager_v1_interface wc_impl = {
     .destroy = wc_destroy_req,
     .set_title = wc_set_title,
@@ -386,13 +450,14 @@ static const struct xw_window_control_manager_v1_interface wc_impl = {
     .set_override_redirect = wc_set_override_redirect,
     .set_size_hints = wc_set_size_hints,
     .set_geometry = wc_set_geometry,
+    .set_fullscreen = wc_set_fullscreen,
 };
 
 static void wc_bind(struct wl_client *client, void *data, uint32_t version,
                     uint32_t id) {
     struct xw_compositor *c = data;
-    if (version > 2)
-        version = 2;
+    if (version > 3)
+        version = 3;
     struct wl_resource *res =
         wl_resource_create(client, &xw_window_control_manager_v1_interface,
                            version, id);
@@ -536,8 +601,14 @@ void xw_xwayland_role_commit(struct xw_surface *s) {
 
     if (bw > 0 && bh > 0) {
         if (!w->mapped) {
-            w->w = bw;
-            w->h = bh;
+            /* a fullscreen/maximized window's state geometry wins over
+             * the client's initial buffer size — the client will be
+             * told (geometry event) and redraw/resize into it; native
+             * windows get the same semantics through xdg configure */
+            if (!w->fullscreen && !w->maximized) {
+                w->w = bw;
+                w->h = bh;
+            }
             if (w->xw_override_redirect) {
                 /* popup-class X11 window: X owns geometry, no managed
                  * toplevel flow (no rules/cascade/taskbar/focus) */
@@ -547,6 +618,16 @@ void xw_xwayland_role_commit(struct xw_surface *s) {
                 /* placement just ran (cascade): mirror it to the X side
                  * so X input coordinates match our geometry */
                 xw_xwayland_notify_geometry(w);
+                /* an EWMH fullscreen request that raced ahead of the
+                 * first commit applies NOW: the placement above is what
+                 * restore saves, and the notify above told the X side
+                 * the placed geometry first (two configures — the
+                 * exact sequence a real WM produces for map+fullscreen) */
+                if (w->xw_fs_pending) {
+                    uint8_t act = w->xw_fs_pending;
+                    w->xw_fs_pending = 0;
+                    wc_fs_apply(c, w, act);
+                }
             }
         } else if (w->w != bw || w->h != bh) {
             xw_wm_damage_window(c->wm, w);
@@ -695,7 +776,7 @@ void xw_xwayland_shell_init(struct xw_compositor *c) {
         xw_log(XW_LOG_ERROR, "xwayland_shell_v1 global creation failed");
     c->g_window_control =
         wl_global_create(c->display, &xw_window_control_manager_v1_interface,
-                         2, c, wc_bind);
+                         3, c, wc_bind);
     if (!c->g_window_control)
         xw_log(XW_LOG_ERROR,
                "xw_window_control_v1 global creation failed");

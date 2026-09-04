@@ -39,7 +39,7 @@
     and close flow one way, compositor to WM).
   </description>
 
-  <interface name="xw_window_control_manager_v1" version="2">
+  <interface name="xw_window_control_manager_v1" version="3">
     <description summary="window control events for the X WM helper">
       The compositor emits these events whenever an Xwayland-managed
       window changes geometry or focus, or is asked to close. The helper
@@ -55,6 +55,15 @@
       model (taskbar titles, popup placement, resize constraints).
       Version 1 helpers never send the new requests and never receive
       the focus event.
+
+      Version 3 adds set_fullscreen: the helper forwards the EWMH
+      fullscreen requests X clients express (map-time _NET_WM_STATE
+      property, runtime _NET_WM_STATE client message). The compositor
+      stays the single state authority — it applies the same
+      fullscreen logic xdg-shell set_fullscreen gets (output
+      rectangle, saved restore geometry, re-fullscreen on output
+      changes) and mirrors the resulting geometry back through the
+      geometry event. Version 2 helpers never send it.
     </description>
 
     <event name="geometry">
@@ -179,6 +188,25 @@
       <arg name="y" type="int" summary="y position of the window extent in compositor layout coordinates"/>
       <arg name="width" type="int" summary="extent width: X11 interior width + 2 * border width"/>
       <arg name="height" type="int" summary="extent height: X11 interior height + 2 * border width"/>
+    </request>
+
+    <request name="set_fullscreen" since="3">
+      <description summary="an X client asked for fullscreen state">
+        The helper saw an EWMH fullscreen request for the window behind
+        the serial — either the runtime _NET_WM_STATE client message
+        (action add/remove/toggle with the _NET_WM_STATE_FULLSCREEN
+        atom) or a map-time _NET_WM_STATE property listing it. The
+        compositor is the one window model's state authority: apply
+        the same fullscreen logic xdg-shell set_fullscreen gets for
+        native windows (save the current geometry, cover the window's
+        output, restack) and mirror the resulting geometry back
+        through the geometry event so the helper can resize the X11
+        window. fullscreen: 1 = enter, 0 = leave, 2 = toggle (resolved
+        against the compositor's own state, which is the truth).
+      </description>
+      <arg name="serial_hi" type="uint" summary="upper 32 bits of the xwayland surface serial"/>
+      <arg name="serial_lo" type="uint" summary="lower 32 bits of the xwayland surface serial"/>
+      <arg name="fullscreen" type="uint" summary="1 enter, 0 leave, 2 toggle"/>
     </request>
   </interface>
 </protocol>

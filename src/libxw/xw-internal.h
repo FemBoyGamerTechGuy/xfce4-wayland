@@ -500,6 +500,14 @@ struct xw_window {
      * min/max reuse the xdg hint fields below. */
     bool xw_override_redirect;
     int xw_inc_w, xw_inc_h;
+
+    /* v3: an EWMH fullscreen request that arrived before the window
+     * mapped (the helper reads _NET_WM_STATE at serial association,
+     * which can precede the first buffer commit). Applied right after
+     * the map-time placement so the saved restore geometry is the
+     * placed one, exactly as if the request had arrived one moment
+     * later. 0 = none, 1 = enter, 2 = leave. */
+    uint8_t xw_fs_pending;
 };
 
 enum { XW_EDGE_L = 1, XW_EDGE_R = 2, XW_EDGE_T = 4, XW_EDGE_B = 8 };
