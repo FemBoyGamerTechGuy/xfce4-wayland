@@ -277,10 +277,36 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
   back through set_geometry (extent space: interior + X border),
   WM_DELETE_WINDOW / WM_TAKE_FOCUS delivery with correct SendEvent
   format bytes, border-aware geometry mirroring both directions.
-  Regressions: tests/suite/test_xwm.c (10 tests, real Xwayland +
+  Regressions: tests/suite/test_xwm.c (11 tests, real Xwayland +
   real helper + controllable X11 client + the real xterm).
-- TODO per-output X mode tracking for fullscreen X11 apps, X11
-  clipboard bridge.
+- DONE EWMH fullscreen for X11 apps (window-control v3): both request
+  paths (runtime _NET_WM_STATE client message, map-time property),
+  the compositor's one fullscreen model (per-output rectangle via the
+  window's output, saved restore geometry, taskbar state),
+  _NET_WM_STATE property kept in sync, pre-map requests deferred to
+  just after placement. The surface-space calibration (below) keeps
+  the mirror stable for both Xwayland surface conventions.
+  Regressions: `xwm-fullscreen` (suite) + scripts/test-realapps.sh
+  (wmctrl fullscreens the real xeyes to the exact output rectangle,
+  xprop verifies the synced state).
+- DONE connection-loss triage in the helper: both sockets (X and the
+  compositor) are watched, wl return codes checked; both gone =
+  orderly stack teardown (exit 0), one gone = that peer's crash
+  reported loudly, wl protocol errors identified as compositor bugs.
+  Regression: scripts/test-xwm-loss.sh.
+- PART the measured surface-space calibration: Xwayland sizes some
+  windows' wl_surfaces to the X11 interior, others to the extent
+  (interior + 2*border) — both measured live with the same binary
+  (x11client/xterm: extent; Xaw xeyes: interior). The helper now
+  measures the convention per window and converts in that space,
+  which killed a 2px-per-round ratchet on drawn interior-convention
+  windows. Override-redirect windows still push the extent convention
+  (no mirror feedback to calibrate against; unambiguous for the
+  border-0 popups every real Xaw menu actually is).
+- TODO X11 clipboard bridge (wl_data_device <-> X selections).
+- TODO EWMH workspace mirroring (_NET_CURRENT_DESKTOP sync both ways);
+  X-side activation channel (_NET_ACTIVE_WINDOW requests currently
+  logged as unimplemented).
 
 ## M9 — Hardening/quality
 - DONE zero-warning builds (-Wall -Wextra -Werror, also under -O1),

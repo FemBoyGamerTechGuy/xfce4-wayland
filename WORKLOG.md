@@ -2249,3 +2249,90 @@ regressions, XWayland stack PASS, full-session acceptance 23/23
 
 Next: per-output X mode tracking for fullscreen X11 apps, X11
 clipboard bridge, notification daemon (backlog order unchanged).
+
+---
+
+## 2026-09-04 — the loss-triage + EWMH fullscreen round
+
+Push retry round (new credentials): a5a01e8 pushed clean; the UUID
+auto-snapshot on top (report-generation session scripts) was dropped
+per the untracked-session-artifact policy.
+
+Two root causes fixed, one of them found BY the round's own real-client
+verification:
+
+1. **The helper never watched the wl socket.** A compositor death
+   while Xwayland lived left xw-xwm spinning at 100% CPU on a
+   POLLHUP-only fd (no POLLIN → no dispatch → poll never blocks) until
+   Xwayland noticed its own dead connection; the failure surfaced
+   misattributed as "X server connection lost". This was the
+   "intermittent helper exit at stack teardown" from the previous
+   round. Now: both fds checked, every wl return code checked
+   (flush/dispatch/dispatch_pending), and loss is TRIAGED before
+   dying — both peers gone is an orderly teardown (info, exit 0),
+   the compositor alone dying while X lives is reported as exactly
+   that, and a wl protocol error names the interface+opcode as a
+   compositor bug. scripts/test-xwm-loss.sh reproduces it
+   deterministically: SIGSTOP Xwayland (pure wl-side loss), kill the
+   compositor; the pre-fix code hangs the check, the fixed code
+   exits in <5s with the right diagnosis.
+
+2. **EWMH fullscreen was entirely absent** (ROADMAP M8's "per-output
+   X mode tracking"): X11 clients that fullscreen (runtime
+   _NET_WM_STATE message — what GTK/Qt/SDL send — or the map-time
+   property games use) got nothing, and the atoms were not even
+   advertised. window-control v3 adds set_fullscreen; the helper
+   forwards both request paths and keeps the _NET_WM_STATE property
+   in sync (preserving foreign atoms); the compositor — the single
+   state authority — runs the SAME fullscreen logic xdg-shell gets
+   (saved restore geometry, the window's output rectangle =
+   per-output tracking, foreign-toplevel/taskbar state) and mirrors
+   the resulting geometry through the existing event; pre-map
+   requests are deferred to just after placement (pending-identity
+   pattern); a fullscreen/maximized window's state geometry now wins
+   over the first buffer size at map. Verified with the REAL path:
+   wmctrl fullscreens the real xeyes to exactly 1280x720+0+0, xprop
+   sees the synced property, remove restores (test-realapps.sh);
+   both EWMH paths pinned in the suite (xwm-fullscreen, x11client
+   grew fullscreen/unfullscreen/state/draw commands + a map-time
+   flag).
+
+3. **The surface-space ratchet** (found by #2's verification): while
+   watching the real xeyes full screen, the geometry mirror shrank
+   it 2px per round (150→148→...→0) forever. Root cause: Xwayland
+   sizes some windows' wl_surfaces to the X11 extent (interior +
+   2*border — x11client/xterm style, measured 240x140 border 1 →
+   buffer 242x142) and others to the interior alone (Xaw xeyes,
+   200x100 border 1 → buffer 200x100) — SAME Xwayland binary, both
+   conventions live. The helper's fixed extent conversion resized
+   already-correct interior-space windows on every mirror; each
+   echo round (ConfigureWindow → damage → new buffer → role_commit
+   → mirror) ate 2*border. The fix MEASURES the convention per
+   window (first mirror vs the X truth; re-measured when the
+   current mode's prediction stops matching, so client self-resizes
+   can't wedge it) and converts in the measured space — mirror,
+   pending-apply, and the set_geometry push. xeyes now gets exactly
+   one mirror and stays at its size; the pre-fix probe-only tests
+   never saw this because x11client never draws.
+
+Also fixed en route: the test-realapps app_id check raced the
+identity-vs-first-commit ordering (now accepts either log shape);
+my own debug scripts' SIGKILLed sessions leaked compositor/panel
+processes that broke test-session's pgrep cleanliness checks
+(cleaned; the lesson: kill session children via the session, not
+SIGKILL).
+
+Known remaining, honestly scoped: X11 clipboard bridge
+(wl_data_device <-> X selections — needs the helper as a
+data-device client; INCR for large transfers), EWMH workspace
+mirroring (_NET_CURRENT_DESKTOP sync), the X-side activation
+channel, OR-window surface convention unmeasured (extent assumed;
+border-0 popups are unambiguous).
+
+**Validation**: 123/123 in-process (11 xwm tests), 144/144 session,
+51/0/1 build regressions, XWayland stack PASS, xwm-loss PASS,
+full-session acceptance 27/27 (incl. the wmctrl/xeyes/xprop
+fullscreen block), zero-warning -Werror builds.
+
+Next: X11 clipboard bridge, EWMH workspace mirroring, activation
+channel (backlog order).

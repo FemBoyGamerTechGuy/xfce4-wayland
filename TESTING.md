@@ -96,7 +96,10 @@ absent rather than half-working.
   X input focus mirroring, WM_TAKE_FOCUS delivery (the SendEvent
   format-byte bug), override-redirect classification and invariants
   (X-owned geometry, no taskbar/focus, move refused), WM_DELETE vs
-  destroy fallback, helper teardown, the real xterm's two-phase
+  destroy fallback, EWMH fullscreen both ways (runtime
+  _NET_WM_STATE message and map-time property: state + geometry +
+  ConfigureNotify delivery + the WM-synced property), helper
+  teardown, the real xterm's two-phase
   resize, and the extent-vs-interior border model (the compositor
   models interior + 2*border; the helper converts). Skips (counted,
   not silent) when .apps-root is not populated.
@@ -135,11 +138,21 @@ absent rather than half-working.
 - `scripts/test-realapps.sh` — **Level 2**: full-session acceptance
   with real toolkits: `xw-session` brings up compositor + XWayland +
   xw-xwm + panel; two native GTK4 apps launch and stay; an X11 app
-  launches through XWayland into the SAME window list; a deliberately
+  launches through XWayland into the SAME window list; the REAL EWMH
+  fullscreen path (wmctrl — the same _NET_WM_STATE client message
+  GTK/Qt/SDL apps send — fullscreens the real xeyes to the exact
+  output rectangle, xprop confirms the WM-synced property, and
+  remove restores the geometry); a deliberately
   slow-starting client (3s before its first window) is not treated as
   a failure; everything stops cleanly at logout. This is the
   in-container mirror of the physical NVIDIA acceptance checklist
   below.
+- `scripts/test-xwm-loss.sh` — **Level 2**: the WM helper must die
+  honestly when the compositor dies: freezes Xwayland (SIGSTOP, so
+  its X socket stays up — a pure wl-side loss), kills the compositor,
+  and requires the helper to exit within seconds with the
+  compositor-loss diagnosis instead of spinning forever on the HUPed
+  wl socket (the pre-fix code hangs the check).
 - `scripts/audit-interfaces.py` — static audit for the NULL-request-
   handler bug class: cross-references every protocol XML (in-repo +
   sysroot wayland-protocols) with the C interface implementations and
@@ -203,7 +216,7 @@ requires a running udev instance; run
 what was verified (device, kernel, distro) in WORKLOG.md — that is
 what keeps "verified at Level 3" honest.
 
-## What is covered today (122 Level-1 tests + 144 Level-2 checks + 50-59 build-regression checks)
+## What is covered today (123 Level-1 tests + 144 Level-2 checks + 50-59 build-regression checks)
 
 The nested-session regression (session 5 below) is the reason several
 of these numbers exist: an invisible panel that looked like a working
@@ -642,6 +655,38 @@ Highlights (each verifiable by reverting the fix):
   convert through the border width (regressed by
   `xwm-configure-mask`; the real-xterm resize is covered by
   `xwm-xterm-real`)**
+- **Xwayland sizes some windows' surfaces to the X11 interior and
+  others to the extent (interior + 2*border) — BOTH conventions
+  measured live with the same binary: x11client/xterm-style windows
+  get the extent, Xaw apps (xeyes) get the interior. The fixed
+  extent conversion shrank interior-convention windows 2px per
+  mirror round until nothing was left (the border ratchet, second
+  edition — caught while verifying EWMH fullscreen with the real
+  xeyes). The helper now MEASURES the convention per window (first
+  mirror vs the X truth) and converts in the measured space;
+  re-measured when the prediction stops matching so client
+  self-resizes cannot wedge it (regressed by
+  scripts/test-realapps.sh's wmctrl fullscreen geometry check —
+  the window must hit the exact output rectangle and STAY there)**
+- **the helper's event loop never checked the wl fd: a compositor
+  that died while Xwayland lived left xw-xwm spinning at 100% CPU on
+  a HUPed socket until Xwayland died too, misreporting the failure
+  as "X server connection lost". Both sockets are now watched, every
+  wl return code is checked, and loss is triaged (both peers gone =
+  orderly teardown, exit 0; one gone = that peer's crash, reported
+  loudly; a wl protocol error is identified as a compositor bug).
+  Regressed by scripts/test-xwm-loss.sh (SIGSTOP Xwayland + kill the
+  compositor: the pre-fix helper hangs the check)**
+- **EWMH fullscreen requests were ignored entirely: X11 clients that
+  fullscreen (GTK/Qt/SDL runtime message, games' map-time property)
+  never got fullscreen, and _NET_WM_STATE/_NET_WM_STATE_FULLSCREEN
+  were not even advertised. window-control v3 forwards the request;
+  the compositor applies the one model's fullscreen (output
+  rectangle through w->output = per-output, saved restore geometry,
+  taskbar state) and mirrors the resulting geometry; the helper
+  keeps the property in sync (regressed by `xwm-fullscreen` for both
+  EWMH paths and the wmctrl/xeyes/xprop checks in
+  scripts/test-realapps.sh)**
 - **the XWayland test scaffold leaked the compositor's signalfd
   blocked-signal mask (HUP/INT/TERM/CHLD survive fork AND exec) into
   every spawned child: kill(SIGTERM) silently did nothing and the
