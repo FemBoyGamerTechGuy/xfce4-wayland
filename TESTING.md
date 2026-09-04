@@ -227,7 +227,7 @@ requires a running udev instance; run
 what was verified (device, kernel, distro) in WORKLOG.md — that is
 what keeps "verified at Level 3" honest.
 
-## What is covered today (125 Level-1 tests + 144 Level-2 checks + 50-59 build-regression checks)
+## What is covered today (124 Level-1 tests + 144 Level-2 checks + 50-59 build-regression checks)
 
 The nested-session regression (session 5 below) is the reason several
 of these numbers exist: an invisible panel that looked like a working
@@ -772,3 +772,73 @@ Highlights (each verifiable by reverting the fix):
   as a pass in the summary — the ASan round had 10 invisible skips
   inside a green "121/121" (the probe is built with `all`, and the
   summary now reports "(N skipped)")**
+
+### The input/focus/cursor battery (2026-09-06 round)
+
+`tests/suite/test_input.c` drives REAL libwayland clients (a second
+raw connection with full event recording — serials, button codes,
+surface-local coordinates, every enter/leave/motion/button/axis)
+plus a REAL GTK4 process. Every fix below was reproduced red
+first (several ASan-only: a use-after-free in the render path, a
+double `popup_done` that killed clients):
+
+- `input-event-matrix` — the priority-1 event matrix: enter (with
+  correct surface-local translation + serial), motion, L/M/R
+  press+release pairs with monotonic serials, axis, leave on exit,
+  re-enter exactly once. The client must see everything and stay
+  alive (death reasons are recorded by the harness
+  `xwt_record_death` — the exact protocol error, if any).
+- `input-hit-test-order` — pointer focus follows the RENDER order
+  (popups > overlay > top > OR windows > windows > bottom >
+  background): a full-screen background layer must not eat window
+  clicks.
+- `input-cursor-state` — the cursor state machine: adoption via
+  set_cursor after enter, reset to the default arrow on
+  cross-client focus transitions (the stuck-cursor regression),
+  re-adoption on re-enter, fabricated-serial rejection, roled-
+  surface rejection, NULL-surface hide, cursor-surface destroy.
+- `input-right-click-menu` — the exact context-menu flow: press →
+  popup + grab(press serial) → enter on the popup → item click →
+  outside-press dismissal → parent refocus → destroy, with the
+  seat's grab state asserted at every stage.
+- `input-popup-destroy-grab` — client destroys the popup and its
+  surface mid-grab: no dangling grab, focus returns, client alive.
+- `input-popup-done-once` — `popup_done` is once-per-lifetime:
+  dismissal + the client's own null-buffer unmap must not double-
+  send (the right-click client killer; revert-verified red).
+- `input-toplevel-null-unmap` — the protocol hide: attach(NULL)+
+  commit unmaps (focus released, not hit-testable); a no-attach
+  commit keeps the window (sticky attach); re-show restarts the
+  configure cycle and maps again.
+- `input-taskbar-activate` — taskbar semantics: minimize via the
+  real `set_minimized` request, activate via the handle's
+  unset_minimized+activate pair AND via a bare activate (the
+  minimized window must restore+focus+raise), repeat cycles,
+  cross-workspace activation switches and focuses, ACTIVATED
+  configure state reaches the client, foreign-toplevel state
+  reflects it.
+- `input-real-gtk-clicks` — a real GTK4 process (zenity) mapped
+  on the compositor, driven with motion + left/right/middle
+  clicks + scroll; the toolkit must survive (a death is reported
+  with the exit status and the client log).
+
+`XW_INPUT_TRACE=1` (stderr, same convention as
+`XW_GEOMETRY_TRACE`) prints every pointer event's raw coordinates,
+the hit-test pick, the delivery target, and every cursor state
+transition (old/requested/applied, serial, rejection reason) —
+the instrument for the physical pass.
+
+Regression highlights added to the policy list:
+
+- **R-cursor-reset**: cross-client focus transitions reset the
+  cursor to the default arrow (the stuck cursor).
+- **R-popup-done-once**: double `popup_done` after dismissal +
+  client unmap kills the client (revert-verified).
+- **R-unmap-transition**: null-attach commits unmap; no-attach
+  commits keep the buffer (sticky attach); unmapped popups never
+  re-map without content (the ghost popup).
+- **R-buffer-destroy-clear**: destroying a committed buffer
+  clears content + damages the extent (no render from freed
+  memory — the ASan SEGV).
+- **R-bare-activate-restores**: a bare `activate` on a minimized
+  window unminimizes, focuses and raises it.

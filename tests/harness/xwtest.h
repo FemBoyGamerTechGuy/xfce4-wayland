@@ -94,7 +94,16 @@ struct xwt_ctx {
     char socket_name[32];
     bool client_dead; /* in-process client hit a connection/protocol
                          error; the pump stops touching its display */
+    char death_reason[192]; /* filled when client_dead flips: the exact
+                                wl_display error / protocol error the
+                                server posted, or "connection closed" —
+                                the difference between "the compositor
+                                killed the client" and anything else */
 };
+
+/* Record why the test client died (protocol error code + object +
+ * message, or the errno). Call once, right after client_dead flips. */
+void xwt_record_death(struct xwt_ctx *t);
 
 /* Starts a compositor with a unique socket and connects a client.
  * Returns 0 on success; on failure the test should abort. */

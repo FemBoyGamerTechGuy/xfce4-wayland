@@ -74,6 +74,26 @@ static void test_pointer_set_cursor(struct xwt_ctx *t) {
     struct xwc *c = &t->client;
     XWT_ASSERT(c->pointer);
 
+    /* the cursor state machine validates the request (2026-09-06
+     * round): the client must own pointer focus and carry a serial
+     * the seat actually issued. A window + a real enter give us both
+     * (c->last_serial is updated by the client's enter handler). */
+    struct xwc_win *win = xwt_window_solid(t, 0xff204060, 120, 90, "cursor");
+    XWT_ASSERT(win);
+    struct xw_window *w = NULL;
+    wl_list_for_each(w, &t->comp->wm->windows, link) {
+        if (strcmp(w->title, "cursor") == 0)
+            break;
+        w = NULL;
+    }
+    XWT_ASSERT(w);
+    xw_compositor_inject_pointer_motion(t->comp, w->x + w->w / 2,
+                                        w->y + w->h / 2);
+    XWT_WAIT(t, c->last_serial != 0);
+    uint32_t enter_serial = c->last_serial;
+    XWT_CHECK(enter_serial != 0, "pointer enter serial captured (%u)",
+              enter_serial);
+
     /* a roleless cursor surface carrying a 24x24 image */
     struct wl_surface *cs = wl_compositor_create_surface(c->compositor);
     struct shm_buf *img = shm_buf_create(c, 24, 24);
@@ -81,22 +101,34 @@ static void test_pointer_set_cursor(struct xwt_ctx *t) {
     wl_surface_attach(cs, img->buf, 0, 0);
     wl_surface_commit(cs);
 
-    /* the request that used to abort the compositor */
-    wl_pointer_set_cursor((struct wl_pointer *)c->pointer, 0, cs, 3, 2);
+    /* the request that used to abort the compositor — now with a
+     * valid focus + serial it must be ADOPTED */
+    wl_pointer_set_cursor((struct wl_pointer *)c->pointer, enter_serial, cs,
+                          3, 2);
     wl_display_flush(c->display);
     xwt_pump(t);
     xwt_pump(t);
-
     XWT_ASSERT(!t->client_dead);
-    /* server state: the seat adopted the client cursor */
     struct xw_seat *seat = xw_seat_first(t->comp);
+    XWT_WAIT(t, seat && seat->cursor_surface);
     XWT_CHECK(seat && seat->cursor_surface, "seat adopted the cursor surface");
     XWT_CHECK(seat && seat->cursor_hot_x == 3 && seat->cursor_hot_y == 2,
               "hotspot stored (%d,%d want 3,2)",
               seat ? seat->cursor_hot_x : -1, seat ? seat->cursor_hot_y : -1);
 
-    /* hide: NULL surface returns the default arrow state */
+    /* serial 0 (never issued): REJECTED, the cursor stays adopted —
+     * the request must not kill the client either */
     wl_pointer_set_cursor((struct wl_pointer *)c->pointer, 0, NULL, 0, 0);
+    wl_display_flush(c->display);
+    xwt_pump(t);
+    xwt_pump(t);
+    XWT_ASSERT(!t->client_dead);
+    XWT_CHECK(seat->cursor_surface,
+              "fabricated serial 0 rejected (cursor kept)");
+
+    /* hide: NULL surface with the VALID serial returns the default */
+    wl_pointer_set_cursor((struct wl_pointer *)c->pointer, enter_serial, NULL,
+                          0, 0);
     wl_display_flush(c->display);
     xwt_pump(t);
     xwt_pump(t);
@@ -104,12 +136,19 @@ static void test_pointer_set_cursor(struct xwt_ctx *t) {
     XWT_CHECK(!seat->cursor_surface, "cursor cleared on NULL surface");
 
     /* the cursor surface dies: the seat must forget it (no dangling) */
+    wl_pointer_set_cursor((struct wl_pointer *)c->pointer, enter_serial, cs,
+                          3, 2);
+    wl_display_flush(c->display);
+    xwt_pump(t);
+    xwt_pump(t);
+    XWT_WAIT(t, seat->cursor_surface);
     wl_surface_destroy(cs);
     xwt_pump(t);
     xwt_pump(t);
     XWT_ASSERT(!t->client_dead);
     XWT_CHECK(!seat->cursor_surface, "seat forgot a destroyed cursor surface");
 
+    xwc_win_destroy(win);
     wl_buffer_destroy(img->buf);
     wl_shm_pool_destroy(img->pool);
     free(img);

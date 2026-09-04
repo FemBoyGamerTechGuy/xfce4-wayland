@@ -19,6 +19,8 @@ static void surface_attach(struct wl_client *client, struct wl_resource *res,
     if (dx || dy)
         xw_log(XW_LOG_WARN, "surface attach offset %d,%d ignored", dx, dy);
     s->pending_buffer = buffer; /* NULL detaches */
+    s->pending_attach = true;   /* ONLY an explicit attach changes the
+                                 * committed buffer at the next commit */
 }
 
 static void surface_damage(struct wl_client *client, struct wl_resource *res,
@@ -193,14 +195,31 @@ void xw_surface_resource_destroyed(struct wl_resource *res) {
 
 /* ------------------------------------------------- buffer ownership */
 
-/* The client destroyed a buffer this surface still references: drop the
- * pointer WITHOUT sending release (the object is gone; the destroy
- * signal fires before internal destructors run). */
+/* The client destroyed a buffer this surface still references: drop
+ * ALL content derived from that resource. Clearing only
+ * committed_buffer (the pre-2026-09-06 behavior) left s->shm pointing
+ * into the freed wl_shm_buffer: the NEXT repaint composited freed
+ * memory (ASan: SEGV inside pixman_image_composite32 from
+ * blit_surface). Xwayland frees buffers/pools aggressively when a
+ * window redraws or resizes — a click that triggers a redraw could
+ * white-screen or crash the compositor. The surface loses its image
+ * until the next commit; the old extent is damaged so the pixels
+ * vanish cleanly instead of lingering. */
 static void committed_buffer_destroyed(struct wl_listener *l, void *data) {
     (void)data;
     struct xw_surface *s =
         wl_container_of(l, s, committed_buffer_destroy);
+    if (s->shm || s->has_single_pixel || s->buf_w > 0) {
+        int x = 0, y = 0, w = 0, h = 0;
+        xw_surface_get_pos(s, &x, &y, &w, &h);
+        if (w > 0 && h > 0)
+            xw_damage_outputs_rect(s->comp, x, y, w, h);
+    }
     s->committed_buffer = NULL;
+    s->shm = NULL;
+    s->has_single_pixel = false;
+    s->buf_w = 0;
+    s->buf_h = 0;
 }
 
 /* Swap the surface's committed buffer. The PREVIOUS buffer gets
@@ -225,6 +244,19 @@ static void set_committed_buffer(struct xw_surface *s,
 }
 
 static void apply_buffer(struct xw_surface *s) {
+    /* attach is STICKY per the wl_surface contract: a commit without
+     * an attach request since the last commit keeps the committed
+     * buffer (damage-only commits, double-buffered frame clocks).
+     * The pre-2026-09-06 code treated every no-attach commit as a
+     * detach: it RELEASED the displayed buffer and blanked the
+     * window mid-frame -- one flash source, and the reason a raw
+     * parent commit un-painted subsurface tests. Only an EXPLICIT
+     * attach(NULL) detaches. */
+    if (!s->pending_attach) {
+        s->pending_buffer = NULL;
+        return; /* committed buffer, shm, and size carry over */
+    }
+    s->pending_attach = false;
     struct wl_resource *b = s->pending_buffer;
     s->pending_buffer = NULL;
     s->shm = NULL;
@@ -248,7 +280,7 @@ static void apply_buffer(struct xw_surface *s) {
             return;
         }
     } else {
-        set_committed_buffer(s, NULL);
+        set_committed_buffer(s, NULL); /* the explicit detach */
     }
     /* an unrecognized or NULL buffer: no content */
     s->buf_w = 0;
@@ -294,6 +326,28 @@ static void surface_commit(struct wl_client *client, struct wl_resource *res) {
         pixman_region_clear(&s->pending_damage);
         return;
     }
+
+    /* THE UNMAP TRANSITION (2026-09-06 round): a role surface that
+     * displayed a buffer and now commits NULL is UNMAPPING -- the
+     * protocol's hide. The pre-fix code ignored this for toplevels
+     * (a GTK "hide" left the window visible and clickable forever)
+     * and, far worse, popup_apply_commit RE-MAPPED an unmapped popup
+     * with NO buffer: a dismissed menu came back as an invisible
+     * input-eating rect at its old position -- the ghost popup that
+     * swallowed every click near where a menu used to be. XWAYLAND
+     * keeps its own null handling inside xw_xwayland_role_commit
+     * (it must also clear grant bookkeeping), so it does not take
+     * this path. */
+    if (had_extent && s->buf_w == 0 && s->buf_h == 0 &&
+        s->role != XW_SURFACE_ROLE_XWAYLAND) {
+        if (old_w > 0 && old_h > 0)
+            xw_damage_outputs_rect(s->comp, old_x, old_y, old_w, old_h);
+        xw_role_unmap(s);
+        xw_seat_repointer(s->comp); /* the surface under the cursor changed */
+        pixman_region_clear(&s->pending_damage);
+        return;
+    }
+
     xw_role_commit(s);
 
     if (s->role == XW_SURFACE_ROLE_XDG_TOPLEVEL)

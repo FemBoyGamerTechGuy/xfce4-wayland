@@ -1109,6 +1109,17 @@ static void test_panel_menu(struct xwt_ctx *t) {
     xw_compositor_inject_pointer_button(t->comp, 0x110, false);
     PANEL_WAIT(t, n_top_popups(t) == 1);
 
+    /* xdg-shell grab semantics (2026-09-06 round): a press outside
+     * the open menu CONSUMES itself dismissing the menu — the exit
+     * button needs its own press. Dismiss first, then click. */
+    xw_compositor_inject_pointer_motion(t->comp, 800, 400);
+    pump_ms(t, 60);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    xwt_pump(t);
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    PANEL_WAIT(t, n_top_popups(t) == 0);
+    XWT_CHECK(n_top_popups(t) == 0, "menu dismissed before the exit click");
+
     /* the exit button is found by its red fill (same scan as the
      * exit-button test) */
     int red_x = -1;

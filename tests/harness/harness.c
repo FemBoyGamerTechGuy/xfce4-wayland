@@ -40,6 +40,7 @@ static void xwt_pump_server(void *ud) {
     while (wl_display_prepare_read(t->client.display) != 0) {
         if (wl_display_dispatch_pending(t->client.display) < 0) {
             t->client_dead = true;
+            xwt_record_death(t);
             return;
         }
     }
@@ -49,13 +50,16 @@ static void xwt_pump_server(void *ud) {
     if (pfd.revents & POLLIN) {
         if (wl_display_read_events(t->client.display) < 0) {
             t->client_dead = true;
+            xwt_record_death(t);
             return;
         }
     } else {
         wl_display_cancel_read(t->client.display);
     }
-    if (wl_display_dispatch_pending(t->client.display) < 0)
+    if (wl_display_dispatch_pending(t->client.display) < 0) {
         t->client_dead = true;
+        xwt_record_death(t);
+    }
     xw_compositor_dispatch(t->comp, 0);
 }
 
@@ -108,6 +112,33 @@ void xwt_end(struct xwt_ctx *t) {
 }
 
 void xwt_pump(struct xwt_ctx *t) { xwt_pump_server(t); }
+
+/* Pull the exact disconnect reason off the client connection: a
+ * protocol error the server posted (code, object, message) is
+ * reported verbatim — "the compositor killed this client" becomes
+ * an attributable fact instead of a bare -1 from dispatch. */
+void xwt_record_death(struct xwt_ctx *t) {
+    if (!t->client_dead || t->death_reason[0])
+        return;
+    struct wl_display *d = t->client.display;
+    if (!d) {
+        snprintf(t->death_reason, sizeof(t->death_reason),
+                 "no client display");
+        return;
+    }
+    uint32_t obj_id = 0;
+    const struct wl_interface *obj_iface = NULL;
+    uint32_t perr = wl_display_get_protocol_error(d, &obj_iface, &obj_id);
+    int err = wl_display_get_error(d);
+    if (perr || obj_iface) {
+        snprintf(t->death_reason, sizeof(t->death_reason),
+                 "protocol error %u on %s object %u (errno %d)",
+                 perr, obj_iface ? obj_iface->name : "(null)", obj_id, err);
+    } else {
+        snprintf(t->death_reason, sizeof(t->death_reason),
+                 "connection error (errno %d)", err);
+    }
+}
 
 int xwt_run_all(void) {
     const char *filter = getenv("XWT_FILTER");

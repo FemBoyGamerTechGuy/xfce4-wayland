@@ -592,6 +592,16 @@ void xw_popup_dismiss(struct xw_popup *p) {
         xw_damage_outputs_rect(p->comp, p->anchor_x, p->anchor_y, p->w, p->h);
         p->mapped = false;
     }
+    /* popup_done is a ONCE-per-lifecycle event (xdg-shell): the
+     * pre-2026-09-06 code sent it from BOTH the outside-press
+     * dismissal AND the client's null-buffer unmap that follows it.
+     * The second one landed on an xdg_popup object the client had
+     * already destroyed after the first -- "invalid object" -- and
+     * libwayland KILLED THE CLIENT. The exact shape of the physical
+     * "right-click kills the application" reports. */
+    if (p->done_sent)
+        return;
+    p->done_sent = true;
     xdg_popup_send_popup_done(p->res);
     /* release the seat grab if this popup owns it */
     struct xw_seat *seat = xw_seat_first(p->comp);
@@ -646,11 +656,18 @@ static void popup_grab(struct wl_client *client, struct wl_resource *res,
         xw_log(XW_LOG_DEBUG, "xdg: popup grab serial %u (last %u)", serial,
                s->serial);
     p->grabbed = true;
-    /* find the grabbing client's pointer resource */
-    struct wl_resource *pr = NULL;
-    wl_list_for_each(pr, &s->pointers, link) {
-        if (wl_resource_get_client(pr) == client)
+    /* find the grabbing client's pointer resource. The
+     * found-variable pattern is load-bearing: on a no-match,
+     * wl_list_for_each leaves the iterator at the LIST HEAD (the
+     * sentinel embedded in the seat), and assigning that to
+     * ptr_grab plants a fake wl_resource in the grab state -- every
+     * later wl_resource_get_client(ptr_grab) reads garbage. */
+    struct wl_resource *pr = NULL, *it;
+    wl_list_for_each(it, &s->pointers, link) {
+        if (wl_resource_get_client(it) == client) {
+            pr = it;
             break;
+        }
     }
     s->ptr_grab = pr;
     s->ptr_grab_is_drag = false;
@@ -1098,12 +1115,16 @@ static void toplevel_apply_commit(struct xw_surface *s) {
 
 static void popup_apply_commit(struct xw_surface *s) {
     struct xw_popup *p = s->role_data;
+    /* a bufferless commit is NOT a map: popups map only when content
+     * arrives (the null-buffer detach is the UNMAP transition handled
+     * in surface_commit -- re-mapping here brought dismissed menus
+     * back as invisible input-eating rects) */
+    if (s->buf_w <= 0 || s->buf_h <= 0)
+        return;
     if (!p->mapped) {
         int sc = s->scale > 0 ? s->scale : 1;
-        if (s->buf_w > 0 && s->buf_h > 0) {
-            p->w = s->buf_w / sc;
-            p->h = s->buf_h / sc;
-        }
+        p->w = s->buf_w / sc;
+        p->h = s->buf_h / sc;
         p->mapped = true;
         xw_damage_outputs_rect(s->comp, p->anchor_x, p->anchor_y, p->w, p->h);
     }
@@ -1133,8 +1154,18 @@ void xw_role_commit(struct xw_surface *s) {
             }
             return;
         }
-        if (w->mapped)
+        if (w->mapped) {
             toplevel_apply_commit(s);
+        } else if (s->buf_w > 0 && s->buf_h > 0) {
+            /* a buffer commit on an UNMAPPED toplevel is a re-show
+             * attempt: restart the configure cycle (the client acks
+             * and re-commits; that commit maps the window -- the
+             * protocol's map-after-hide flow. Pre-2026-09-06 this
+             * path did not exist: a hidden window could NEVER come
+             * back except by destroying and recreating its surface).
+             */
+            xw_xdg_send_configure(w);
+        }
         return;
     }
     case XW_SURFACE_ROLE_XDG_POPUP:

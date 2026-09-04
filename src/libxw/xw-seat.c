@@ -14,6 +14,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,20 +70,50 @@ static void pointer_release(struct wl_client *client, struct wl_resource *res) {
     wl_resource_destroy(res);
 }
 
-/* wl_pointer.set_cursor — THE request that killed the compositor: the
- * function pointer was NULL, and libwayland-server aborts the process
- * on any request dispatched to a NULL listener ("listener function
- * for opcode 0 of wl_pointer is NULL"). Every real toolkit calls this
- * right after its window takes focus, so native apps died seconds
- * after mapping and the session manager restarted the compositor —
- * the physical "window visible for a fraction of a second" bug. */
+/* wl_pointer.set_cursor — the cursor state machine.
+ *
+ * requested:  what the client asked for (validated, stored)
+ * applied:    what the seat adopted (cursor_surface/hotspot)
+ * displayed:  what the renderer draws (default arrow while
+ *             cursor_surface is NULL or empty)
+ *
+ * Validation (the physical round demanded it):
+ *   1. the serial must be one the seat could have issued
+ *      (serial <= s->serial) — a fabricated serial is ignored
+ *   2. the requesting client must own the CURRENT pointer focus —
+ *      a stale response to an old focus is ignored
+ *   3. the surface must exist and have NO role (a roled surface as
+ *      cursor is a client bug, ignored — never fatal)
+ *
+ * Focus changes reset the applied cursor to the default arrow: the
+ * Wayland cursor is per-enter, and the old code kept the previous
+ * client's image around until some OTHER client changed it — the
+ * physical "cursor stuck in the previous state, only recovers after
+ * entering another cursor state" bug. The history note below stays:
+ * this was also THE request that killed the compositor when the
+ * handler pointer was NULL (libwayland-server aborts on requests
+ * dispatched to a NULL listener — every real toolkit calls this
+ * right after its window takes focus). */
 static void pointer_set_cursor(struct wl_client *client,
                                struct wl_resource *res, uint32_t serial,
                                struct wl_resource *surface_res,
                                int32_t hotspot_x, int32_t hotspot_y) {
-    (void)client;
-    (void)serial; /* v0: no serial-based validity window */
     struct xw_seat *s = wl_resource_get_user_data(res);
+
+    const char *requested = surface_res ? "surface" : "hidden";
+    struct xw_surface *old = s->cursor_surface;
+
+    bool valid_serial = serial != 0 && serial <= s->serial;
+    bool owns_focus =
+        s->ptr_focus &&
+        wl_resource_get_client(s->ptr_focus->res) == client;
+    if (!valid_serial || !owns_focus) {
+        xw_input_trace(
+            "cursor: serial=%u %s REJECTED (%s); applied keeps %s", serial,
+            requested, !valid_serial ? "fabricated serial" : "focus lost",
+            old ? "surface" : "default");
+        return; /* ignore: the client keeps running, the cursor stays */
+    }
 
     /* erase the old cursor image before swapping */
     xw_seat_damage_cursor(s->comp);
@@ -95,22 +126,34 @@ static void pointer_set_cursor(struct wl_client *client,
             s->cursor_surface = cs;
             s->cursor_hot_x = hotspot_x;
             s->cursor_hot_y = hotspot_y;
+            s->cursor_serial = serial;
             cs->is_cursor = true;
-            xw_log(XW_LOG_DEBUG,
-                   "seat: cursor set (surface %u, hotspot %d,%d)",
-                   wl_resource_get_id(cs->res), (int)hotspot_x,
-                   (int)hotspot_y);
+            xw_input_trace(
+                "cursor: old=%s requested=%s applied=surface-%u "
+                "hotspot=%d,%d serial=%u",
+                old ? "surface" : "default", requested,
+                wl_resource_get_id(cs->res), (int)hotspot_x,
+                (int)hotspot_y, serial);
         } else {
             /* a roled surface cannot be a cursor: ignore the request
-             * (the client keeps running; the default arrow stays) */
+             * (the client keeps running; the current cursor stays) */
             xw_log(XW_LOG_WARN,
                    "seat: set_cursor with a roled surface ignored");
+            xw_input_trace(
+                "cursor: ROLED surface REJECTED; applied keeps %s",
+                s->cursor_surface ? "surface" : "default");
+            xw_seat_damage_cursor(s->comp);
+            return;
         }
     } else {
         if (s->cursor_surface)
             s->cursor_surface->is_cursor = false;
         s->cursor_surface = NULL;
+        s->cursor_serial = serial;
         xw_log(XW_LOG_DEBUG, "seat: cursor hidden");
+        xw_input_trace("cursor: old=%s requested=hidden applied=default "
+                       "serial=%u",
+                       old ? "surface" : "default", serial);
     }
 
     /* paint the new image (or default arrow) over the erased area */
@@ -275,6 +318,46 @@ static void bind_seat(struct wl_client *client, void *data, uint32_t version,
 
 /* ------------------------------------------------------------ internals */
 
+/* XW_INPUT_TRACE=1: the pointer/cursor/focus instrument for physical
+ * debugging -- every event's raw coordinates, the hit-test pick, the
+ * delivery target, and every cursor state transition (requested vs
+ * applied vs displayed). stderr, same convention as
+ * XW_GEOMETRY_TRACE (works in nested/headless/DRM alike, never
+ * interleaves with the structured log sink). */
+static int input_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("XW_INPUT_TRACE") != NULL;
+    return enabled;
+}
+
+void xw_input_trace(const char *fmt, ...) {
+    if (!input_trace_enabled())
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    fputs("[input] ", stderr);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+}
+
+/* reset the applied cursor to the default arrow (focus transition,
+ * cursor surface death): damage both the old image extent and the
+ * default-arrow box so neither leaves ghosts */
+static void cursor_reset_default(struct xw_seat *s) {
+    if (!s->cursor_surface)
+        return; /* already the default arrow */
+    xw_input_trace(
+        "cursor: old=surface requested=default applied=default "
+        "(focus transition)");
+    xw_seat_damage_cursor(s->comp);
+    s->cursor_surface->is_cursor = false;
+    s->cursor_surface = NULL;
+    s->cursor_serial = 0;
+    xw_seat_damage_cursor(s->comp);
+}
+
 /* topmost layer-shell surface claiming keyboard (exclusive mode) */
 static struct xw_layer_surface *layer_keyboard_owner(struct xw_compositor *c) {
     for (int layer = 3; layer >= 2; layer--) {
@@ -316,10 +399,21 @@ static const char *surface_desc(struct xw_surface *s, char *buf, size_t n) {
     }
 }
 
-/* topmost surface at global point, excluding windows (used for layers);
- * windows are hit-tested by the wm. While the session lock gate is
- * engaged, ONLY lock surfaces are hit-testable: input belongs to the
- * lock client (ext-session-lock security requirement). */
+/* topmost surface at a global point, in the EXACT order the renderer
+ * paints (xw_render_output): popups -> overlay(3) -> top(2) ->
+ * OR windows -> managed windows -> bottom(1) -> background(0) -> NULL.
+ * Within each list: head = topmost (the renderer paints tail-first,
+ * head-last, so the last pixel painted wins the input too). While the
+ * session lock gate is engaged, ONLY lock surfaces are hit-testable:
+ * input belongs to the lock client (ext-session-lock security
+ * requirement).
+ *
+ * The pre-2026-09-06 code scanned ALL FOUR layer levels BEFORE the
+ * windows: a full-screen background/bottom layer (a wallpaper) sat
+ * ABOVE every window in the hit-test while the renderer painted it
+ * BELOW them -- every click "not registering" on the desktop, apps
+ * visible but unusable, taskbar presses swallowed by the wrong
+ * client. Hit-testing must answer exactly what the pixels say. */
 static struct xw_surface *surface_at(struct xw_seat *s, int x, int y) {
     struct xw_compositor *c = s->comp;
 
@@ -330,17 +424,18 @@ static struct xw_surface *surface_at(struct xw_seat *s, int x, int y) {
     if (s->grab_surface)
         return s->grab_surface;
 
-    /* popups: list tail = topmost */
+    /* 1. popups (render step 4 -- topmost of all surfaces). Head of
+     * the list is the topmost popup (painted last). */
     struct xw_popup *p;
-    wl_list_for_each_reverse(p, &c->popups, link) {
+    wl_list_for_each(p, &c->popups, link) {
         if (p->mapped && p->surface && xw_surface_has_input_at(p->surface, x, y)) {
             struct xw_surface *sub = xw_subsurface_at(p->surface, x, y);
             return sub ? sub : p->surface;
         }
     }
 
-    /* layer shell: overlay/top/bottom/background, head = topmost */
-    for (int layer = 3; layer >= 0; layer--) {
+    /* 2. layer-shell top + overlay (render step 3 -- above windows) */
+    for (int layer = 3; layer >= 2; layer--) {
         struct xw_layer_surface *ls;
         wl_list_for_each(ls, &c->wm->layers[layer], link) {
             if (ls->mapped && ls->surface &&
@@ -351,13 +446,30 @@ static struct xw_surface *surface_at(struct xw_seat *s, int x, int y) {
         }
     }
 
+    /* 3. windows: override-redirect above managed (render step 2b
+     * after 2 -- xw_wm_window_at scans OR first, then the stack) */
     struct xw_window *w = xw_wm_window_at(c->wm, x, y, NULL);
     if (w && w->surface) {
         struct xw_surface *sub = xw_subsurface_at(w->surface, x, y);
         if (sub)
             return sub;
     }
-    return w ? w->surface : NULL;
+    if (w)
+        return w->surface;
+
+    /* 4. layer-shell bottom + background (render step 1 -- BELOW the
+     * windows: they only take input where no window pixel is drawn) */
+    for (int layer = 1; layer >= 0; layer--) {
+        struct xw_layer_surface *ls;
+        wl_list_for_each(ls, &c->wm->layers[layer], link) {
+            if (ls->mapped && ls->surface &&
+                xw_surface_has_input_at(ls->surface, x, y)) {
+                struct xw_surface *sub = xw_subsurface_at(ls->surface, x, y);
+                return sub ? sub : ls->surface;
+            }
+        }
+    }
+    return NULL;
 }
 
 /* send pointer events to every wl_pointer resource owned by surface's
@@ -486,6 +598,14 @@ static void set_ptr_focus(struct xw_seat *s, struct xw_surface *surface) {
         }
     }
     s->ptr_focus = surface;
+    /* focus crossed to a different client: the old client's cursor
+     * image is not valid on the new focus (the Wayland cursor is
+     * per-enter). Reset to the default arrow; the new client sets its
+     * own with a set_cursor carrying the enter serial we are about to
+     * send. This is the stuck-cursor fix: previously the old image
+     * stayed until some other client happened to change it. */
+    if (old && old != newc)
+        cursor_reset_default(s);
     if (newc) {
         struct wl_resource *p;
         wl_list_for_each(p, &s->pointers, link) {
@@ -496,6 +616,7 @@ static void set_ptr_focus(struct xw_seat *s, struct xw_surface *surface) {
                                       wl_fixed_from_int(s->cursor_x - sx),
                                       wl_fixed_from_int(s->cursor_y - sy));
                 wl_pointer_send_frame(p);
+                s->ptr_enter_serial = s->serial;
                 if (!s->first_enter_ms) {
                     s->first_enter_ms = xw_now_ms();
                     xw_log(XW_LOG_INFO,
@@ -823,11 +944,19 @@ void xw_seat_pointer_motion(struct xw_seat *s, int x, int y) {
         struct wl_resource *p;
         int sx = 0, sy = 0;
         xw_surface_get_pos(s->ptr_focus, &sx, &sy, NULL, NULL);
-        if (getenv("XW_GEOMETRY_TRACE"))
+        {
+            char dbuf[64];
+            xw_input_trace("motion (%d,%d) -> %s local (%d,%d)",
+                           x, y,
+                           surface_desc(s->ptr_focus, dbuf, sizeof(dbuf)),
+                           x - sx, y - sy);
+        }
+        if (getenv("XW_GEOMETRY_TRACE")) {
             fprintf(stderr,
                     "[geom] motion      global (%d,%d) -> surface-local "
                     "(%d,%d) [origin %d,%d]\n",
                     x, y, x - sx, y - sy, sx, sy);
+        }
         PTR_FOR_EACH(s->ptr_focus, p) {
             wl_pointer_send_motion(p, (uint32_t)xw_now_ms(),
                                    wl_fixed_from_int(x - sx),
@@ -937,17 +1066,41 @@ void xw_seat_pointer_button(struct xw_seat *s, uint32_t linux_button,
             xw_popup_dismiss(p);
             dismissed = true;
         }
-        /* the dismissed popup may still hold ptr_focus (the client has
-         * not processed popup_done yet): re-hit-test so the press is
-         * delivered to the surface actually under the cursor */
-        if (dismissed && s->ptr_focus &&
-            s->ptr_focus->role == XW_SURFACE_ROLE_XDG_POPUP) {
-            struct xw_popup *fp = s->ptr_focus->role_data;
-            if (!fp || !fp->mapped) {
-                struct xw_surface *target =
-                    surface_at(s, s->cursor_x, s->cursor_y);
+        if (dismissed) {
+            /* xdg-shell grab semantics: the press that dismisses a
+             * grabbed popup is CONSUMED by the grab -- it is not
+             * delivered to the surface below (the user's click was
+             * "close the menu", nothing else). Focus still follows the
+             * surface under the cursor so the desktop feels right. */
+            struct xw_surface *target = surface_at(s, s->cursor_x,
+                                                   s->cursor_y);
+            if (s->ptr_focus != target)
                 set_ptr_focus(s, target);
-            }
+            char dbuf[64];
+            xw_input_trace("button %u press at (%d,%d): popup dismissed -> "
+                           "focus %s, press CONSUMED by the grab",
+                           linux_button, s->cursor_x, s->cursor_y,
+                           surface_desc(target, dbuf, sizeof(dbuf)));
+            /* focus the window under the cursor (taskbar/desktop
+             * parity) without delivering the consuming press */
+            struct xw_window *w = xw_wm_window_at(c->wm, s->cursor_x,
+                                                  s->cursor_y, NULL);
+            if (w)
+                xw_wm_focus_window(c->wm, w, true);
+            return;
+        }
+    }
+
+    /* ptr_focus may point at a surface that unmapped since the last
+     * hit-test (a dismissed popup the client already tore down, a
+     * null-buffer commit): never deliver events to a dead rect --
+     * re-hit-test from the current cursor position */
+    if (s->ptr_focus && s->ptr_focus->role == XW_SURFACE_ROLE_XDG_POPUP) {
+        struct xw_popup *fp = s->ptr_focus->role_data;
+        if (!fp || !fp->mapped) {
+            struct xw_surface *target =
+                surface_at(s, s->cursor_x, s->cursor_y);
+            set_ptr_focus(s, target);
         }
     }
 
@@ -1014,6 +1167,10 @@ void xw_seat_pointer_button(struct xw_seat *s, uint32_t linux_button,
         (void)sx;
         (void)sy;
         char dbuf[64];
+        xw_input_trace("button %u %s -> %s (serial next %u)",
+                       linux_button, down ? "press" : "release",
+                       surface_desc(s->ptr_focus, dbuf, sizeof(dbuf)),
+                       s->serial + 1);
         xw_log(XW_LOG_DEBUG, "wayland: pointer button %u %s surface=%s",
                linux_button, down ? "pressed" : "released",
                surface_desc(s->ptr_focus, dbuf, sizeof(dbuf)));

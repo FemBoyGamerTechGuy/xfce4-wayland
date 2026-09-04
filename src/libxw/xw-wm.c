@@ -408,6 +408,15 @@ void xw_wm_unmanage(struct xw_wm *wm, struct xw_window *w, bool resources_gone) 
 void xw_wm_focus_window(struct xw_wm *wm, struct xw_window *w, bool activate) {
     if (w && w->xw_override_redirect)
         return; /* popup-class windows never take keyboard focus */
+    /* An activation request (taskbar button, xdg-activation, EWMH)
+     * RESTORES a minimized window before the visibility check: the
+     * pre-2026-09-06 order tested visibility first and bailed with
+     * "refusing to focus invisible window" -- minimized == invisible,
+     * so a taskbar click on a minimized window was a NO-OP (the
+     * dead-taskbar-button physical report; the unminimize below was
+     * unreachable code for exactly the windows that needed it). */
+    if (w && w->minimized)
+        xw_wm_minimize(wm, w, false);
     if (w && !xw_wm_window_visible(wm, w)) {
         xw_log(XW_LOG_WARN, "wm: refusing to focus invisible window");
         return;
@@ -423,8 +432,6 @@ void xw_wm_focus_window(struct xw_wm *wm, struct xw_window *w, bool activate) {
     }
     if (w) {
         w->activated = activate;
-        if (w->minimized)
-            xw_wm_minimize(wm, w, false);
         xw_wm_raise(wm, w);
         xw_xdg_send_configure(w);
         xw_foreign_toplevel_notify(wm->comp, w);

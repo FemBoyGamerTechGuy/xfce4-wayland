@@ -337,6 +337,30 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
   X-side activation channel (_NET_ACTIVE_WINDOW requests currently
   logged as unimplemented).
 
+- DONE (2026-09-06) the input/focus/cursor/window-state round: the
+  physical "geometry fixed but desktop unusable" reports were
+  INPUT-side, not geometry. Root causes fixed: hit-test now follows
+  the RENDER order (a full-screen background layer used to eat every
+  window click), the cursor state machine (per-enter reset, serial
+  validation — the stuck cursor), popup_done is once-per-lifetime
+  (the double-send after dismissal+unmap KILLED clients — the
+  right-click killer), the null-buffer UNMAP transition existed
+  nowhere (hidden toplevels stayed visible+clickable forever;
+  dismissed popups re-mapped as invisible click-eating ghost rects),
+  wl_surface.attach is sticky (no-attach commits no longer release
+  and blank the displayed buffer), destroying a committed buffer no
+  longer leaves a UAF for the renderer (ASan SEGV), a bare activate
+  on a minimized window now restores+focuses (the dead taskbar
+  button), popup_grab can no longer plant a list-head sentinel in
+  the grab state, and the dismissing press is consumed by the grab
+  (xdg-shell semantics). Instrument: XW_INPUT_TRACE=1 (per-event
+  coordinates/picks/delivery + cursor transitions). Regressions:
+  the test_input.c battery (real libwayland clients + a real GTK4
+  process, full event recording; every fix revert-verified or
+  reproduced red first). 124/124 in-process (release and ASan),
+  144/144 session, xwayland stack PASS, xwm-loss PASS, realapps
+  27/27, build-regressions 51/0/1.
+
 ## M9 — Hardening/quality
 - DONE zero-warning builds (-Wall -Wextra -Werror, also under -O1),
   ASAN/UBSAN/LSAN-clean suite + process tests (`make asan`),

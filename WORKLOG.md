@@ -2464,3 +2464,125 @@ canonical, and regression-pinned, but "desktop functional" must
 be claimed only after a physical pass. Not yet implemented (same
 backlog as before): X11 clipboard bridge, EWMH workspace
 mirroring, X-side activation channel.
+
+## 2026-09-06 — the input/focus/cursor/window-state round
+
+**The physical reports**: geometry improved, but the desktop was
+still not usable — unreliable cursor state (stuck until another
+cursor region), "most clicks do not register", right-click KILLING
+Wayland applications, X11 windows flashing on click, taskbar
+buttons not restoring windows, Mirage/browser unusable.
+
+**Root causes found and fixed** (each pinned by a new regression):
+
+1. **Hit-test did not follow the render order.** `surface_at`
+   scanned ALL FOUR layer-shell levels BEFORE the windows, while
+   the renderer paints background/bottom BELOW windows. A
+   full-screen background layer (a wallpaper) sat above every
+   window in the hit-test: clicks landed on the wallpaper client,
+   not the window under the cursor. Hit-testing now mirrors
+   `xw_render_output` exactly: popups → overlay → top → OR
+   windows → managed windows → bottom → background.
+   (`input-hit-test-order`)
+
+2. **The cursor was never reset on focus changes.** The Wayland
+   cursor is per-enter; the old code kept the previous client's
+   image until some OTHER client happened to change it — the
+   stuck cursor. New state machine (requested / applied /
+   displayed) with serial validation (fabricated serials
+   rejected, stale cross-client requests rejected, roled
+   surfaces rejected — never fatal) and default-arrow reset on
+   every cross-client focus transition.
+   (`input-cursor-state`, `pointer-set-cursor`)
+
+3. **Double `popup_done` killed clients.** The outside-press
+   dismissal AND the client's own null-buffer unmap each sent
+   `popup_done`; the second landed on an xdg_popup object the
+   client had already destroyed — invalid object — libwayland
+   killed the client. THE right-click killer: popup_done is now
+   once-per-lifetime. (`input-popup-done-once`, revert-verified
+   red)
+
+4. **The null-buffer unmap transition did not exist.** A
+   role surface committing NULL after displaying a buffer is
+   HIDING (the protocol's hide): the old code ignored it for
+   toplevels (GTK-hidden windows stayed visible, clickable and
+   in the taskbar forever) and `popup_apply_commit` RE-MAPPED an
+   unmapped popup with no buffer — a dismissed menu came back
+   as an invisible input-eating rect at its old position (the
+   ghost popup that swallowed clicks). Plus the re-show path:
+   a buffer commit on an unmapped toplevel now restarts the
+   configure cycle (previously the window could never come
+   back without destroying its surface).
+   (`input-toplevel-null-unmap`)
+
+5. **`wl_surface.attach` is sticky.** Every no-attach commit was
+   treated as a detach: the displayed buffer got RELEASED and
+   the window blanked mid-frame (a flash source on redraw).
+   Only an explicit `attach(NULL)` detaches now.
+   (`subsurface-lifecycle`, `geometry-native` — both went red
+   with the old semantics)
+
+6. **Buffer-destroy UAF in the render path.** A client
+   destroying a committed buffer left `s->shm` pointing into the
+   freed `wl_shm_buffer`; the next repaint composited freed
+   memory (ASan: SEGV in pixman from blit_surface). Xwayland
+   frees buffers/pools aggressively on redraw/resize — the
+   white-window/flash family. Content now clears with damage on
+   destroy. (pinned by every rawc test that destroys its buffer
+   post-commit)
+
+7. **Taskbar activation was refused.** `xw_wm_focus_window`
+   tested visibility BEFORE unminimizing: minimized == invisible
+   → "refusing to focus invisible window" → the unminimize call
+   below was unreachable for exactly the windows that needed it.
+   A bare `activate` (no `unset_minimized`) on a minimized
+   window now restores + focuses + raises. The taskbar's
+   unset_minimized+activate pair was already working; the
+   bare-activate path (xdg-activation, other taskbars) was dead.
+   (`input-taskbar-activate`)
+
+8. **`popup_grab`'s iterator could plant a sentinel.** On a
+   no-match, `wl_list_for_each` leaves the iterator at the list
+   head; assigning it to `s->ptr_grab` stored a fake wl_resource
+   in the grab state. Found-variable pattern (same class as the
+   panel-click UBSan finding).
+
+9. **The dismissing press is consumed by the grab** (xdg-shell
+   semantics): the press that dismisses a popup is not delivered
+   to the surface below; focus still follows the surface under
+   the cursor. (panel-menu updated accordingly)
+
+**Instrument**: `XW_INPUT_TRACE=1` — every pointer event's raw
+coordinates, hit-test pick, delivery target, and every cursor
+state transition (old/requested/applied, serial, rejection
+reason) on stderr, alongside `XW_GEOMETRY_TRACE`.
+
+**New battery** (`tests/suite/test_input.c`, real libwayland
+clients, full event recording): the priority-1 event matrix
+(enter/leave/motion/L-M-R buttons/axis with serials and
+surface-local coordinates), the hit-test order, the cursor state
+machine, the right-click context-menu flow (press → popup +
+grab → enter → item click → outside-press dismissal → parent
+refocus → destroy), popup-destroy-under-grab, popup_done-once,
+toplevel null-commit hide/show, taskbar activation cycles
+(incl. cross-workspace), and a REAL GTK4 process (zenity) driven
+with motion + L/R/M clicks that must survive. The harness now
+records the exact protocol error when a test client dies
+(`xwt_record_death`).
+
+**Validation**: 124/124 in-process (release), 124/124 under
+ASan/UBSan/LSan with zero reports, 144/144 session, XWayland
+stack PASS, xwm-loss PASS, realapps 27/27, build-regressions
+51/0/1.
+
+**Honest acceptance status**: the input/focus/cursor/state
+invariants are headlessly pinned for real clients (raw protocol
++ GTK4). The physical NVIDIA pass remains the authority: the
+right-click kill is fixed at the protocol level (double-done +
+ghost-popups + UAF all reproduced headlessly and reverted-red),
+but Wine/Heroic/Browser-class workloads could not be exercised
+in-container — their remaining failures, if any, will trace
+through XW_INPUT_TRACE / XW_GEOMETRY_TRACE. Backlog unchanged:
+X11 clipboard bridge, EWMH workspace mirroring, X-side
+activation channel.

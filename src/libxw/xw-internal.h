@@ -93,6 +93,7 @@ struct xw_surface {
 
     /* pending state */
     struct wl_resource *pending_buffer;
+    bool pending_attach; /* attach seen since the last commit (sticky buffer) */
     pixman_region16_t pending_damage;
 
     pixman_region16_t input;        /* surface-local; empty = whole surface */
@@ -347,6 +348,12 @@ struct xw_seat {
      * software cursor path at (cursor_x - hot_x, cursor_y - hot_y). */
     struct xw_surface *cursor_surface;
     int cursor_hot_x, cursor_hot_y;
+    /* cursor state machine: the serial of the pointer enter most
+     * recently delivered to the current focus (set_cursor requests
+     * are validated against it and against the seat's issued-serial
+     * ceiling) and the serial of the last accepted set_cursor */
+    uint32_t ptr_enter_serial;
+    uint32_t cursor_serial;
 
     /* key repeat (see xw.h struct xw_compositor_config): advertised to
      * clients via wl_keyboard.repeat_info; the server-side timer
@@ -755,6 +762,7 @@ struct xw_popup {
     int w, h;
     bool mapped;
     bool grabbed;
+    bool done_sent; /* popup_done is once-per-lifetime (xdg-shell) */
     struct wl_list link;
 };
 
@@ -791,6 +799,10 @@ void xw_subsurface_parent_committed(struct xw_surface *parent);
 /* the parent is being destroyed: unrole+damage all children */
 void xw_subsurface_parent_destroyed(struct xw_surface *parent);
 /* the seat needs to forget a dying cursor/subsurface reference */
+/* XW_INPUT_TRACE=1 instrument (xw-seat.c): pointer/cursor/focus
+ * event lines on stderr for physical debugging */
+void xw_input_trace(const char *fmt, ...);
+
 void xw_seat_forget_cursor_surface(struct xw_compositor *c,
                                    struct xw_surface *s);
 /* role dispatch (xw-subcompositor.c, called from xw-surface.c) */
