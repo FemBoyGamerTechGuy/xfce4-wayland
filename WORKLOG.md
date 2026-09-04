@@ -2586,3 +2586,140 @@ in-container — their remaining failures, if any, will trace
 through XW_INPUT_TRACE / XW_GEOMETRY_TRACE. Backlog unchanged:
 X11 clipboard bridge, EWMH workspace mirroring, X-side
 activation channel.
+
+---
+
+## Round 3 — the A/B/C physical-debug round (2026-09-06)
+
+The three physical reports after f49614f: (A) Backspace types "u",
+(B) the move/resize hit-offset (resize cursor on the title bar, MOVE
+only engages deeper inside the app, both stacks), (C) fullscreen
+still leaves a large one-sided gap on the physical NVIDIA box.
+Method for each: instrument the whole chain, RED-reproduce
+headlessly, fix the narrow root cause, pin with a regression, keep
+the physical box as the final authority.
+
+### A — keyboard: the compositor is exonerated, byte-perfect
+
+The full-chain instrument (XW_INPUT_TRACE=1, stderr): libinput's raw
+keycode at the source, the seat's entry line (raw linux keycode, the
++8 wl keycode, the keysym a compliant client computes, press/release,
+all four modifier masks, focus surface, destination client pid), the
+modifiers line with its serial, the kb-bind line (keymap size,
+version, repeat), the kb-focus transitions, and the per-outcome line
+(delivered serial / consumed-by-VT / shortcut / interactive /
+dropped). A physical run now answers "wrong event from the
+compositoritor, or wrong interpretation in the client" by diffing
+these lines against what the app shows.
+
+Two new deliverables: `tests/keyboardprobe.c` — the minimal RAW
+Wayland keyboard client (no toolkit, no libxwcl; its own xkb state
+from the delivered keymap; spot-checks the keymap keycode space at
+startup; reports every enter/leave/modifiers/key/repeat_info with
+serials and the client-side decode; flags anomalies: keycode < 8,
+non-monotonic serials, unpaired release, double delivery, BackSpace
+decoding to a printable letter — the literal symptom) — runs against
+any compositor socket, container or NVIDIA box: `keyboardprobe
+<socket> [seconds]`. And `scripts/test-physical-kbd.sh` +
+`tests/kbddriver.c` (XSendEvent, libX11-only): drives the report
+matrix through the REAL X keycode space (evdev+8, the same
+convention XWayland uses) into the X11-backend compositor while the
+probe records the wire — PASS: wl 22 = BackSpace (not 'u'), 16/16
+events, 0 anomalies.
+
+The in-process matrix (`seat-keyboard-matrix`): the keymap
+spot-table (22 BackSpace, 23 Tab, 30 u, 36 Return, 38 a, 50 Shift_L,
+37 Control_L, 67 F1 — pins the evdev+8 keycode space itself) plus
+the exact 16-event stream for Backspace / u / a / Shift+Backspace /
+Ctrl+Backspace / Alt press-release: keycode, client-computed
+keysym, press/release, mods at delivery, exactly-16 (no stale or
+replayed events). GREEN. Headless conclusion: raw 14 -> wl 22 ->
+BackSpace is correct through every layer this container can
+exercise, including the X keycode space. The physical "u" must
+therefore live in what the container cannot run: the physical
+libinput device, the physical config's RMLVO, or the client app
+itself — the probe + trace decide which on the next physical run.
+
+### B — THE move/resize hit-offset root cause: found, RED, fixed
+
+Symptom reproduction: a CSD toplevel (set_window_geometry with a
+shadow/header offset — every GTK/kitty/Firefox window) received
+pointer events whose surface-local coordinates were WINDOW-RECT
+relative. The protocol's surface-local space is the BUFFER origin:
+with a geometry offset (geo_x, geo_y) the buffer origin sits that
+far left/above the window rect, so every delivered coordinate was
+shifted up-left by exactly (geo_x, geo_y). The client's widget,
+header-bar and resize-margin zones live in buffer space, so the
+user hovering the VISIBLE title bar made the client believe the
+pointer was in its shadow/resize margin — the resize cursor on the
+title bar — and a window MOVE only engaged once the pointer was
+pushed (geo_y) pixels deeper into the app. Render and hit-test
+already honored the offset; only the event stream was wrong.
+
+Fix (one canonical conversion, no special cases):
+`xw_surface_to_local()` in xw-surface.c is now the ONE global ->
+surface-local translation (buffer-relative, geometry offset
+included) — `xw_surface_has_input_at` uses it, and every delivery
+site switched to it: wl_pointer enter (focus transition + late-bind
+replay), wl_pointer motion, and the data-device drag enter. The
+inverse `xw_surface_buffer_pos()` (buffer origin in global coords)
+fixes the popup family: xdg_positioner anchors are parent-SURFACE
+(buffer) coordinates, so `popup_place` now anchors off the buffer
+origin (menus land under their buttons, not (geo_x, geo_y) off) and
+`popup_send_configure` reports x/y relative to the same origin.
+
+Regressions (RED -> GREEN): `input-csd-pointer-geometry` (enter,
+motion, re-enter must all be buffer-relative: delivered 20,15 ->
+30,29 was the failing shape) and `input-csd-popup-anchor` (server
+placement + configure coordinates; the configure x/y alone cancels
+the origin, so the assertion checks the placed rect — placed
+(700,360) vs correct (690,346) was the failing shape). XWayland-role
+surfaces have no geometry offset: same helper, unchanged numbers.
+
+### C — fullscreen: every headless layer pinned, the DRM leg traced
+
+The zero-gap battery `geometry-fullscreen`, three legs:
+(A) native xdg fullscreen on a SECOND output at a non-zero layout
+origin (1000,200 640x480 — the global (0,0) assumption trap): model
+== output rect exactly, pixels cover the four corners AND four edge
+midpoints of that output, unfullscreen restores.
+(B) the XWayland role driven through the REAL protocols — a raw
+client binding xwayland_shell_v1 + xw_window_control_manager_v1 v3
+(the exact channel the WM helper uses): set_serial, map, EWMH-style
+set_fullscreen — model goes to its output rect, the grant mirrors
+back through the geometry event, a stale client commit cannot
+shrink it, leave restores.
+(C) CSD geometry + fullscreen: the state-held rect wins over the
+geometry declaration, the render covers edge-to-edge.
+All GREEN — the model + render chain is correct for both stacks
+headlessly. What the container cannot exercise is the DRM scanout
+leg, so it is now instrumented: XW_GEOMETRY_TRACE prints the
+physical chain's first link at output setup (mode, CRTC, FB size,
+pitch, layout origin, logical size, scale). A one-sided physical
+gap with a correct model rect now points at exactly one place.
+
+### Instrument set for the physical NVIDIA run
+
+XW_INPUT_TRACE=1 (libinput raw -> seat chain -> delivery, serials,
+pids, cursor/focus/popup state) and XW_GEOMETRY_TRACE=1 (wm
+geometry transitions, motion translation, output/mode/scanout
+setup). build/tests/keyboardprobe against the live socket.
+TESTING.md's matrix unchanged; the physical bar stays the authority.
+
+### Validation (this container: wayland+xkbcommon+pixman+X11 only —
+no libdrm/libudev/libinput/libXtst dev files, no Xwayland binary)
+
+127/127 in-process (release), 127/127 under ASan/UBSan/LSan with
+zero reports (one leak fixed: the new raw xwayland-role client in
+test_core.c must destroy every proxy — reg/shm/comp — like
+rc_destroy). Child-process leak check PASS.
+scripts/test-physical-kbd.sh PASS (the X-keycode-space matrix
+end-to-end against a live compositor). link-deps 7/7.
+Environment-gated (not runnable HERE, unchanged code paths):
+session drm rounds 8 checks (needs the drm backend compiled),
+build-regressions R6 (libinput/udev variants), the XWayland stack
+and realapps rounds (need .apps-root). `make all` no longer breaks
+where libXtst is absent: x11probe is now auto-gated on XTest
+availability (kbddriver covers the same key matrix with plain
+libX11). Backlog unchanged: X11 clipboard bridge, EWMH workspace
+mirroring, X-side activation channel.

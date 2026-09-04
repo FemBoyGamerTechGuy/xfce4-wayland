@@ -432,6 +432,57 @@ pixman_image_t *xw_surface_get_image(struct xw_surface *s) {
     return NULL;
 }
 
+/* The canonical global -> surface-local translation, ONE truth for
+ * every consumer (hit-test and event delivery). Surface-local is
+ * relative to the BUFFER origin (wl_surface space) per the protocol:
+ * for CSD toplevels with set_window_geometry the buffer origin sits
+ * geo_* left/above the window-rect origin, so the offset must be
+ * ADDED. Delivering window-rect-relative coords instead (the
+ * pre-2026-09-06 delivery path) shifted every client-side hit zone
+ * up-left by (geo_x, geo_y): hovering the visible header bar read as
+ * the client's shadow/resize margin (resize cursor on the title bar),
+ * and a window MOVE only engaged once the pointer was pushed that
+ * many pixels deeper into the app — the physical move/resize
+ * hit-offset bug. */
+void xw_surface_to_local(struct xw_surface *s, int gx, int gy, int *lx,
+                         int *ly) {
+    int x = 0, y = 0, gl = 0, gt = 0;
+    xw_surface_get_pos(s, &x, &y, NULL, NULL);
+    if (s->role == XW_SURFACE_ROLE_XDG_TOPLEVEL && s->role_data) {
+        struct xw_window *win = s->role_data;
+        if (win->geometry_set) {
+            gl = win->geo_x;
+            gt = win->geo_y;
+        }
+    }
+    if (lx)
+        *lx = gx - x + gl;
+    if (ly)
+        *ly = gy - y + gt;
+}
+
+/* The wl_surface (buffer) origin in global coords — the inverse of
+ * to_local. Popup anchoring needs this: xdg_positioner anchors are
+ * parent-SURFACE (buffer) coordinates, so the popup's global position
+ * is buffer origin + anchor point. Using the window-rect origin
+ * instead shifted every CSD-parented menu/popover by exactly the
+ * shadow margin. */
+void xw_surface_buffer_pos(struct xw_surface *s, int *x, int *y) {
+    int wx = 0, wy = 0, gl = 0, gt = 0;
+    xw_surface_get_pos(s, &wx, &wy, NULL, NULL);
+    if (s->role == XW_SURFACE_ROLE_XDG_TOPLEVEL && s->role_data) {
+        struct xw_window *win = s->role_data;
+        if (win->geometry_set) {
+            gl = win->geo_x;
+            gt = win->geo_y;
+        }
+    }
+    if (x)
+        *x = wx - gl;
+    if (y)
+        *y = wy - gt;
+}
+
 bool xw_surface_has_input_at(struct xw_surface *s, int gx, int gy) {
     int x, y, w, h;
     xw_surface_get_pos(s, &x, &y, &w, &h);
@@ -450,7 +501,8 @@ bool xw_surface_has_input_at(struct xw_surface *s, int gx, int gy) {
             gt = win->geo_y;
         }
     }
-    int lx = gx - x + gl, ly = gy - y + gt; /* surface-local */
+    int lx, ly;
+    xw_surface_to_local(s, gx, gy, &lx, &ly); /* surface-local */
     if (!s->input_set) {
         /* no input region set: the geometry rect is interactive */
         return lx >= gl && lx < gl + w && ly >= gt && ly < gt + h;

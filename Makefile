@@ -644,6 +644,30 @@ build/tests/fdtest2: $(OBJ)/tests/fdtest2.o | build/tests
 build/tests/mockseatd: $(OBJ)/tests/mockseatd.o | build/tests
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/mockseatd.o $(LDLIBS_M)
 
+# minimal raw Wayland keyboard probe (physical "backspace types u"
+# instrument: records the exact wl_keyboard wire stream + client-side
+# decode). Runs against any compositor socket, container or NVIDIA box.
+build/tests/keyboardprobe: $(OBJ)/tests/keyboardprobe.o \
+	$(OBJ)/gen/xdg-shell-protocol.o | build/tests
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/keyboardprobe.o \
+	$(OBJ)/gen/xdg-shell-protocol.o $(LDLIBS_WLC) $(LDLIBS_XKB) -lm
+
+$(OBJ)/tests/keyboardprobe.o: tests/keyboardprobe.c | $(OBJ)/tests
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_XKB) -c $< -o $@
+
+# X-side key driver for the physical-kbd regression (XSendEvent;
+# libX11 only so it builds wherever the X11 backend does)
+build/tests/kbddriver: $(OBJ)/tests/kbddriver.o | build/tests
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/kbddriver.o $(LDLIBS_X11) -lm
+
+$(OBJ)/tests/kbddriver.o: tests/kbddriver.c | $(OBJ)/tests
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(CFLAGS_X11) -c $< -o $@
+
+# x11probe needs the XTest dev headers; kbddriver (plain
+# libX11) covers the same key-path regression where they are
+# absent, so the build degrades instead of failing
+XTST_FOUND := $(shell printf '%s' '\#include <X11/extensions/XTest.h>\nint main(void){return 0;}' | $(CC) -x c - $(CFLAGS_X11) -o /dev/null - >/dev/null 2>&1 && echo y)
+
 # XTEST probe: xtst dev files live in the optional sysroot (the
 # runtime lib may be there too), so use explicit paths with rpath
 ifeq ($(X11_ON)$(XW_SYSROOT),y$(XW_SYSROOT))
@@ -687,10 +711,14 @@ CLIENT_BINS := $(if $(wildcard src/clients/xw-demo.c),build/bin/xw-demo,) \
 all: build/.profile build/.features build/bin/xw-compositor $(SESSION_BINS) $(CLIENT_BINS) \
 	build/tests/run-tests
 ifeq ($(X11_ON),y)
+ifeq ($(XTST_FOUND),y)
 all: build/tests/x11probe build/tests/panelprobe build/tests/miniwm \
 	build/tests/fdtest2 build/tests/x11client
+else
+	$(info x11probe: XTest dev files not found - build/tests/kbddriver (libX11 only) covers the key matrix)
 endif
-all: build/tests/mockseatd
+endif
+all: build/tests/mockseatd build/tests/keyboardprobe build/tests/kbddriver
 
 # profile stamp consulted by the PROFILE guard near the top
 build/.profile:

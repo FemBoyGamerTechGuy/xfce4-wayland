@@ -569,6 +569,191 @@ static void test_seat_vt_switch_keys(struct xwt_ctx *t) {
     close_mock_env(sock);
 }
 
+/* ------------------------------------------------- keyboard matrix */
+
+/* The physical "Backspace types u" matrix, pinned headlessly: the
+ * exact wl_keyboard event stream a raw client must observe for every
+ * key combination of the report, plus the keycode space of the
+ * delivered keymap itself. The xwc key callback reports the RAW linux
+ * keycode (wire - 8) and the keysym IT computed from the delivered
+ * keymap + modifiers events — so a double +8, a raw-space keymap, or
+ * a corrupted modifier stream all fail here with a diff of exactly
+ * which event was wrong. */
+#include <xkbcommon/xkbcommon-keysyms.h>
+
+#define K_BKSP 14 /* linux KEY_BACKSPACE */
+#define K_U    22 /* linux KEY_U */
+#define K_A    30 /* linux KEY_A */
+
+struct krec {
+    uint32_t code; /* raw linux keycode as the client received it */
+    bool down;
+    xkb_keysym_t sym; /* the client's own decode of the wire keycode */
+    uint32_t mods;   /* depressed mods at delivery time */
+};
+#define KREC_MAX 64
+static struct krec g_krec[KREC_MAX];
+static int g_nkrec;
+
+static void matrix_key_cb(struct xwc_win *w, uint32_t keycode, bool down,
+                          xkb_keysym_t sym, uint32_t mods, void *ud) {
+    (void)w;
+    (void)ud;
+    if (g_nkrec < KREC_MAX) {
+        g_krec[g_nkrec].code = keycode;
+        g_krec[g_nkrec].down = down;
+        g_krec[g_nkrec].sym = sym;
+        g_krec[g_nkrec].mods = mods;
+    }
+    g_nkrec++;
+}
+
+/* solid-fill configure so the window maps and takes focus */
+static void matrix_win_configure(struct xwc_win *w, int width, int height,
+                                 void *ud) {
+    (void)width;
+    (void)height;
+    uint32_t color = *(uint32_t *)ud;
+    int ww = 0, wh = 0, stride = 0;
+    xwc_win_size(w, &ww, &wh);
+    uint32_t *pix = xwc_win_pixels(w, &stride);
+    if (!pix || ww < 1 || wh < 1)
+        return;
+    xwc_fill_rect(pix, stride, ww, wh, 0, 0, ww, wh, color);
+    xwc_win_commit(w);
+}
+
+/* inject one key press+release pair */
+static void tap(struct xwt_ctx *t, uint32_t code) {
+    xw_compositor_inject_key(t->comp, code, true);
+    xwt_pump(t);
+    xw_compositor_inject_key(t->comp, code, false);
+    xwt_pump(t);
+}
+
+/* press (no release) — for modifier holds */
+static void hold(struct xwt_ctx *t, uint32_t code, bool down) {
+    xw_compositor_inject_key(t->comp, code, down);
+    xwt_pump(t);
+}
+
+static void check_krec(struct xwt_ctx *t, int idx, uint32_t code, bool down,
+                       xkb_keysym_t sym, const char *what) {
+    (void)t; /* context only for the XWT_CHECK bookkeeping */
+    XWT_CHECK(idx < g_nkrec, "event %d (%s) never arrived (got %d)", idx,
+              what, g_nkrec);
+    if (idx >= g_nkrec)
+        return;
+    XWT_CHECK(g_krec[idx].code == code,
+              "event %d (%s): raw keycode %u, expected %u — a wrong "
+              "number here means the wire keycode is not evdev+8",
+              idx, what, g_krec[idx].code, code);
+    XWT_CHECK(g_krec[idx].sym == sym,
+              "event %d (%s): client decoded keysym %#x, expected %#x — "
+              "the keymap/modifier decode of the delivered events is "
+              "wrong (this is the backspace-types-u failure shape)",
+              idx, what, g_krec[idx].sym, (unsigned)sym);
+    XWT_CHECK(g_krec[idx].down == down, "event %d (%s): state is %s",
+              idx, what, g_krec[idx].down ? "press" : "release");
+}
+
+static void test_seat_keyboard_matrix(struct xwt_ctx *t) {
+    /* 1. the delivered keymap itself: the standard evdev keycode-space
+     * spot table. If the keymap were compiled in a raw keycode space
+     * (the empty-RMLVO family), wl 22 would decode as 'u' here and
+     * every physical Backspace press would type 'u' in every client. */
+    XWT_ASSERT(XWT_WAIT(t, t->client.xkb_state != NULL));
+    struct {
+        uint32_t wire;
+        xkb_keysym_t expect;
+        const char *what;
+    } spot[] = {
+        {22, XKB_KEY_BackSpace, "wire 22 = BackSpace (raw 14)"},
+        {23, XKB_KEY_Tab, "wire 23 = Tab (raw 15)"},
+        {30, XKB_KEY_u, "wire 30 = u (raw 22)"},
+        {36, XKB_KEY_Return, "wire 36 = Return (raw 28)"},
+        {38, XKB_KEY_a, "wire 38 = a (raw 30)"},
+        {50, XKB_KEY_Shift_L, "wire 50 = Shift_L (raw 42)"},
+        {37, XKB_KEY_Control_L, "wire 37 = Control_L (raw 29)"},
+        {67, XKB_KEY_F1, "wire 67 = F1 (raw 59)"},
+    };
+    for (size_t i = 0; i < sizeof(spot) / sizeof(spot[0]); i++) {
+        xkb_keysym_t got =
+            xkb_state_key_get_one_sym(t->client.xkb_state, spot[i].wire);
+        XWT_CHECK(got == spot[i].expect,
+                  "keymap spot-check %s: got %#x, expected %#x",
+                  spot[i].what, (unsigned)got, (unsigned)spot[i].expect);
+    }
+
+    /* 2. a focused window records every key event */
+    static uint32_t color = 0xff335577;
+    g_nkrec = 0;
+    struct xwc_callbacks cb = {
+        .key = matrix_key_cb,
+        .configure = matrix_win_configure,
+        .ud = &color,
+    };
+    struct xwc_win *win =
+        xwc_win_create(&t->client, &cb, "KeyMatrix", "keymatrix", 300, 200);
+    XWT_ASSERT(win);
+    XWT_WAIT(t, t->comp->wm->focused &&
+                    strcmp(t->comp->wm->focused->title, "KeyMatrix") == 0);
+    XWT_WAIT(t, t->client.has_focus);
+    g_nkrec = 0; /* drop focus-time events; the matrix starts clean */
+
+    /* 3. the report matrix, in the physical-test order */
+    tap(t, K_BKSP);                                /* plain Backspace */
+    tap(t, K_U);                                   /* a normal letter */
+    tap(t, K_A);
+    hold(t, K_LEFTSHIFT, true);                    /* Shift+Backspace */
+    tap(t, K_BKSP);
+    hold(t, K_LEFTSHIFT, false);
+    hold(t, K_LEFTCTRL, true);                     /* Ctrl+Backspace */
+    tap(t, K_BKSP);
+    hold(t, K_LEFTCTRL, false);
+    XWT_WAIT(t, g_nkrec >= 14);
+    /* modifier release symmetry: no stray presses remain */
+    hold(t, K_LEFTALT, true);                      /* Alt press/release */
+    hold(t, K_LEFTALT, false);
+    XWT_WAIT(t, g_nkrec >= 16);
+
+    /* 4. assert the exact stream — keycode, keysym, press/release.
+     * Ordering is asserted too: a stale/replayed/duplicated event
+     * shifts the stream and fails here with the offending index. */
+    check_krec(t, 0, K_BKSP, true, XKB_KEY_BackSpace, "Backspace press");
+    check_krec(t, 1, K_BKSP, false, XKB_KEY_BackSpace, "Backspace release");
+    check_krec(t, 2, K_U, true, XKB_KEY_u, "u press");
+    check_krec(t, 3, K_U, false, XKB_KEY_u, "u release");
+    check_krec(t, 4, K_A, true, XKB_KEY_a, "a press");
+    check_krec(t, 5, K_A, false, XKB_KEY_a, "a release");
+    check_krec(t, 6, K_LEFTSHIFT, true, XKB_KEY_Shift_L, "Shift press");
+    check_krec(t, 7, K_BKSP, true, XKB_KEY_BackSpace, "Shift+Bksp press");
+    check_krec(t, 8, K_BKSP, false, XKB_KEY_BackSpace, "Shift+Bksp release");
+    check_krec(t, 9, K_LEFTSHIFT, false, XKB_KEY_Shift_L, "Shift release");
+    check_krec(t, 10, K_LEFTCTRL, true, XKB_KEY_Control_L, "Ctrl press");
+    check_krec(t, 11, K_BKSP, true, XKB_KEY_BackSpace, "Ctrl+Bksp press");
+    check_krec(t, 12, K_BKSP, false, XKB_KEY_BackSpace, "Ctrl+Bksp release");
+    check_krec(t, 13, K_LEFTCTRL, false, XKB_KEY_Control_L, "Ctrl release");
+    check_krec(t, 14, K_LEFTALT, true, XKB_KEY_Alt_L, "Alt press");
+    check_krec(t, 15, K_LEFTALT, false, XKB_KEY_Alt_L, "Alt release");
+
+    /* modifiers as delivered alongside the key events: the Shift press
+     * must already show in the Shift+Bksp event's mods, and nothing
+     * may remain depressed after the matrix fully unwinds */
+    XWT_CHECK(g_krec[7].mods != 0, "Shift+Bksp carried mods=0 (modifier "
+                                   "state never reached the client)");
+    XWT_CHECK(g_krec[15].mods == 0,
+              "mods leaked after all modifiers released (%u)",
+              g_krec[15].mods);
+
+    /* exactly 16 events: no extras (stale, replayed, or synthesized) */
+    XWT_CHECK(g_nkrec == 16, "client saw %d key events, expected 16 "
+                             "(extras = stale/replayed events)",
+              g_nkrec);
+
+    xwc_win_destroy(win);
+}
+
 static void test_seatd_switch_session(struct xwt_ctx *t) {
     pid_t pid;
     char sock[108];
@@ -694,6 +879,7 @@ __attribute__((constructor)) static void register_seat(void) {
         {"seat-seatd-disable-lifecycle", test_seatd_disable_lifecycle},
         {"seat-seatd-disable-autoack", test_seatd_disable_autoack},
         {"seat-vt-switch-keys", test_seat_vt_switch_keys},
+        {"seat-keyboard-matrix", test_seat_keyboard_matrix},
         {"seat-seatd-switch-session", test_seatd_switch_session},
         {"seat-seatd-server-error", test_seatd_server_error},
         {"seat-seatd-garbage", test_seatd_garbage},

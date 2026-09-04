@@ -494,12 +494,14 @@ void xw_data_device_drag_motion(struct xw_compositor *c, struct xw_seat *seat,
                 if (wl_resource_get_client(d->res) ==
                     wl_resource_get_client(target->res)) {
                     struct xw_data_offer *off = offer_create(d, seat->drag.source);
-                    int tx = 0, ty = 0;
-                    xw_surface_get_pos(target, &tx, &ty, NULL, NULL);
+                    int lx = 0, ly = 0;
+                    /* same canonical translation as wl_pointer: drag
+                     * enter coords must be surface-local (buffer) */
+                    xw_surface_to_local(target, x, y, &lx, &ly);
                     wl_data_device_send_enter(
                         d->res, seat->serial, target->res,
-                        wl_fixed_from_int(x - tx),
-                        wl_fixed_from_int(y - ty), off ? off->res : NULL);
+                        wl_fixed_from_int(lx),
+                        wl_fixed_from_int(ly), off ? off->res : NULL);
                 }
             }
         }

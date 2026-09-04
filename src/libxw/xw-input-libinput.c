@@ -344,6 +344,14 @@ static void handle_libinput_event(struct xw_input_libinput *in,
         note_first_key_event(in);
         xw_log(XW_LOG_DEBUG, "libinput: KEY %u %s", code,
                down ? "down" : "up");
+        /* XW_INPUT_TRACE=1 physical chain, step 1 of 3: what libinput
+         * itself reported (raw linux keycode + device). Steps 2/3 are
+         * the seat's entry/outcome lines. A keycode mismatch between
+         * this line and the seat's "raw=" pinpoints translation damage
+         * in between; equal raw codes with a wrong client keysym pin
+         * the bug to the client or the keymap it compiled. */
+        xw_input_trace("libinput: KEY raw=%u %s", code,
+                       down ? "down" : "up");
         xw_input_handle_key(in, code, down);
         break;
     }

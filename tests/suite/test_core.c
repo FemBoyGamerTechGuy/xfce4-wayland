@@ -1,6 +1,10 @@
 /* test_core.c — lifecycle, windows, rendering, input, shortcuts. */
 #include "xwtest.h"
 
+#include <fcntl.h>
+#include <poll.h>
+#include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 /* ------------------------------------------------------------- lifecycle */
@@ -457,6 +461,397 @@ static void test_all_default_shortcuts(struct xwt_ctx *t) {
     xw_compositor_set_action_hook(t->comp, NULL, NULL);
 }
 
+/* ---------------------------------------------------- fullscreen gap */
+
+/* THE physical fullscreen-gap battery. The NVIDIA box still sees a
+ * one-sided gap after the canonical-geometry round, so every layer of
+ * the chain is pinned here headlessly, for BOTH stacks:
+ *
+ *   A. native xdg fullscreen on a NON-ZERO-ORIGIN output (the layout
+ *      origin must never be assumed to be global (0,0)): the model
+ *      rect must equal the output rect exactly, and the output's four
+ *      corners + edge midpoints must carry window pixels.
+ *   B. the XWayland-role leg, driven through the REAL protocols (the
+ *      xwayland_surface role + window-control v3 set_fullscreen, the
+ *      exact requests the X WM helper sends): the model goes
+ *      fullscreen, the granted rect is mirrored back through the
+ *      geometry event, and a stale client commit cannot shrink it.
+ *   C. CSD geometry (set_window_geometry offset) + fullscreen: the
+ *      render must still cover the granted rect (no gap via the
+ *      buffer/geometry interaction).
+ */
+#include "xwayland-shell.h"
+#include "xw-window-control-v1.h"
+#include "xdg-shell.h"
+
+/* do the output's 4 corners + 4 edge midpoints carry window pixels? */
+static bool fs_pixels_cover(const uint32_t *pix, int pw, int ph,
+                            uint32_t color) {
+    color &= 0xffffff;
+    int px[8] = {2, pw - 3, 2, pw - 3, pw / 2, pw / 2, 2, pw - 3};
+    int py[8] = {2, 2, ph - 3, ph - 3, 2, ph - 3, ph / 2, ph / 2};
+    for (int i = 0; i < 8; i++)
+        if ((pix[py[i] * pw + px[i]] & 0xffffff) != color)
+            return false;
+    return true;
+}
+
+static bool fs_wait_cover(struct xwt_ctx *t, int out_index, uint32_t color) {
+    for (int i = 0; i < 400; i++) {
+        xwt_pump(t);
+        usleep(5 * 1000);
+        int pw = 0, ph = 0;
+        const uint32_t *pix =
+            xw_compositor_output_pixels(t->comp, out_index, &pw, &ph);
+        if (pix && pw > 4 && ph > 4 && fs_pixels_cover(pix, pw, ph, color))
+            return true;
+    }
+    return false;
+}
+
+/* -- the raw xwayland-role client (leg B) -- */
+struct xr {
+    struct wl_display *d;
+    struct wl_registry *reg;
+    struct wl_compositor *comp;
+    struct wl_shm *shm;
+    struct xwayland_shell_v1 *shell;
+    struct xw_window_control_manager_v1 *wcm;
+    struct wl_surface *surf;
+    struct xwayland_surface_v1 *xs;
+    struct wl_buffer *buf;
+    int n_geom;
+    uint32_t gs_hi, gs_lo;
+    int gx, gy, gw, gh;
+};
+
+static void xr_geom(void *data, struct xw_window_control_manager_v1 *m,
+                    uint32_t hi, uint32_t lo, int32_t x, int32_t y,
+                    int32_t width, int32_t height) {
+    (void)m;
+    struct xr *r = data;
+    r->n_geom++;
+    r->gs_hi = hi;
+    r->gs_lo = lo;
+    r->gx = x;
+    r->gy = y;
+    r->gw = width;
+    r->gh = height;
+}
+static void xr_close(void *data, struct xw_window_control_manager_v1 *m,
+                     uint32_t hi, uint32_t lo) {
+    (void)data;
+    (void)m;
+    (void)hi;
+    (void)lo;
+}
+static void xr_focus(void *data, struct xw_window_control_manager_v1 *m,
+                     uint32_t hi, uint32_t lo) {
+    (void)data;
+    (void)m;
+    (void)hi;
+    (void)lo;
+}
+static const struct xw_window_control_manager_v1_listener xr_wcm = {
+    .geometry = xr_geom,
+    .close = xr_close,
+    .focus = xr_focus,
+};
+
+static void xr_global(void *data, struct wl_registry *r, uint32_t name,
+                      const char *iface, uint32_t version) {
+    struct xr *x = data;
+    if (strcmp(iface, "wl_compositor") == 0)
+        x->comp = wl_registry_bind(r, name, &wl_compositor_interface, 4);
+    else if (strcmp(iface, "wl_shm") == 0)
+        x->shm = wl_registry_bind(r, name, &wl_shm_interface, 1);
+    else if (strcmp(iface, "xwayland_shell_v1") == 0)
+        x->shell = wl_registry_bind(r, name, &xwayland_shell_v1_interface, 1);
+    else if (strcmp(iface, "xw_window_control_manager_v1") == 0) {
+        if (version > 3)
+            version = 3;
+        x->wcm = wl_registry_bind(r, name,
+                                  &xw_window_control_manager_v1_interface,
+                                  version);
+        xw_window_control_manager_v1_add_listener(x->wcm, &xr_wcm, x);
+    }
+}
+static const struct wl_registry_listener xr_reg = {
+    .global = xr_global,
+    .global_remove = NULL,
+};
+
+static void xr_pump(struct xr *x, struct xwt_ctx *t);
+
+static bool xr_connect(struct xr *x, struct xwt_ctx *t) {
+    memset(x, 0, sizeof(*x));
+    x->d = wl_display_connect(t->socket_name);
+    if (!x->d)
+        return false;
+    x->reg = wl_display_get_registry(x->d);
+    wl_registry_add_listener(x->reg, &xr_reg, x);
+    wl_display_flush(x->d);
+    /* NEVER a blocking roundtrip: the server is in-process and only
+     * runs inside our pump */
+    bool bound = false;
+    for (int i = 0; i < 500 && !bound; i++) {
+        xr_pump(x, t);
+        bound = x->comp && x->shm && x->shell && x->wcm;
+    }
+    return bound;
+}
+
+/* non-blocking client pump, server-first (wl_display_dispatch would
+ * BLOCK the test whenever the server has nothing to say, and the
+ * in-process server only runs when WE run it) */
+static void xr_pump(struct xr *x, struct xwt_ctx *t) {
+    xw_compositor_dispatch(t->comp, 0);
+    wl_display_flush(x->d);
+    while (wl_display_prepare_read(x->d) != 0) {
+        if (wl_display_dispatch_pending(x->d) < 0)
+            return;
+    }
+    struct pollfd pfd = {.fd = wl_display_get_fd(x->d), .events = POLLIN};
+    poll(&pfd, 1, 0);
+    if (pfd.revents & POLLIN) {
+        if (wl_display_read_events(x->d) < 0)
+            return;
+    } else {
+        wl_display_cancel_read(x->d);
+    }
+    if (wl_display_dispatch_pending(x->d) < 0)
+        return;
+    xw_compositor_dispatch(t->comp, 0);
+}
+
+static bool xr_map(struct xr *x, int w, int h, uint32_t color,
+                   uint32_t serial_hi, uint32_t serial_lo) {
+    x->surf = wl_compositor_create_surface(x->comp);
+    x->xs = xwayland_shell_v1_get_xwayland_surface(x->shell, x->surf);
+    xwayland_surface_v1_set_serial(x->xs, serial_lo, serial_hi);
+    int fd = memfd_create("xr-buf", 0);
+    if (fd < 0)
+        return false;
+    size_t len = (size_t)w * h * 4;
+    if (ftruncate(fd, (off_t)len) < 0) {
+        close(fd);
+        return false;
+    }
+    uint32_t *pix = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (pix == MAP_FAILED) {
+        close(fd);
+        return false;
+    }
+    for (int i = 0; i < w * h; i++)
+        pix[i] = color;
+    munmap(pix, len);
+    struct wl_shm_pool *pool = wl_shm_create_pool(x->shm, fd, (int32_t)len);
+    x->buf = wl_shm_pool_create_buffer(pool, 0, w, h, w * 4,
+                                       WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+    wl_surface_attach(x->surf, x->buf, 0, 0);
+    wl_surface_damage(x->surf, 0, 0, w, h);
+    wl_surface_commit(x->surf);
+    wl_display_flush(x->d);
+    return true;
+}
+
+static void xr_destroy(struct xr *x) {
+    /* full teardown, child-most first: every proxy destroyed so
+     * LeakSanitizer sees a clean connection (rc_destroy's contract) */
+    if (x->buf)
+        wl_buffer_destroy(x->buf);
+    if (x->xs)
+        xwayland_surface_v1_destroy(x->xs);
+    if (x->surf)
+        wl_surface_destroy(x->surf);
+    if (x->wcm)
+        xw_window_control_manager_v1_destroy(x->wcm);
+    if (x->shell)
+        xwayland_shell_v1_destroy(x->shell);
+    if (x->shm)
+        wl_shm_destroy(x->shm);
+    if (x->comp)
+        wl_compositor_destroy(x->comp);
+    if (x->reg)
+        wl_registry_destroy(x->reg);
+    if (x->d)
+        wl_display_disconnect(x->d);
+    memset(x, 0, sizeof(*x));
+}
+
+static void test_geometry_fullscreen(struct xwt_ctx *t) {
+    const uint32_t colorA = 0xff2d8f4e;
+    const uint32_t colorB = 0xff8f2d4e;
+    const int OX = 1000, OY = 200, OW = 640, OH = 480; /* output 2 */
+
+    /* ---- A: native xdg fullscreen on a non-zero-origin output ---- */
+    struct xw_output *o2 =
+        xw_output_create(t->comp, "XW-T2", OX, OY, OW, OH, 1);
+    XWT_ASSERT(o2);
+    struct xwc_win *winA =
+        xwt_window_solid(t, colorA, 300, 200, "FsNonZero");
+    XWT_ASSERT(winA);
+    XWT_WAIT(t, xw_compositor_window_count(t->comp) == 1);
+    struct xw_window *wA =
+        wl_container_of(t->comp->wm->windows.next, wA, link);
+    XWT_WAIT(t, wA->mapped);
+    /* move the window into output 2's area and re-associate */
+    t->comp->wm->focused = wA; /* keep it interactable after the move */
+    xw_wm_damage_window(t->comp->wm, wA);
+    wA->x = OX + 100;
+    wA->y = OY + 100;
+    xw_wm_update_window_output(t->comp->wm, wA);
+    xw_wm_damage_window(t->comp->wm, wA);
+    XWT_CHECK(wA->output == o2, "window associated with output 2");
+
+    xw_wm_fullscreen(t->comp->wm, wA, true);
+    for (int i = 0; i < 200 && !(wA->w == OW && wA->h == OH); i++)
+        xwt_pump(t);
+    XWT_CHECK(wA->x == OX && wA->y == OY && wA->w == OW && wA->h == OH,
+              "fullscreen model == output 2 rect (non-zero origin): "
+              "%d,%d %dx%d vs %d,%d %dx%d",
+              wA->x, wA->y, wA->w, wA->h, OX, OY, OW, OH);
+    XWT_CHECK(wA->output == o2, "fullscreen window stays on output 2");
+    /* the output-2 pixels: 4 corners + 4 edge midpoints, no gap. The
+     * composited frame of output 2 (index 1 in the outputs list). */
+    XWT_CHECK(fs_wait_cover(t, 1, colorA),
+              "fullscreen fills output 2 edge-to-edge (corners+edges, "
+              "non-zero origin)");
+    /* zero-width gap check on every side: the row/column just outside
+     * the output edge must NOT show window pixels leaking, and every
+     * pixel ON each edge must be window color (checked via the
+     * corner/edge probes above). Restore: */
+    xw_wm_fullscreen(t->comp->wm, wA, false);
+    for (int i = 0; i < 100; i++)
+        xwt_pump(t);
+    XWT_CHECK(wA->w == 300 && wA->h == 200,
+              "unfullscreen restores the size (%dx%d)", wA->w, wA->h);
+    xwc_win_destroy(winA);
+    xw_output_destroy(o2);
+    for (int i = 0; i < 20; i++)
+        xwt_pump(t);
+
+    /* ---- B: the XWayland role, real protocols, EWMH-style ---- */
+    struct xr r;
+    XWT_ASSERT(xr_connect(&r, t));
+    const uint32_t S_HI = 0x11223344, S_LO = 0x55667788;
+    XWT_ASSERT(xr_map(&r, 240, 160, colorB, S_HI, S_LO));
+    struct xw_window *wB = NULL;
+    for (int i = 0; i < 300 && !wB; i++) {
+        xwt_pump(t);
+        xr_pump(&r, t);
+        wl_list_for_each(wB, &t->comp->wm->windows, link) {
+            if (wB->surface && wB->surface->role == XW_SURFACE_ROLE_XWAYLAND)
+                break;
+            wB = NULL;
+        }
+    }
+    XWT_ASSERT(wB);
+    XWT_CHECK(wB->xw_has_serial && wB->xw_serial ==
+              (((uint64_t)S_HI << 32) | S_LO),
+              "serial associated");
+    int restore_w = wB->w, restore_h = wB->h;
+
+    /* the EWMH fullscreen request, exactly as the helper sends it */
+    int geom_before = r.n_geom;
+    xw_window_control_manager_v1_set_fullscreen(r.wcm, S_HI, S_LO, 1);
+    wl_display_flush(r.d);
+    bool fs = false;
+    for (int i = 0; i < 300 && !fs; i++) {
+        xwt_pump(t);
+        xr_pump(&r, t);
+        struct xw_output *ob = wB->output;
+        fs = ob && wB->fullscreen && wB->x == ob->x && wB->y == ob->y &&
+             wB->w == ob->width && wB->h == ob->height;
+    }
+    XWT_CHECK(fs, "X-role fullscreen model == its output rect "
+                  "(%d,%d %dx%d)", wB->x, wB->y, wB->w, wB->h);
+    /* the grant mirrors back through the geometry event (the X side
+     * learns the fullscreen rect this way) */
+    XWT_CHECK(r.n_geom > geom_before && r.gw == wB->w && r.gh == wB->h &&
+              r.gx == wB->x && r.gy == wB->y,
+              "geometry event mirrors the fullscreen grant "
+              "(%d,%d %dx%d)", r.gx, r.gy, r.gw, r.gh);
+    /* park the software cursor at the window center so its 12x17
+     * sprite cannot cover a corner/edge probe (the default cursor
+     * position is (0,0) — exactly the top-left probe) */
+    xw_compositor_inject_pointer_motion(
+        t->comp, wB->x + wB->w / 2, wB->y + wB->h / 2);
+    for (int i = 0; i < 20; i++)
+        xwt_pump(t);
+    XWT_CHECK(fs_wait_cover(t, 0, colorB),
+              "X-role fullscreen fills output 0 edge-to-edge");
+
+    /* stale commit: the client re-commits its old 240x160 buffer —
+     * the granted fullscreen rect must NOT be clobbered */
+    wl_surface_attach(r.surf, r.buf, 0, 0);
+    wl_surface_damage(r.surf, 0, 0, 240, 160);
+    wl_surface_commit(r.surf);
+    wl_display_flush(r.d);
+    for (int i = 0; i < 100; i++) {
+        xwt_pump(t);
+        xr_pump(&r, t);
+    }
+    XWT_CHECK(wB->fullscreen && wB->w == wB->output->width &&
+              wB->h == wB->output->height,
+              "stale commit does not shrink the fullscreen rect "
+              "(%dx%d)", wB->w, wB->h);
+
+    /* leave fullscreen: restores, mirrors back */
+    xw_window_control_manager_v1_set_fullscreen(r.wcm, S_HI, S_LO, 0);
+    wl_display_flush(r.d);
+    bool restored = false;
+    for (int i = 0; i < 300 && !restored; i++) {
+        xwt_pump(t);
+        xr_pump(&r, t);
+        restored = !wB->fullscreen && wB->w == restore_w &&
+                   wB->h == restore_h;
+    }
+    XWT_CHECK(restored, "leave-fullscreen restores %dx%d (got %dx%d)",
+              restore_w, restore_h, wB->w, wB->h);
+    xr_destroy(&r);
+
+    /* ---- C: CSD geometry + fullscreen (render must still cover) ---- */
+    const uint32_t colorC = 0xff3355aa;
+    struct xwc_win *winC =
+        xwt_window_solid(t, colorC, 400, 300, "FsCsd");
+    XWT_ASSERT(winC);
+    XWT_WAIT(t, xw_compositor_window_count(t->comp) == 1);
+    struct xw_window *wC =
+        wl_container_of(t->comp->wm->windows.next, wC, link);
+    XWT_WAIT(t, wC->mapped);
+    struct xdg_surface *xsc = xwc_win_xdg_surface(winC);
+    XWT_ASSERT(xsc);
+    xdg_surface_set_window_geometry(xsc, 10, 14, 380, 280);
+    for (int i = 0; i < 40; i++)
+        xwt_pump(t);
+    xw_wm_fullscreen(t->comp->wm, wC, true);
+    struct xw_output *o0 = wC->output;
+    for (int i = 0; i < 200 && !(wC->w == o0->width && wC->h == o0->height);
+         i++)
+        xwt_pump(t);
+    /* re-commit with the CSD buffer (the geometry declaration rides
+     * along): the state-held rect wins */
+    xwc_win_commit(winC);
+    for (int i = 0; i < 40; i++)
+        xwt_pump(t);
+    XWT_CHECK(wC->w == o0->width && wC->h == o0->height,
+              "CSD fullscreen keeps the granted rect (%dx%d)", wC->w,
+              wC->h);
+    xw_compositor_inject_pointer_motion(
+        t->comp, wC->x + wC->w / 2, wC->y + wC->h / 2);
+    for (int i = 0; i < 20; i++)
+        xwt_pump(t);
+    XWT_CHECK(fs_wait_cover(t, 0, colorC),
+              "CSD fullscreen fills the output edge-to-edge");
+    xw_wm_fullscreen(t->comp->wm, wC, false);
+    for (int i = 0; i < 100; i++)
+        xwt_pump(t);
+    xwc_win_destroy(winC);
+}
+
 /* ------------------------------------------------------------ registration */
 
 static const struct xwt_test tests[] = {
@@ -465,6 +860,7 @@ static const struct xwt_test tests[] = {
     {"window-map", test_window_map},
     {"render-pixels", test_render_pixels},
     {"geometry-native", test_geometry_native},
+    {"geometry-fullscreen", test_geometry_fullscreen},
     {"workspace-switch", test_workspace_switch},
     {"shortcut-close", test_shortcut_table},
     {"shortcut-suppression", test_shortcut_release_suppression},

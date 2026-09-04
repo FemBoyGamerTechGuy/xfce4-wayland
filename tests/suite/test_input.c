@@ -110,6 +110,7 @@ struct rawc {
                             * clears the content server-side) */
     bool pop_configured, pop_done;
     int pop_done_count; /* popup_done is once-per-lifetime (xdg-shell) */
+    int pop_cfg_x, pop_cfg_y; /* configure position (parent-buffer-relative) */
 };
 
 static void rc_die(struct rawc *rc) {
@@ -252,12 +253,14 @@ static const struct xdg_surface_listener rc_xs_listener = {
 static void rc_popup_configure(void *data, struct xdg_popup *pop, int32_t x,
                                int32_t y, int32_t w, int32_t h) {
     (void)pop;
-    (void)x;
-    (void)y;
     (void)w;
     (void)h;
     struct rawc *rc = data;
     rc->pop_configured = true;
+    rc->pop_cfg_x = x; /* popup position relative to the parent
+                        * SURFACE (buffer) origin — the client composes
+                        * its menu exactly here */
+    rc->pop_cfg_y = y;
 }
 static void rc_popup_done(void *data, struct xdg_popup *pop) {
     (void)pop;
@@ -1644,6 +1647,159 @@ static void test_input_toplevel_null_unmap(struct xwt_ctx *t) {
     rc_destroy(&rc);
 }
 
+/* ================================================== CSD pointer geometry */
+
+/* THE move/resize hit-offset physical bug, headlessly: a CSD client
+ * with set_window_geometry (shadow margins / header offset) must
+ * receive pointer coordinates relative to the BUFFER (wl_surface)
+ * origin — that is the space its widgets, header bar and resize
+ * margins live in. Delivering window-geometry-rect-relative coords
+ * instead shifts every client-side hit zone up-left by (geo_x, geo_y):
+ * the user hovers the visible title bar and the client believes the
+ * pointer is in its shadow/resize margin (resize cursor!), and a
+ * window MOVE only triggers once the pointer is pushed (geo_y) pixels
+ * deeper into the app. Render and hit-test already honor the offset;
+ * the event stream must match them. */
+static void test_input_csd_pointer_geometry(struct xwt_ctx *t) {
+    const int GX = 10, GY = 14; /* the client's shadow offset */
+    struct rawc rc;
+    XWT_ASSERT(rc_connect(&rc, t));
+    XWT_ASSERT(rc_map_window(t, &rc, 200, 150));
+    struct xw_window *w = find_by_title(t, "rawc");
+    XWT_ASSERT(w);
+    int bx = w->x, by = w->y; /* the content rect origin after CSD */
+
+    /* declare the content rect: offset (GX,GY) inside the 200x150
+     * buffer, size 190x136 */
+    xdg_surface_set_window_geometry(rc.xs, GX, GY, 190, 136);
+    RC_WAIT(t, &rc, w->geometry_set, 1000);
+    RC_ALIVE(&rc);
+    XWT_CHECK(w->geometry_set && w->geo_x == GX && w->geo_y == GY,
+              "geometry offset stored (%d,%d)", w->geo_x, w->geo_y);
+    XWT_CHECK(w->w == 190 && w->h == 136, "window sized to the geometry "
+              "(got %dx%d)", w->w, w->h);
+
+    /* enter from outside: pointer at content (20,15) is buffer (30,29) */
+    xw_compositor_inject_pointer_motion(t->comp, 5, 5); /* outside */
+    for (int i = 0; i < 5; i++)
+        xwt_pump(t);
+    xw_compositor_inject_pointer_motion(t->comp, bx + 20, by + 15);
+    RC_WAIT(t, &rc, rc_count(&rc, 'e') >= 1, 1000);
+    RC_ALIVE(&rc);
+    struct pev *e = rc_last(&rc, 'e');
+    XWT_CHECK(e && e->on_self, "enter delivered on the CSD window");
+    XWT_CHECK(e && e->sx == 20 + GX && e->sy == 15 + GY,
+              "enter surface-local coords %d,%d — must be BUFFER-relative "
+              "(%d,%d), not geometry-rect-relative (%d,%d)",
+              e ? e->sx : -99, e ? e->sy : -99, 20 + GX, 15 + GY, 20, 15);
+
+    /* motion across the content rect: every event stays buffer-relative */
+    int n_motions = rc_count(&rc, 'm');
+    xw_compositor_inject_pointer_motion(t->comp, bx + 60, by + 40);
+    RC_WAIT(t, &rc, rc_count(&rc, 'm') > n_motions, 1000);
+    RC_ALIVE(&rc);
+    struct pev *m = rc_last(&rc, 'm');
+    XWT_CHECK(m && m->sx == 60 + GX && m->sy == 40 + GY,
+              "motion surface-local coords %d,%d — must be (%d,%d)",
+              m ? m->sx : -99, m ? m->sy : -99, 60 + GX, 40 + GY);
+
+    /* leave + re-enter at the other corner keeps the same convention */
+    xw_compositor_inject_pointer_motion(t->comp, 5, 5);
+    RC_WAIT(t, &rc, rc_count(&rc, 'l') >= 1, 1000);
+    int enters = rc_count(&rc, 'e');
+    xw_compositor_inject_pointer_motion(t->comp, bx + 189, by + 135);
+    RC_WAIT(t, &rc, rc_count(&rc, 'e') > enters, 1000);
+    RC_ALIVE(&rc);
+    e = rc_last(&rc, 'e');
+    XWT_CHECK(e && e->sx == 189 + GX && e->sy == 135 + GY,
+              "re-enter surface-local coords %d,%d — must be (%d,%d)",
+              e ? e->sx : -99, e ? e->sy : -99, 189 + GX, 135 + GY);
+
+    rc_destroy(&rc);
+}
+
+/* ================================================= CSD popup anchoring */
+
+/* The other half of the CSD space family: xdg_popup anchors are
+ * specified in PARENT-SURFACE (buffer) coordinates. With a CSD parent
+ * (set_window_geometry offset) the parent buffer origin sits geo_*
+ * left/above the window-rect origin — anchoring via the window-rect
+ * origin shifts every menu/popover by exactly the shadow margin
+ * (menus open (geo_x, geo_y) off from the button that opened them).
+ * The configure reply must use the same space. */
+static void test_input_csd_popup_anchor(struct xwt_ctx *t) {
+    const int GX = 10, GY = 14;
+    struct rawc rc;
+    XWT_ASSERT(rc_connect(&rc, t));
+    XWT_ASSERT(rc_map_window(t, &rc, 200, 150));
+    struct xw_window *w = find_by_title(t, "rawc");
+    XWT_ASSERT(w);
+    xdg_surface_set_window_geometry(rc.xs, GX, GY, 190, 136);
+    RC_WAIT(t, &rc, w->geometry_set, 1000);
+    RC_ALIVE(&rc);
+
+    /* a menu anchored at parent-buffer (40,50), extending down-right */
+    rc.pop_surf = wl_compositor_create_surface(rc.compositor);
+    rc.pop_xs = xdg_wm_base_get_xdg_surface(rc.wm_base, rc.pop_surf);
+    xdg_surface_add_listener(rc.pop_xs, &rc_xs_listener, &rc);
+    struct xdg_positioner *pos =
+        xdg_wm_base_create_positioner(rc.wm_base);
+    xdg_positioner_set_size(pos, 60, 40);
+    xdg_positioner_set_anchor_rect(pos, 40, 50, 20, 20);
+    xdg_positioner_set_anchor(pos, XDG_POSITIONER_ANCHOR_TOP_LEFT);
+    xdg_positioner_set_gravity(pos, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+    rc.pop = xdg_surface_get_popup(rc.pop_xs, rc.xs, pos);
+    xdg_positioner_destroy(pos);
+    xdg_popup_add_listener(rc.pop, &rc_pop_listener, &rc);
+    wl_surface_commit(rc.pop_surf);
+    RC_WAIT(t, &rc, rc.pop_configured, 2000);
+    RC_ALIVE(&rc);
+    if (!rc_buf_create(&rc, &rc.pop_buf, 60, 40)) {
+        XWT_CHECK(false, "popup buffer alloc failed");
+        return;
+    }
+    wl_surface_attach(rc.pop_surf, rc.pop_buf.buf, 0, 0);
+    wl_surface_damage(rc.pop_surf, 0, 0, 60, 40);
+    wl_surface_commit(rc.pop_surf);
+    RC_WAIT(t, &rc, rc_count(&rc, 'e') >= 0, 500); /* settle */
+
+    /* the server-side placement is the authoritative check: the popup
+     * must land at parent BUFFER origin + anchor point. The configure
+     * x/y alone cannot catch this bug (it subtracts the same origin
+     * both sides) — the rendered/hit-tested position is what shifts. */
+    uint32_t pop_id =
+        wl_proxy_get_id((struct wl_proxy *)rc.pop_surf);
+    struct xw_popup *p = NULL, *it;
+    wl_list_for_each(it, &t->comp->popups, link) {
+        if (it->surface &&
+            wl_resource_get_id(it->surface->res) == pop_id) {
+            p = it;
+            break;
+        }
+    }
+    XWT_CHECK(p != NULL, "popup found in the compositor's list");
+    if (p) {
+        int want_x = w->x - GX + 40, want_y = w->y - GY + 50;
+        XWT_CHECK(p->anchor_x == want_x && p->anchor_y == want_y,
+                  "popup placed at (%d,%d) — must be parent buffer "
+                  "origin + anchor (%d,%d): anchoring off the window-rect "
+                  "origin shifts every menu by the shadow margin (%d,%d)",
+                  p->anchor_x, p->anchor_y, want_x, want_y, GX, GY);
+    }
+
+    /* the client-visible truth: configure x,y must be (40,50) —
+     * relative to the parent BUFFER origin, exactly the anchor the
+     * client asked for */
+    XWT_CHECK(rc.pop_cfg_x == 40 && rc.pop_cfg_y == 50,
+              "popup configure position (%d,%d) — must be the "
+              "parent-buffer-relative anchor (40,50), not the "
+              "window-rect-relative (%d,%d)",
+              rc.pop_cfg_x, rc.pop_cfg_y, 40 - GX, 50 - GY);
+
+    rc_close_menu(&rc);
+    rc_destroy(&rc);
+}
+
 static const struct xwt_test tests[] = {
     {"input-toplevel-null-unmap", test_input_toplevel_null_unmap},
     {"input-popup-done-once", test_input_popup_done_once},
@@ -1653,6 +1809,8 @@ static const struct xwt_test tests[] = {
     {"input-right-click-menu", test_input_right_click_menu},
     {"input-popup-destroy-grab", test_input_popup_destroy_grab},
     {"input-taskbar-activate", test_input_taskbar_activate},
+    {"input-csd-pointer-geometry", test_input_csd_pointer_geometry},
+    {"input-csd-popup-anchor", test_input_csd_popup_anchor},
     {"input-real-gtk-clicks", test_input_real_gtk_clicks},
 };
 

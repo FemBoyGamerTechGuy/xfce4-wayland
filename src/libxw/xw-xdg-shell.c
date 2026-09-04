@@ -542,11 +542,14 @@ static void compute_popup_position(struct xw_compositor *c,
 static void popup_send_configure(struct xw_popup *p) {
     if (!p->res)
         return;
-    int parent_x = 0, parent_y = 0;
+    int bx = 0, by = 0;
     if (p->parent)
-        xw_surface_get_pos(p->parent, &parent_x, &parent_y, NULL, NULL);
-    xdg_popup_send_configure(p->res, p->anchor_x - parent_x,
-                             p->anchor_y - parent_y, p->w, p->h);
+        xw_surface_buffer_pos(p->parent, &bx, &by);
+    /* the configure x/y is relative to the parent SURFACE (buffer)
+     * origin — the same space the client anchored in, so the menu it
+     * composes lands exactly under its anchor */
+    xdg_popup_send_configure(p->res, p->anchor_x - bx,
+                             p->anchor_y - by, p->w, p->h);
     uint32_t serial = wl_display_next_serial(p->comp->display);
     xdg_surface_send_configure(p->xdg_surface_res, serial);
     if (p->surface) {
@@ -560,13 +563,17 @@ static void popup_send_configure(struct xw_popup *p) {
 static void popup_place(struct xw_popup *p) {
     struct xw_positioner *pos = p->pos;
     if (p->parent) {
-        int px, py;
-        xw_surface_get_pos(p->parent, &px, &py, NULL, NULL);
+        int bx, by;
+        /* the anchor rect is in parent-SURFACE (buffer) coordinates:
+         * the buffer origin, not the window-rect origin, is the base.
+         * (Anchoring off the window-rect origin shifted every
+         * CSD-parented menu by the shadow margin.) */
+        xw_surface_buffer_pos(p->parent, &bx, &by);
         int apx, apy;
         /* anchor point is in parent-surface coordinates (rect origin
          * included) — do not add the rect origin twice */
         positioner_anchor_point(pos, &apx, &apy);
-        compute_popup_position(p->comp, pos, px + apx, py + apy, p->w, p->h,
+        compute_popup_position(p->comp, pos, bx + apx, by + apy, p->w, p->h,
                                &p->anchor_x, &p->anchor_y);
     } else {
         struct xw_seat *seat = xw_seat_first(p->comp);

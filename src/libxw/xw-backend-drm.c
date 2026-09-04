@@ -30,6 +30,7 @@
 #include "xw-internal.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -792,6 +793,21 @@ static int add_output(struct drm_backend *db, drmModeConnectorPtr conn,
     wl_list_insert(db->outputs.prev, &op->link);
     xw_log(XW_LOG_INFO, "drm: output %s: %dx%d@%u (crtc %u)", op->name, w, h,
            op->mode.vrefresh, crtc_id);
+    /* XW_GEOMETRY_TRACE step 1 of the physical fullscreen chain: what
+     * the scanout hardware was actually programmed with. A fullscreen
+     * window covers (o->x, o->y, o->width, o->height) in the layout;
+     * this line is what that maps to physically: mode, CRTC origin,
+     * FB size, layout origin, logical size, scale. A one-sided
+     * physical gap with a correct model rect points HERE (mode !=
+     * logical, CRTC offset, or a scaled native mismatch). */
+    if (getenv("XW_GEOMETRY_TRACE")) {
+        fprintf(stderr,
+                "[geom] drm output %s: mode %dx%d@%u crtc=%u@0,0 "
+                "fb=%ux%u pitch=%u layout=%d,%d logical=%dx%d scale=%d\n",
+                op->name, w, h, op->mode.vrefresh, crtc_id, w, h,
+                (int)op->bos[0].pitch, op->out->x, op->out->y,
+                op->out->width, op->out->height, op->out->scale);
+    }
     return w;
 }
 

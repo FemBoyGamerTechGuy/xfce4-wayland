@@ -132,6 +132,13 @@ void xw_surface_get_pos(struct xw_surface *s, int *x, int *y, int *w, int *h);
 pixman_image_t *xw_surface_get_image(struct xw_surface *s);
 /* true if point (global coords) is inside the surface input region */
 bool xw_surface_has_input_at(struct xw_surface *s, int x, int y);
+/* canonical global -> surface-local (BUFFER-relative, geometry offset
+ * included) — the ONE translation for hit-test AND event delivery */
+void xw_surface_to_local(struct xw_surface *s, int gx, int gy, int *lx,
+                         int *ly);
+/* the wl_surface (buffer) origin in global coords (to_local's inverse;
+ *    popup anchoring) */
+void xw_surface_buffer_pos(struct xw_surface *s, int *x, int *y);
 /* role dispatch (implemented by the respective shell files) */
 void xw_role_commit(struct xw_surface *s);
 void xw_role_destroy(struct xw_surface *s);

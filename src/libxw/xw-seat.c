@@ -31,6 +31,8 @@
 
 /* --------------------------------------------------------- wl_keyboard */
 
+static const char *client_desc(struct wl_client *cl, char *buf, size_t n);
+
 static void keyboard_release(struct wl_client *client, struct wl_resource *res);
 
 static const struct wl_keyboard_interface keyboard_impl = {
@@ -198,11 +200,12 @@ static void seat_get_pointer(struct wl_client *client, struct wl_resource *res,
      * received motion but never enter (clients gate on enter). */
     if (s->ptr_focus &&
         wl_resource_get_client(s->ptr_focus->res) == client) {
-        int sx = 0, sy = 0;
-        xw_surface_get_pos(s->ptr_focus, &sx, &sy, NULL, NULL);
+        int lx = 0, ly = 0;
+        xw_surface_to_local(s->ptr_focus, s->cursor_x, s->cursor_y, &lx,
+                            &ly);
         wl_pointer_send_enter(p, ++s->serial, s->ptr_focus->res,
-                              wl_fixed_from_int(s->cursor_x - sx),
-                              wl_fixed_from_int(s->cursor_y - sy));
+                              wl_fixed_from_int(lx),
+                              wl_fixed_from_int(ly));
         wl_pointer_send_frame(p);
         char dbuf[64];
         xw_log(XW_LOG_DEBUG,
@@ -234,6 +237,13 @@ static void seat_get_keyboard(struct wl_client *client, struct wl_resource *res,
         }
         wl_keyboard_send_keymap(k, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd,
                                 (uint32_t)s->keymap_len);
+    }
+    {
+        char cbuf[32];
+        xw_input_trace("kb-bind: %s version=%u keymap=%zuB format=xkb-v1 "
+                       "repeat=%dHz/%dms",
+                       client_desc(client, cbuf, sizeof(cbuf)), v,
+                       s->keymap_len, s->repeat_rate_hz, s->repeat_delay_ms);
     }
     /* repeat rate/delay (wayland: the CLIENT repeats, the server only
      * advertises the parameters — v4+) */
@@ -481,6 +491,22 @@ static struct xw_surface *surface_at(struct xw_seat *s, int x, int y) {
         wl_list_for_each(ptr, &(s)->pointers, link)                          \
             if (wl_resource_get_client(ptr) == _cl)
 
+/* short identity string for a wl_client: its pid (from the socket
+ * credentials). The physical keyboard matrix needs "WHICH process
+ * received this key" — the compositor cannot know process names, but
+ * the pid maps 1:1 on the running system (Xwayland, kitty, the
+ * panel...). Same convention as surface_desc. */
+static const char *client_desc(struct wl_client *cl, char *buf, size_t n) {
+    if (!cl)
+        return "(none)";
+    pid_t pid = 0;
+    uid_t uid = 0;
+    gid_t gid = 0;
+    wl_client_get_credentials(cl, &pid, &uid, &gid);
+    snprintf(buf, n, "pid=%d", (int)pid);
+    return buf;
+}
+
 static void send_modifiers(struct xw_seat *s) {
     xkb_mod_mask_t dep = xkb_state_serialize_mods(s->xkb_state,
                                                   XKB_STATE_MODS_DEPRESSED);
@@ -500,10 +526,18 @@ static void send_modifiers(struct xw_seat *s) {
     if (!s->kb_focus || wl_list_empty(&s->keyboards))
         return;
     struct wl_client *cl = wl_resource_get_client(s->kb_focus->res);
+    char cbuf[32], fbuf[64];
     struct wl_resource *k;
     wl_list_for_each(k, &s->keyboards, link) {
-        if (wl_resource_get_client(k) == cl)
+        if (wl_resource_get_client(k) == cl) {
             wl_keyboard_send_modifiers(k, ++s->serial, dep, lat, loc, grp);
+            xw_input_trace(
+                "mods: dep=%u lat=%u lock=%u grp=%u serial=%u -> %s "
+                "(focus=%s)",
+                dep, lat, loc, grp, s->serial,
+                client_desc(cl, cbuf, sizeof(cbuf)),
+                surface_desc(s->kb_focus, fbuf, sizeof(fbuf)));
+        }
     }
 }
 
@@ -537,6 +571,12 @@ void xw_seat_set_kb_focus(struct xw_seat *s, struct xw_surface *surface) {
         s->kb_focus ? wl_resource_get_client(s->kb_focus->res) : NULL;
     struct wl_client *newc =
         surface ? wl_resource_get_client(surface->res) : NULL;
+    char dbuf[64], nbuf[64], cobuf[32], cnbuf[32];
+    xw_input_trace("kb-focus: %s -> %s (%s -> %s)",
+                   surface_desc(s->kb_focus, dbuf, sizeof(dbuf)),
+                   surface_desc(surface, nbuf, sizeof(nbuf)),
+                   client_desc(old, cobuf, sizeof(cobuf)),
+                   client_desc(newc, cnbuf, sizeof(cnbuf)));
 
     if (old && old != newc) {
         struct wl_resource *k;
@@ -610,11 +650,17 @@ static void set_ptr_focus(struct xw_seat *s, struct xw_surface *surface) {
         struct wl_resource *p;
         wl_list_for_each(p, &s->pointers, link) {
             if (wl_resource_get_client(p) == newc) {
-                int sx = 0, sy = 0;
-                xw_surface_get_pos(surface, &sx, &sy, NULL, NULL);
+                int lx = 0, ly = 0;
+                /* BUFFER-relative local coords (the client's widget
+                 * space): xw_surface_to_local adds the CSD geometry
+                 * offset. Window-rect-relative coords drifted every
+                 * client hit zone up-left by the shadow margin — the
+                 * resize-cursor-on-the-title-bar physical bug. */
+                xw_surface_to_local(surface, s->cursor_x, s->cursor_y,
+                                    &lx, &ly);
                 wl_pointer_send_enter(p, ++s->serial, surface->res,
-                                      wl_fixed_from_int(s->cursor_x - sx),
-                                      wl_fixed_from_int(s->cursor_y - sy));
+                                      wl_fixed_from_int(lx),
+                                      wl_fixed_from_int(ly));
                 wl_pointer_send_frame(p);
                 s->ptr_enter_serial = s->serial;
                 if (!s->first_enter_ms) {
@@ -793,6 +839,43 @@ static bool seat_vt_switch_key(struct xw_seat *s, uint32_t keycode,
     return true;
 }
 
+/* XW_INPUT_TRACE=1: the one-line keyboard-chain record for a key event,
+ * printed at xw_seat_key entry (after the xkb state update, before any
+ * consumption decision). Fields, in the order a physical bug hunt reads
+ * them: the RAW linux keycode the seat was called with (what libinput
+ * reported), the xkb/wl keycode that goes on the wire (+8), the keysym
+ * a compliant client computes for that keycode under the CURRENT
+ * modifier state, the state, the four modifier masks, and the keyboard
+ * focus (surface + client pid). The outcome line (delivered serial /
+ * consumed-by) is printed by the branches below — together they answer
+ * "wrong event from the compositor, or wrong interpretation in the
+ * client" without guessing. */
+static void trace_key_event(struct xw_seat *s, uint32_t keycode, bool down) {
+    if (!input_trace_enabled())
+        return;
+    char kbuf[64], fbuf[64], cbuf[32];
+    xkb_keysym_t sym =
+        xkb_state_key_get_one_sym(s->xkb_state, keycode + 8);
+    xkb_keysym_get_name(sym, kbuf, sizeof(kbuf));
+    xkb_mod_mask_t dep = xkb_state_serialize_mods(s->xkb_state,
+                                                  XKB_STATE_MODS_DEPRESSED);
+    xkb_mod_mask_t lat = xkb_state_serialize_mods(s->xkb_state,
+                                                  XKB_STATE_MODS_LATCHED);
+    xkb_mod_mask_t loc = xkb_state_serialize_mods(s->xkb_state,
+                                                  XKB_STATE_MODS_LOCKED);
+    xkb_mod_mask_t grp = xkb_state_serialize_layout(s->xkb_state,
+                                                    XKB_STATE_LAYOUT_EFFECTIVE);
+    struct wl_client *cl = s->kb_focus
+                               ? wl_resource_get_client(s->kb_focus->res)
+                               : NULL;
+    xw_input_trace(
+        "key: raw=%u wl=%u sym=%#x '%s' %s mods=[d=%u l=%u k=%u g=%u] "
+        "focus=%s %s",
+        keycode, keycode + 8, (unsigned)sym, kbuf, down ? "press" : "release",
+        dep, lat, loc, grp, surface_desc(s->kb_focus, fbuf, sizeof(fbuf)),
+        client_desc(cl, cbuf, sizeof(cbuf)));
+}
+
 void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
     if (!s->xkb_state)
         return;
@@ -801,6 +884,7 @@ void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
      * the wm use raw linux keycodes */
     xkb_state_update_key(s->xkb_state, keycode + 8,
                          down ? XKB_KEY_DOWN : XKB_KEY_UP);
+    trace_key_event(s, keycode, down);
     send_modifiers(s);
     xw_idle_activity(s);
 
@@ -811,6 +895,9 @@ void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
      * handling below (a client never sees the press, so it must never
      * see the release either) */
     if (seat_vt_switch_key(s, keycode, down)) {
+        xw_input_trace("key: raw=%u consumed=vt-switch (client never sees "
+                       "press or release)",
+                       keycode);
         mark_consumed(s, keycode, true);
         return;
     }
@@ -820,15 +907,25 @@ void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
      * keyboard focus is pinned to a lock surface by
      * xw_seat_set_kb_focus while the gate is engaged. */
     if (xw_session_lock_active(s->comp)) {
-        if (!s->kb_focus || wl_list_empty(&s->keyboards))
+        if (!s->kb_focus || wl_list_empty(&s->keyboards)) {
+            xw_input_trace("key: raw=%u dropped (lock active, no kb focus)",
+                           keycode);
             return;
+        }
         struct wl_client *cl = wl_resource_get_client(s->kb_focus->res);
         struct wl_resource *k;
         wl_list_for_each(k, &s->keyboards, link) {
-            if (wl_resource_get_client(k) == cl)
-                wl_keyboard_send_key(k, ++s->serial, time, keycode + 8,
+            if (wl_resource_get_client(k) == cl) {
+                uint32_t serial = ++s->serial;
+                wl_keyboard_send_key(k, serial, time, keycode + 8,
                                      down ? WL_KEYBOARD_KEY_STATE_PRESSED
                                           : WL_KEYBOARD_KEY_STATE_RELEASED);
+                char cbuf[32];
+                xw_input_trace("key: raw=%u delivered=lock wl=%u serial=%u "
+                               "-> %s",
+                               keycode, keycode + 8, serial,
+                               client_desc(cl, cbuf, sizeof(cbuf)));
+            }
         }
         return;
     }
@@ -837,6 +934,9 @@ void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
      *    suppressed so clients never see a stray release) */
     if (down && s->comp->shortcuts &&
         xw_shortcuts_dispatch(s->comp->shortcuts, s, keycode, true)) {
+        xw_input_trace("key: raw=%u consumed=shortcut (release will be "
+                       "suppressed too)",
+                       keycode);
         mark_consumed(s, keycode, true);
         return;
     }
@@ -844,6 +944,9 @@ void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
         /* the press was consumed (shortcut or interactive move/resize):
          * the release never reaches the client, and any interactive
          * auto-repeat of this key stops here */
+        xw_input_trace("key: raw=%u release-suppressed (its press was "
+                       "consumed above)",
+                       keycode);
         if (s->repeat_active && keycode == s->repeat_key)
             disarm_interactive_repeat(s);
         mark_consumed(s, keycode, false);
@@ -857,6 +960,8 @@ void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
      *    to the client as a stray event. */
     struct xw_window *iw = xw_wm_interactive_window(s->comp->wm);
     if (iw && xw_wm_interactive_key(s->comp->wm, iw, keycode, down)) {
+        xw_input_trace("key: raw=%u consumed=interactive-move/resize",
+                       keycode);
         if (down) {
             arm_interactive_repeat(s, keycode);
             mark_consumed(s, keycode, true);
@@ -868,15 +973,25 @@ void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
         disarm_interactive_repeat(s);
 
     /* 3. deliver to the focused client (evdev + 8) */
-    if (!s->kb_focus || wl_list_empty(&s->keyboards))
+    if (!s->kb_focus || wl_list_empty(&s->keyboards)) {
+        xw_input_trace("key: raw=%u dropped (no keyboard focus — nothing "
+                       "is focused or no wl_keyboard bound)",
+                       keycode);
         return;
+    }
     struct wl_client *cl = wl_resource_get_client(s->kb_focus->res);
     struct wl_resource *k;
     wl_list_for_each(k, &s->keyboards, link) {
-        if (wl_resource_get_client(k) == cl)
-            wl_keyboard_send_key(k, ++s->serial, time, keycode + 8,
+        if (wl_resource_get_client(k) == cl) {
+            uint32_t serial = ++s->serial;
+            wl_keyboard_send_key(k, serial, time, keycode + 8,
                                  down ? WL_KEYBOARD_KEY_STATE_PRESSED
                                       : WL_KEYBOARD_KEY_STATE_RELEASED);
+            char cbuf[32];
+            xw_input_trace("key: raw=%u delivered wl=%u serial=%u -> %s",
+                           keycode, keycode + 8, serial,
+                           client_desc(cl, cbuf, sizeof(cbuf)));
+        }
     }
 }
 
@@ -942,25 +1057,25 @@ void xw_seat_pointer_motion(struct xw_seat *s, int x, int y) {
 
     if (s->ptr_focus && !wl_list_empty(&s->pointers)) {
         struct wl_resource *p;
-        int sx = 0, sy = 0;
-        xw_surface_get_pos(s->ptr_focus, &sx, &sy, NULL, NULL);
+        int lx = 0, ly = 0;
+        xw_surface_to_local(s->ptr_focus, x, y, &lx, &ly);
         {
             char dbuf[64];
             xw_input_trace("motion (%d,%d) -> %s local (%d,%d)",
                            x, y,
                            surface_desc(s->ptr_focus, dbuf, sizeof(dbuf)),
-                           x - sx, y - sy);
+                           lx, ly);
         }
         if (getenv("XW_GEOMETRY_TRACE")) {
             fprintf(stderr,
                     "[geom] motion      global (%d,%d) -> surface-local "
-                    "(%d,%d) [origin %d,%d]\n",
-                    x, y, x - sx, y - sy, sx, sy);
+                    "(%d,%d) [buffer-relative]\n",
+                    x, y, lx, ly);
         }
         PTR_FOR_EACH(s->ptr_focus, p) {
             wl_pointer_send_motion(p, (uint32_t)xw_now_ms(),
-                                   wl_fixed_from_int(x - sx),
-                                   wl_fixed_from_int(y - sy));
+                                   wl_fixed_from_int(lx),
+                                   wl_fixed_from_int(ly));
             wl_pointer_send_frame(p);
         }
     }
@@ -1162,10 +1277,6 @@ void xw_seat_pointer_button(struct xw_seat *s, uint32_t linux_button,
 
     if (s->ptr_focus && !wl_list_empty(&s->pointers)) {
         struct wl_resource *p;
-        int sx = 0, sy = 0;
-        xw_surface_get_pos(s->ptr_focus, &sx, &sy, NULL, NULL);
-        (void)sx;
-        (void)sy;
         char dbuf[64];
         xw_input_trace("button %u %s -> %s (serial next %u)",
                        linux_button, down ? "press" : "release",
