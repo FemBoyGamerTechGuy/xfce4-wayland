@@ -103,6 +103,74 @@ void xw_wm_damage_all(struct xw_wm *wm) {
         xw_output_damage_rect(o, o->x, o->y, o->width, o->height);
 }
 
+/* ------------------------------------------------------------ geometry */
+
+/* THE canonical geometry trace — one function, every coordinate space
+ * of one managed window, printed at every geometry transition. This
+ * is the instrument the 2026-09-05 physical-NVIDIA round demanded:
+ * when the desktop misbehaves, this line answers "which space was
+ * wrong" without guessing. Gated by XW_GEOMETRY_TRACE=1 (stderr, so
+ * it works in nested/headless/DRM alike and never interleaves with
+ * the structured log sink). */
+void xw_wm_trace_geometry(const struct xw_window *w, const char *tag) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("XW_GEOMETRY_TRACE") != NULL;
+    if (!enabled || !w)
+        return;
+    const char *role = "?";
+    if (w->surface) {
+        switch (w->surface->role) {
+        case XW_SURFACE_ROLE_XDG_TOPLEVEL: role = "xdg"; break;
+        case XW_SURFACE_ROLE_XWAYLAND:     role = "xwl"; break;
+        default:                           role = "other"; break;
+        }
+    }
+    int gx = 0, gy = 0, gw = 0, gh = 0;
+    if (w->surface)
+        xw_surface_get_pos((struct xw_surface *)w->surface, &gx, &gy, &gw, &gh);
+    struct xw_output *o = w->output;
+    struct xw_seat *seat = xw_seat_first(w->comp);
+    fprintf(stderr,
+            "[geom] %-12s win %u role %s | model %dx%d+%d+%d "
+            "| surface-pos %dx%d+%d+%d | buffer %dx%d scale %d "
+            "| output '%s' %dx%d+%d+%d usable %dx%d+%d+%d "
+            "| state%s%s%s | restore %dx%d+%d+%d "
+            "| seat %d,%d\n",
+            tag, w->id, role,
+            w->w, w->h, w->x, w->y,
+            gw, gh, gx, gy,
+            w->surface ? w->surface->buf_w : 0,
+            w->surface ? w->surface->buf_h : 0,
+            w->surface ? w->surface->scale : 0,
+            o ? o->name : "(none)",
+            o ? o->width : 0, o ? o->height : 0,
+            o ? o->x : 0, o ? o->y : 0,
+            o ? o->usable.w : 0, o ? o->usable.h : 0,
+            o ? o->usable.x : 0, o ? o->usable.y : 0,
+            w->fullscreen ? " FS" : "", w->maximized ? " MAX" : "",
+            w->minimized ? " MIN" : "",
+            w->restore.w, w->restore.h, w->restore.x, w->restore.y,
+            seat ? seat->cursor_x : -1, seat ? seat->cursor_y : -1);
+}
+
+/* hit-test truth for the trace: which window does the wm think sits
+ * under a point, and does that match the model rect? */
+void xw_wm_trace_pick(struct xw_wm *wm, int px, int py) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("XW_GEOMETRY_TRACE") != NULL;
+    if (!enabled)
+        return;
+    struct xw_surface *surf = NULL;
+    struct xw_window *hit = xw_wm_window_at(wm, px, py, &surf);
+    fprintf(stderr, "[geom] pick %-6s (%d,%d) -> win %u surface %u\n",
+            "pointer", px, py,
+            hit ? hit->id : 0,
+            surf ? wl_resource_get_id(surf->res) : 0);
+    (void)hit;
+}
+
 /* ------------------------------------------------------------ lifecycle */
 
 void xw_wm_manage_toplevel(struct xw_wm *wm, struct xw_window *w) {
@@ -112,6 +180,18 @@ void xw_wm_manage_toplevel(struct xw_wm *wm, struct xw_window *w) {
     xw_log(XW_LOG_DEBUG, "wm: window %u managed (surface %u, app '%s')",
            w->id, w->surface ? wl_resource_get_id(w->surface->res) : 0,
            w->app_id);
+}
+
+/* surface->mapped is the FRAME-CALLBACK lifecycle bit: xw-output
+ * delivers wl_callback.done only to mapped surfaces, and Xwayland
+ * (plus any frame-clocked native client, e.g. GTK's frame clock)
+ * presents its NEXT frame only after the previous callback fired.
+ * Missing this bit froze X11 windows at their very first frame —
+ * the white/invisible-window physical symptom: the client kept
+ * drawing, Xwayland kept waiting for a callback that never came. */
+static void wm_window_surface_set_mapped(struct xw_window *w, bool on) {
+    if (w->surface)
+        w->surface->mapped = on;
 }
 
 void xw_wm_window_map(struct xw_wm *wm, struct xw_window *w) {
@@ -125,6 +205,7 @@ void xw_wm_window_map(struct xw_wm *wm, struct xw_window *w) {
         return;
     }
     w->mapped = true;
+    wm_window_surface_set_mapped(w, true);
 
     struct xw_output *o = w->output;
     if (!o && !wl_list_empty(&wm->comp->outputs)) {
@@ -171,7 +252,22 @@ void xw_wm_window_map(struct xw_wm *wm, struct xw_window *w) {
 
     /* ---- placement (cascade inside the usable area, xfwm-style) */
     static int cascade = 0;
-    if (o && !w->maximized && !w->fullscreen) {
+    if ((w->maximized || w->fullscreen) && o) {
+        /* state windows map AT their state rect: the model is the
+         * authority (granted geometry), the client is configured/
+         * mirrored into it. Buffer-size adoption must never override
+         * this — the fullscreen-gap and reverted-resize bugs were
+         * exactly a stale client commit overwriting the state rect. */
+        struct xw_rect target = w->maximized
+                                    ? (struct xw_rect){o->usable.x, o->usable.y,
+                                                       o->usable.w, o->usable.h}
+                                    : (struct xw_rect){o->x, o->y, o->width,
+                                                       o->height};
+        w->x = target.x;
+        w->y = target.y;
+        w->w = target.w;
+        w->h = target.h;
+    } else if (o && !w->maximized && !w->fullscreen) {
         int uw = o->usable.w, uh = o->usable.h;
         int off = (cascade % 8) * 24;
         cascade++;
@@ -195,6 +291,7 @@ void xw_wm_window_map(struct xw_wm *wm, struct xw_window *w) {
     /* a window mapped under the stationary cursor takes pointer focus
      * immediately (motion would do it too, but not before then) */
     xw_seat_repointer(wm->comp);
+    xw_wm_trace_geometry(w, "map");
     xw_log(XW_LOG_INFO,
            "wm: window %u MAPPED (surface %u, app '%s', title '%s', "
            "%dx%d+%d+%d, output '%s', ws %d)",
@@ -227,6 +324,7 @@ void xw_wm_or_map(struct xw_wm *wm, struct xw_window *w) {
     if (w->mapped)
         return;
     w->mapped = true;
+    wm_window_surface_set_mapped(w, true);
     struct xw_output *o = w->output;
     if (!o && !wl_list_empty(&wm->comp->outputs)) {
         o = wl_container_of(wm->comp->outputs.next, o, link);
@@ -253,6 +351,7 @@ void xw_wm_window_unmap(struct xw_wm *wm, struct xw_window *w) {
         xw_log(XW_LOG_INFO, "wm: X11 popup (OR) window %u UNMAPPED", w->id);
         xw_wm_damage_window(wm, w);
         w->mapped = false;
+        wm_window_surface_set_mapped(w, false);
         /* the pointer may now sit over a different surface */
         xw_seat_repointer(wm->comp);
         return;
@@ -261,6 +360,7 @@ void xw_wm_window_unmap(struct xw_wm *wm, struct xw_window *w) {
            w->id, w->app_id, w->title);
     xw_wm_damage_window(wm, w);
     w->mapped = false;
+    wm_window_surface_set_mapped(w, false);
     xw_foreign_toplevel_window_unmapped(wm->comp, w);
     if (wm->focused == w) {
         wm->focused = NULL;
@@ -451,6 +551,7 @@ void xw_wm_maximize(struct xw_wm *wm, struct xw_window *w, bool on) {
     struct xw_output *o = w->output;
     if (!o)
         return;
+    xw_wm_trace_geometry(w, on ? "max-enter" : "max-leave-in");
     xw_wm_damage_window(wm, w);
     if (on) {
         if (!w->fullscreen)
@@ -475,6 +576,7 @@ void xw_wm_maximize(struct xw_wm *wm, struct xw_window *w, bool on) {
         xw_xwayland_notify_geometry(w);
     xw_foreign_toplevel_notify(wm->comp, w);
     xw_wm_damage_window(wm, w);
+    xw_wm_trace_geometry(w, on ? "max-granted" : "max-restored");
 }
 
 void xw_wm_fullscreen(struct xw_wm *wm, struct xw_window *w, bool on) {
@@ -510,6 +612,7 @@ void xw_wm_fullscreen(struct xw_wm *wm, struct xw_window *w, bool on) {
         xw_xwayland_notify_geometry(w);
     xw_foreign_toplevel_notify(wm->comp, w);
     xw_wm_damage_window(wm, w);
+    xw_wm_trace_geometry(w, on ? "fs-granted" : "fs-restored");
 }
 
 void xw_wm_minimize(struct xw_wm *wm, struct xw_window *w, bool on) {
@@ -671,6 +774,10 @@ bool xw_wm_interactive_begin_move(struct xw_wm *wm, struct xw_window *w, int px,
     w->inter.grab_dx = px - w->x;
     w->inter.grab_dy = py - w->y;
     w->inter.snap = 0;
+    xw_wm_trace_geometry(w, "move-begin");
+    fprintf(stderr, "[geom]   grab offset %d,%d (pointer %d,%d - frame "
+            "%d,%d)\n", w->inter.grab_dx, w->inter.grab_dy, px, py,
+            w->x, w->y);
     return true;
 }
 
@@ -714,6 +821,7 @@ void xw_wm_interactive_motion(struct xw_wm *wm, struct xw_window *w, int px,
         return;
     xw_wm_damage_window(wm, w);
     if (w->inter.mode == 1) {
+        xw_wm_trace_geometry(w, "move-motion-in");
         w->x = px - w->inter.grab_dx;
         w->y = py - w->inter.grab_dy;
         xw_wm_update_window_output(wm, w);

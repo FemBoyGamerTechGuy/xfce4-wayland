@@ -11,12 +11,17 @@
  * The client prints lifecycle events to stdout (line-buffered, every
  * line flushed) and then executes stdin commands, one per line:
  *   resize WxH | title NAME | move X Y | queryfocus | fullscreen |
- *   unfullscreen | state | wait | exit
+ *   unfullscreen | state | wait | exit | geom | draw [COLOR] |
+ *   pointer on/off | button on/off
  * Output lines the tests assert on:
  *   WINDOW 0x...     (the toplevel id, right after creation)
  *   MAPPED
  *   CONFIGURE WxH+X+Y   (ConfigureNotify, the granted geometry)
- *   DELETE           (WM_DELETE_WINDOW received — client exits itself)
+ *   GEOM WxH+X+Y BW B  (XGetGeometry + root-translation truth + border)
+ *   MOTION X,Y        (PointerWindow motion, window-local coords)
+ *   BTN d X,Y         (ButtonPress/Release with window-local coords)
+ *   ENTER X,Y         (EnterNotify, window-local)
+ *   DELETE            (WM_DELETE_WINDOW received — client exits itself)
  *   TAKEFOCUS        (WM_TAKE_FOCUS received)
  *   FOCUS 0x...      (XGetInputFocus result)
  *   STATE a,b,...    (_NET_WM_STATE atoms; "STATE (none)" when empty —
@@ -180,6 +185,8 @@ int main(int argc, char **argv) {
     }
     bool want_delete = true, want_takefocus = false, want_input = true;
     bool want_fs = false;
+    bool want_motion = false, want_button = false;
+    int border = 1;
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "nodelete") == 0)
             want_delete = false;
@@ -189,13 +196,24 @@ int main(int argc, char **argv) {
             want_input = false;
         if (strcmp(argv[i], "fullscreen") == 0)
             want_fs = true;
+        if (strcmp(argv[i], "motion") == 0)
+            want_motion = true;
+        if (strcmp(argv[i], "button") == 0)
+            want_button = true;
+        if (strncmp(argv[i], "border", 6) == 0)
+            border = atoi(argv[i] + 6);
     }
 
     XSetWindowAttributes attrs;
     attrs.event_mask = StructureNotifyMask | PropertyChangeMask;
-    Window win = XCreateWindow(dpy, root, 0, 0, (unsigned)w, (unsigned)h, 1,
-                               CopyFromParent, InputOutput, CopyFromParent,
-                               CWEventMask, &attrs);
+    if (want_motion)
+        attrs.event_mask |= PointerMotionMask | EnterWindowMask |
+                            LeaveWindowMask;
+    if (want_button)
+        attrs.event_mask |= ButtonPressMask | ButtonReleaseMask;
+    Window win = XCreateWindow(dpy, root, 0, 0, (unsigned)w, (unsigned)h,
+                               (unsigned)border, CopyFromParent, InputOutput,
+                               CopyFromParent, CWEventMask, &attrs);
     set_str_prop(dpy, win, XA_WM_NAME, "Probe Initial");
     set_str_prop(dpy, win, XA_WM_ICON_NAME, "Probe");
     XClassHint class = {.res_name = "probe", .res_class = "Probe"};
@@ -227,6 +245,23 @@ int main(int argc, char **argv) {
     say("WINDOW 0x%lx", (unsigned long)win);
     say("MAPPED");
 
+    /* the geometry truth of the X window: interior size, absolute
+     * (root) position, border width. The compositor's model must be
+     * the EXTENT (interior + 2*bw rooted at x-bw,y-bw) — the tests
+     * assert this invariant live. */
+#define REPORT_GEOM(dpy, win)                                                 \
+    do {                                                                      \
+        Window root_ret;                                                      \
+        int gx, gy; unsigned gw, gh, gbw, gd;                                 \
+        if (XGetGeometry(dpy, win, &root_ret, &gx, &gy, &gw, &gh, &gbw,       \
+                         &gd) &&                                             \
+            XTranslateCoordinates(dpy, win, root_ret, 0, 0, &gx, &gy,          \
+                                 &(Window){0})) {                             \
+            say("GEOM %ux%u+%d+%d BW %u", gw, gh, gx, gy, gbw);              \
+        }                                                                     \
+    } while (0)
+    REPORT_GEOM(dpy, win);
+
     /* event + command loop: drain events between stdin reads */
     char line[128];
     bool done = false;
@@ -235,8 +270,24 @@ int main(int argc, char **argv) {
             XEvent ev;
             XNextEvent(dpy, &ev);
             if (ev.type == ConfigureNotify) {
-                say("CONFIGURE %dx%d+%d+%d", ev.xconfigure.width,
-                    ev.xconfigure.height, ev.xconfigure.x, ev.xconfigure.y);
+                if (ev.xconfigure.window == win)
+                    say("CONFIGURE %dx%d+%d+%d", ev.xconfigure.width,
+                        ev.xconfigure.height, ev.xconfigure.x,
+                        ev.xconfigure.y);
+            } else if (ev.type == MotionNotify) {
+                if (ev.xmotion.window == win)
+                    say("MOTION %d,%d", ev.xmotion.x, ev.xmotion.y);
+            } else if (ev.type == EnterNotify) {
+                if (ev.xcrossing.window == win)
+                    say("ENTER %d,%d", ev.xcrossing.x, ev.xcrossing.y);
+            } else if (ev.type == LeaveNotify) {
+                if (ev.xcrossing.window == win)
+                    say("LEAVE %d,%d", ev.xcrossing.x, ev.xcrossing.y);
+            } else if (ev.type == ButtonPress || ev.type == ButtonRelease) {
+                if (ev.xbutton.window == win)
+                    say("BTN %c %d,%d",
+                        ev.type == ButtonPress ? 'd' : 'u', ev.xbutton.x,
+                        ev.xbutton.y);
             } else if (ev.type == ClientMessage) {
                 if ((Atom)ev.xclient.data.l[0] == atom_wm_delete) {
                     say("DELETE");
@@ -280,18 +331,71 @@ int main(int argc, char **argv) {
             } else if (strncmp(line, "title ", 6) == 0) {
                 line[strcspn(line, "\n")] = 0;
                 set_str_prop(dpy, win, XA_WM_NAME, line + 6);
+            } else if (strncmp(line, "geom", 4) == 0) {
+                REPORT_GEOM(dpy, win);
+            } else if (strncmp(line, "mask", 4) == 0) {
+                /* what does the server think our event mask is? (the
+                 * WM helper rewrites CWEventMask at MapRequest) */
+                XWindowAttributes wa;
+                if (XGetWindowAttributes(dpy, win, &wa)) {
+                    unsigned long m = wa.your_event_mask;
+                    say("MASK 0x%lx%s%s%s%s%s", m,
+                        (m & StructureNotifyMask) ? " struct" : "",
+                        (m & PointerMotionMask) ? " motion" : "",
+                        (m & ButtonPressMask) ? " btn" : "",
+                        (m & PropertyChangeMask) ? " prop" : "",
+                        (m & EnterWindowMask) ? " enter" : "");
+                }
+            } else if (strncmp(line, "readpix", 7) == 0) {
+                /* XGetImage the window center: does the X-side drawable
+                 * contain what the client drew? (separates "X drawing
+                 * never happened" from "Xwayland never presented") */
+                Window root_ret;
+                int gx_, gy_;
+                unsigned cw_, ch_, gbw_, gd_;
+                if (XGetGeometry(dpy, win, &root_ret, &gx_, &gy_, &cw_,
+                                 &ch_, &gbw_, &gd_)) {
+                    XImage *img = XGetImage(dpy, win, (int)(cw_ / 2),
+                                            (int)(ch_ / 2), 1, 1,
+                                            0xffffffff, ZPixmap);
+                    if (img) {
+                        unsigned long pv = 0xffffff;
+                        if (img->bits_per_pixel == 32)
+                            memcpy(&pv, img->data, 4);
+                        say("READPIX 0x%06lx", pv & 0xffffff);
+                        XDestroyImage(img);
+                    } else {
+                        say("READPIX failed");
+                    }
+                }
             } else if (strncmp(line, "draw", 4) == 0) {
                 /* paint the whole window + flush: forces Xwayland to
                  * re-attach a fresh damage-driven buffer (the probe
                  * normally never draws, which is exactly what makes it
-                 * different from every real X11 client) */
-                XGCValues gcv = {.foreground = 0x3366CC};
+                 * different from every real X11 client). Optional hex
+                 * color after "draw " (default 0x3366CC). Uses the
+                 * CURRENT window size (the window may have been
+                 * resized since launch). */
+                unsigned long fg = 0x3366CC;
+                if (line[4] == ' ')
+                    fg = strtoul(line + 5, NULL, 16);
+                Window root_ret;
+                int gx_, gy_;
+                unsigned cw_, ch_, gbw_, gd_;
+                XGetGeometry(dpy, win, &root_ret, &gx_, &gy_, &cw_, &ch_,
+                             &gbw_, &gd_);
+                XGCValues gcv = {.foreground = fg};
                 GC gc = XCreateGC(dpy, win, GCForeground, &gcv);
-                XFillRectangle(dpy, win, gc, 0, 0, (unsigned)w,
-                               (unsigned)h);
+                XFillRectangle(dpy, win, gc, 0, 0, cw_, ch_);
                 XFreeGC(dpy, gc);
                 XFlush(dpy);
-                say("DREW %dx%d", w, h);
+                say("DREW %ux%u", cw_, ch_);
+            } else if (strncmp(line, "move ", 5) == 0) {
+                /* XMoveWindow — the client moving itself */
+                int nx = atoi(line + 5);
+                char *sp = strchr(line + 5, ' ');
+                int ny = sp ? atoi(sp + 1) : 0;
+                XMoveWindow(dpy, win, nx, ny);
             } else if (strncmp(line, "fullscreen", 10) == 0) {
                 send_state_msg(dpy, win, 1 /* _NET_WM_STATE_ADD */);
             } else if (strncmp(line, "unfullscreen", 12) == 0) {

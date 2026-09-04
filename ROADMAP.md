@@ -294,6 +294,35 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
   orderly stack teardown (exit 0), one gone = that peer's crash
   reported loudly, wl protocol errors identified as compositor bugs.
   Regression: scripts/test-xwm-loss.sh.
+- DONE the canonical geometry round (2026-09-05, the
+  physical-NVIDIA findings): ONE model rect per window now drives
+  render, hit-test, pointer-event translation AND damage for both
+  window families (the XWAYLAND branch in xw_surface_get_pos was
+  missing — X11 surfaces hit-tested against a phantom rect at the
+  layout origin while rendering used the model: the off-center
+  grab/hit area, clicks on the wrong window, X11 clients fed
+  global pointer coordinates, Xwayland starved of pointer events).
+  Frame callbacks now reach MAPPED toplevel surfaces (the map/unmap
+  funnel maintains surface->mapped; Xwayland 24.1 presents frame N+1
+  only after frame N's callback — the white/invisible frozen-window
+  symptom was exactly one presented frame). State geometry
+  (fullscreen/maximized) is authoritative against stale-size
+  commits, state windows map at their state rect, and grants are
+  distinguished from commits (xw_geom_pending) so in-flight
+  pre-grant commits cannot rewind a live resize. Mirror positions
+  are identity across the compositor<->X boundary (X window x/y IS
+  the extent origin; only sizes convert by 2*border — the old
+  +bw/-bw on positions shifted every mirrored window 1px/round).
+  Instrument: XW_GEOMETRY_TRACE=1 (per-window geometry line +
+  hit-test picks + the global→surface-local translation).
+  Regressions: xwm-geometry-truth (the X11 battery, real
+  Xwayland/helper/Xlib client) + geometry-native (native twin +
+  frame-callback liveness); both verified red with the fixes
+  reverted. Physical NVIDIA acceptance: the checklist in
+  TESTING.md (real-hand drags, menu interaction, continuous
+  repaint of frame-clocked apps) — the headless battery pins every
+  geometry invariant, the physical pass remains the final
+  authority and has NOT yet been re-run by hand.
 - PART the measured surface-space calibration: Xwayland sizes some
   windows' wl_surfaces to the X11 interior, others to the extent
   (interior + 2*border) — both measured live with the same binary

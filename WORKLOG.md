@@ -2336,3 +2336,131 @@ fullscreen block), zero-warning -Werror builds.
 
 Next: X11 clipboard bridge, EWMH workspace mirroring, activation
 channel (backlog order).
+
+## Session 2026-09-05 — the central geometry round (physical-NVIDIA findings)
+
+**Commission**: physical NVIDIA testing showed the automated suite
+green while the desktop was wrong: decorations/grabs offset
+off-center, fullscreen with a one-sided gap, granted resizes not
+landing, white/invisible X11 windows, Mirage rendering but
+unusable. Directive: audit EVERY coordinate space, instrument,
+find the single source of truth, no per-app special cases, no
+papering over.
+
+**The audit** (all spaces A-K mapped first, then one instrument —
+`XW_GEOMETRY_TRACE=1`, `xw_wm_trace_geometry()` prints model /
+surface-pos / buffer / output / usable / state / restore / seat in
+one line; `xw_wm_trace_pick()` prints what the hit-test resolves;
+the seat logs the global→surface-local translation; the helper
+already logs every mirror). Reproduced EVERY physical symptom
+headlessly with a real Xwayland + real helper + real Xlib client
+(the new `xwm-geometry-truth` battery, 10 failures on the unfixed
+tree — hit-test 0/5, phantom input rect at (0,0), no pointer
+events reaching X11 clients, no pixels, fullscreen gap, resize
+revert).
+
+**Root causes — one canonical model, five concrete breaks:**
+
+1. `xw_surface_get_pos()` had NO branch for
+   XW_SURFACE_ROLE_XWAYLAND: every X11 surface reported position
+   (0,0)+buffer-size while rendering used the window model. Render
+   said one rect, hit-test/pointer-translation/damage used another
+   — the grab/hit offset, the phantom clickable rect at the
+   top-left, X11 clients receiving GLOBAL pointer coordinates
+   (every widget hit-test off by the window position = "the app
+   is non-functional"), and the compositor starving Xwayland of
+   pointer events entirely (no wl_pointer enter → no X pointer
+   motion → nothing interactive). Fix: the XWAYLAND branch returns
+   the model rect, same as xdg — one rect, four consumers
+   (render, hit-test, pointer translation, damage).
+
+2. `deliver_frame_callbacks()` skips surfaces with
+   `s->mapped == false` — and NOTHING ever set `s->mapped` for
+   toplevel roles (xdg AND xwayland; only cursors/subsurfaces/
+   lock surfaces had it). Xwayland 24.1 presents its NEXT frame
+   only after the previous wl_callback fires
+   (xwl_screen_post_damage skips windows waiting on a frame
+   callback): every X11 window presented exactly ONE frame (the
+   initial background — white for apps with a background pixel,
+   empty/transparent = "invisible") and froze. This also explains
+   "shows its UI but is non-functional" for frame-clocked native
+   clients (GTK frame clock). Fix: the window-map/unmap funnel
+   (`xw_wm_window_map` / `xw_wm_or_map` / `xw_wm_window_unmap`)
+   now maintains surface->mapped. Verified against Xwayland
+   24.1.6 source in .apps-root (the whole present path:
+   ensure_surface_for_window requires manual redirect — the
+   helper's CompositeRedirectSubwindows(root, Manual) is correct
+   and required — damage_report → damage_window_list →
+   blockhandler → swap_pixmap copies the window backing into the
+   shm buffer → attach; all machinery intact, only the callback
+   was missing).
+
+3. State geometry (fullscreen/maximized) was clobbered by
+   stale-size commits: both role-commit paths (xdg
+   toplevel_apply_commit, xwl role_commit) adopted the committed
+   buffer size unconditionally — a pre-resize commit rewound the
+   model to the old size, then the mirror pushed the old size
+   back to X, reverting the client's own resize: the fullscreen
+   "gap" and the unreliable granted resizes. Fix: while
+   state-held, the granted rect is authoritative; mismatched
+   commits re-assert (configure / notify_geometry) instead of
+   adopting. State windows now also map AT their state rect
+   (window_map sets usable/output before configure/mirror).
+
+4. Granted-vs-committed race (found by the full-suite run order):
+   an in-flight pre-grant commit (e.g. the unfullscreen
+   resize-cleared backing) landed AFTER the interactive grant and
+   rewound the model. Fix: `xw_geom_pending` — notify_geometry
+   marks the grant in flight; commits carrying a different size
+   while pending are stale pre-grant state; set_geometry (the X
+   truth echo) clears the flag. "Compositor granted 360x240" is
+   now provably distinct from "client committed 360x240".
+
+5. The helper's position math was 1px-per-round off: X reports
+   window x/y as the OUTER origin (border INSIDE it); the extent
+   rect (== the compositor model == the surface) is anchored
+   exactly there. surf_to_pos/interior_pos_to_surf added +bw /
+   -bw to POSITIONS (only SIZES convert by 2*bw). Every mirror
+   round shifted X11 windows 1*bw off the model. Fix: positions
+   are identity across the mirror; OR pushes dropped the -bw.
+
+**The tests** (both proven red on the unfixed tree — the
+revert-check re-disabled FIX B and both went red again):
+- `xwm-geometry-truth` (X11): model == X extent (settled),
+  hit-test center+4 corners of the model rect, no phantom rect,
+  pointer events window-local in X (MOTION/BTN with coords),
+  pixels composited at the model rect, fullscreen model == X
+  extent == pixel corners (no gap), interactive resize grant
+  stable across the client redraw + X truth == granted.
+  x11client gained: GEOM (XGetGeometry+translate truth), MOTION/
+  BTN/ENTER window-local reports, border<N>, draw [color],
+  readpix, move, mask.
+- `geometry-native` (native Wayland window): hit-test == model,
+  render bbox == model, pointer position window-local (toolkit
+  truth), fullscreen fills corners after the client redraw, and
+  the frame-callback liveness check (a MAPPED toplevel's
+  wl_callback MUST fire — the native twin of the freeze).
+
+Also: the focus-routing test's stale comment claimed "click on A
+through injected pointer events" while calling
+xw_wm_focus_window directly — the pointer path was never
+exercised for X11 windows; the geometry battery now covers it
+for real (that is why the suite was green while the desktop was
+wrong: no test asserted compositor-side geometry or pixels, only
+X-side truth).
+
+**Validation**: 125/125 in-process (12 xwm tests + the native
+geometry test), 144/144 session, 51/0/1 build regressions,
+XWayland stack PASS, xwm-loss PASS, realapps 27/27, full
+ASan/UBSan/LSan round PASS (125/125 + 144/144, zero reports).
+
+**Honest acceptance status**: everything headlessly verifiable is
+now verified (render/hit/pointer/fullscreen/resize invariants for
+both window families, real pixels, real Xwayland). The physical
+NVIDIA checklist (drag with a real hand, Mirage's menus, xterm
+selection with a real mouse) still requires hands on the machine:
+the geometry model those interactions depend on is now single,
+canonical, and regression-pinned, but "desktop functional" must
+be claimed only after a physical pass. Not yet implemented (same
+backlog as before): X11 clipboard bridge, EWMH workspace
+mirroring, X-side activation channel.

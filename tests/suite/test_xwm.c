@@ -1011,6 +1011,388 @@ static void test_xwm_fullscreen(struct xwt_ctx *t) {
     stack_down(t, &s);
 }
 
+/* --------------------------------------------------- geometry truth ---- */
+
+/* THE physical-symptom battery (2026-09-05 NVIDIA round): for a real
+ * X11 window, in ONE test, verify the three coordinate agreements the
+ * desktop depends on —
+ *   1. render rect == X extent rect (where pixels are == where X routes)
+ *   2. hit-test rect == render rect (clicks land on what is drawn)
+ *   3. pointer events are WINDOW-LOCAL in X (apps hit-test their own
+ *      widgets correctly — the "Mirage is non-functional" root cause)
+ * plus fullscreen pixel coverage (no "unexplained gap") and the
+ * granted-resize model stability. Every check was a live physical
+ * failure before this round; the automated suite never exercised
+ * compositor-side geometry, only X-side truth. */
+/* parse "GEOM <w>x<h>+<x>+<y> BW <bw>" */
+static bool parse_geom_line(const char *line, int *w, int *h, int *x, int *y,
+                            int *bw) {
+    return sscanf(line, "GEOM %dx%d+%d+%d BW %d", w, h, x, y, bw) == 5;
+}
+
+/* the client log is append-only from the CLIENT side; the test reads
+ * it whole. To wait for a FRESH line (not one from an earlier phase),
+ * record the file size before sending the command and search only
+ * past that offset — client_wait(t, "DREW") otherwise matches the
+ * PREVIOUS draw's line instantly and the phase races ahead of the
+ * client's 100ms select loop. Found live: the fullscreen corner
+ * check read a pre-draw (empty, resize-cleared) buffer. */
+static long log_size_of(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 ? (long)st.st_size : 0;
+}
+
+static bool client_wait_from(struct xwt_ctx *t, struct xw_proc *p,
+                             const char *needle, long from, int iterations) {
+    char buf[8192];
+    for (int i = 0; i < iterations; i++) {
+        if (log_read(p->logpath, buf, sizeof(buf))) {
+            if ((long)strlen(buf) > from &&
+                strstr(buf + (from < (long)sizeof(buf) ? from : 0), needle))
+                return true;
+        }
+        xwt_pump(t);
+        usleep(10 * 1000);
+    }
+    return false;
+}
+
+/* parse the LAST line starting with prefix that begins at/after offset */
+static bool last_log_line_from(struct xw_proc *p, const char *prefix,
+                               long from, char *out, size_t outsz) {
+    char buf[8192];
+    if (!log_read(p->logpath, buf, sizeof(buf)))
+        return false;
+    if ((long)strlen(buf) <= from)
+        return false;
+    char *best = NULL;
+    char *cur = buf + (from < (long)(sizeof(buf) - 1) ? from : 0);
+    size_t plen = strlen(prefix);
+    while ((cur = strstr(cur, prefix)) != NULL) {
+        best = cur;
+        cur += plen;
+    }
+    if (!best)
+        return false;
+    snprintf(out, outsz, "%s", best);
+    return true;
+}
+
+static struct xw_window *wait_x11_window(struct xwt_ctx *t) {
+    struct xw_window *w = NULL;
+    for (int i = 0; i < 500 && !w; i++) {
+        w = win_by_title(t, "Probe Initial");
+        if (!w) {
+            xwt_pump(t);
+            usleep(5 * 1000);
+        }
+    }
+    if (!w)
+        return NULL;
+    for (int i = 0; i < 600 && !w->mapped; i++) {
+        xwt_pump(t);
+        usleep(5 * 1000);
+    }
+    return w->mapped ? w : NULL;
+}
+
+/* bounding box of a color in the composited output (logical coords) */
+static bool color_bbox(const uint32_t *pix, int pw, int ph, uint32_t rgb,
+                       int *bx, int *by, int *bw, int *bh) {
+    int x0 = pw, y0 = ph, x1 = -1, y1 = -1;
+    for (int y = 0; y < ph; y++) {
+        for (int x = 0; x < pw; x++) {
+            if ((pix[y * pw + x] & 0xffffff) == rgb) {
+                if (x < x0) x0 = x;
+                if (y < y0) y0 = y;
+                if (x > x1) x1 = x;
+                if (y > y1) y1 = y;
+            }
+        }
+    }
+    if (x1 < x0)
+        return false;
+    *bx = x0;
+    *by = y0;
+    *bw = x1 - x0 + 1;
+    *bh = y1 - y0 + 1;
+    return true;
+}
+
+static void test_xwm_geometry_truth(struct xwt_ctx *t) {
+    if (!s_apps_ok) {
+        XWT_SKIP("apps-root not populated (XWayland tests)");
+        return;
+    }
+    struct xw_stack s;
+    XWT_ASSERT(stack_up(t, &s));
+    struct xw_proc c;
+    XWT_ASSERT(client_spawn(&c, t, s.display, "240x140 motion button border1"));
+    XWT_ASSERT(client_wait(t, &c, "MAPPED", 400));
+    XWT_ASSERT(client_wait(t, &c, "GEOM ", 400));
+
+    struct xw_window *w = wait_x11_window(t);
+    XWT_ASSERT(w);
+    XWT_ASSERT(w->output);
+
+    /* --- invariant 1: the compositor model == the X extent rect ---
+     * X truth: interior WxH+X+Y, border bw. The extent rect the X
+     * server routes input in is (X-bw, Y-bw, W+2bw, H+2bw). The
+     * mirror is eventual: at map the compositor re-places the window
+     * (cascade) and pushes the placement to X, so the X truth only
+     * converges after the helper's ConfigureWindow — wait for the
+     * client's ConfigureNotify before comparing. */
+    XWT_ASSERT(client_wait(t, &c, "CONFIGURE", 400));
+    for (int i = 0; i < 200; i++)
+        xwt_pump(t);
+    char gline[256];
+    int gw = 0, gh = 0, gx = 0, gy = 0, gbw = 0;
+    long gbase = log_size_of(c.logpath);
+    proc_cmd(&c, "geom\n");
+    bool have_geom = client_wait_from(t, &c, "GEOM ", gbase, 100);
+    XWT_ASSERT(have_geom);
+    have_geom = last_log_line_from(&c, "GEOM ", gbase, gline, sizeof(gline));
+    XWT_ASSERT(have_geom);
+    XWT_ASSERT(parse_geom_line(gline, &gw, &gh, &gx, &gy, &gbw));
+    int ew = gw + 2 * gbw, eh = gh + 2 * gbw;
+    int ex = gx - gbw, ey = gy - gbw;
+    xw_wm_trace_geometry(w, "audit");
+    XWT_CHECK(w->w == ew && w->h == eh,
+              "model size == X extent size: model %dx%d vs extent %dx%d "
+              "(interior %dx%d bw %d)",
+              w->w, w->h, ew, eh, gw, gh, gbw);
+    XWT_CHECK(w->x == ex && w->y == ey,
+              "model origin == X extent origin: model +%d+%d vs extent "
+              "+%d+%d (X interior +%d+%d, bw %d)",
+              w->x, w->y, ex, ey, gx, gy, gbw);
+
+    /* --- invariant 2: hit-test rect == model rect (render rect) ---
+     * probe the model rect's center and four inner corners; a point
+     * clearly outside must NOT hit. This is the grab/hit-offset
+     * battery (the physical "clicks land in the wrong place"). */
+    int hits = 0;
+    for (int i = 0; i < 5; i++) {
+        int px = (i & 1) ? (w->x + w->w - 3) : (w->x + 2);
+        int py = (i & 2) ? (w->y + w->h - 3) : (w->y + 2);
+        if (i == 4) {
+            px = w->x + w->w / 2;
+            py = w->y + w->h / 2;
+        }
+        struct xw_surface *picked = NULL;
+        struct xw_window *hw = xw_wm_window_at(t->comp->wm, px, py, &picked);
+        if (hw == w)
+            hits++;
+        else
+            xw_wm_trace_pick(t->comp->wm, px, py);
+    }
+    XWT_CHECK(hits == 5, "hit-test covers the model rect (center + 4 "
+              "corners): %d/5 picked window %u at model %dx%d+%d+%d",
+              hits, w->id, w->w, w->h, w->x, w->y);
+
+    /* a point inside the (0,0)-anchored phantom input rect but OUTSIDE
+     * the model must NOT hit the window (the pre-fix bug: it did) */
+    {
+        int px = 30, py = 20;
+        if (px >= w->x && px < w->x + w->w && py >= w->y &&
+            py < w->y + w->h) {
+            /* the window actually covers it (e.g. placed at origin):
+             * pick another phantom-only point */
+            px = w->x + w->w + 40;
+            py = w->y + w->h + 40;
+        }
+        struct xw_window *hw = xw_wm_window_at(t->comp->wm, px, py, NULL);
+        XWT_CHECK(hw != w, "no phantom input rect: (%d,%d) outside the "
+                  "model rect must not pick window %u", px, py, w->id);
+    }
+
+    /* --- invariant 3: pointer events are window-local in X ---
+     * inject motion at the model center; the X client must report
+     * window-local coordinates ((w/2)-ish, (h/2)-ish), not global. */
+    int mx = w->x + w->w / 2, my = w->y + w->h / 2;
+    xw_compositor_inject_pointer_motion(t->comp, mx, my);
+    for (int i = 0; i < 100; i++) {
+        xwt_pump(t);
+        usleep(5 * 1000);
+    }
+    xw_compositor_inject_pointer_button(t->comp, 0x110, true);
+    for (int i = 0; i < 50; i++) {
+        xwt_pump(t);
+        usleep(5 * 1000);
+    }
+    xw_compositor_inject_pointer_button(t->comp, 0x110, false);
+    for (int i = 0; i < 100; i++) {
+        xwt_pump(t);
+        usleep(5 * 1000);
+    }
+
+    char mline[256];
+    bool got_motion = false;
+    {
+        char buf[8192];
+        char *cur, *best = NULL;
+        if (log_read(c.logpath, buf, sizeof(buf))) {
+            for (cur = buf; (cur = strstr(cur, "MOTION ")) != NULL;
+                 cur += 7)
+                best = cur;
+        }
+        if (best) {
+            snprintf(mline, sizeof(mline), "%s", best);
+            got_motion = true;
+        }
+    }
+    XWT_CHECK(got_motion, "X11 client received pointer motion");
+    if (got_motion) {
+        int rx = -9999, ry = -9999;
+        sscanf(mline, "MOTION %d,%d", &rx, &ry);
+        XWT_CHECK(rx >= 0 && rx < w->w && ry >= 0 && ry < w->h,
+                  "motion is window-local: got (%d,%d), want within "
+                  "(0,0..%d,%d) [global was (%d,%d)]",
+                  rx, ry, w->w, w->h, mx, my);
+    }
+    {
+        char buf[8192];
+        bool got_btn = false;
+        if (log_read(c.logpath, buf, sizeof(buf)))
+            got_btn = strstr(buf, "BTN d") != NULL;
+        XWT_CHECK(got_btn, "X11 client received the button press");
+    }
+
+    /* --- render truth: pixels appear at the model rect ---
+     * draw a distinctive color and scan the output for its bbox.
+     * This is the frozen-content regression: with the frame-callback
+     * lifecycle broken (surface->mapped never set), Xwayland
+     * presented exactly ONE frame and then waited forever — the
+     * physical white/invisible windows. */
+    proc_cmd(&c, "draw 0x00CC66\n");
+    XWT_ASSERT(client_wait(t, &c, "DREW", 400));
+
+    int pw = 0, ph = 0;
+    const uint32_t *pix = xw_compositor_output_pixels(t->comp, 0, &pw, &ph);
+    XWT_ASSERT(pix);
+    int bx = 0, by = 0, bbw = 0, bbh = 0;
+    bool found = false;
+    for (int i = 0; i < 300 && !(found = color_bbox(pix, pw, ph, 0x00CC66,
+                                                    &bx, &by, &bbw, &bbh));
+         i++) {
+        xwt_pump(t);
+        pix = xw_compositor_output_pixels(t->comp, 0, &pw, &ph);
+    }
+    XWT_CHECK(found, "client color composited on the output");
+    if (found) {
+        /* the fill-color bbox is the INTERIOR: the X border ring is
+         * painted with the window's border pixel, not the fill — the
+         * interior of the model rect is inset by the X border width */
+        int ix = w->x + gbw, iy = w->y + gbw;
+        int iw2 = w->w - 2 * gbw, ih2 = w->h - 2 * gbw;
+        XWT_CHECK(bx == ix && by == iy,
+                  "render bbox origin == model interior origin: (%d,%d) vs "
+                  "(%d,%d) [model +%d+%d bw %d]", bx, by, ix, iy, w->x,
+                  w->y, gbw);
+        XWT_CHECK(bbw == iw2 && bbh == ih2,
+                  "render bbox size == model interior size: %dx%d vs %dx%d "
+                  "[model %dx%d bw %d]", bbw, bbh, iw2, ih2, w->w, w->h,
+                  gbw);
+    }
+
+    /* --- fullscreen: model == output rect, pixels fill edge-to-edge,
+     * X side sees the same extent (no gap, no offset) --- */
+    struct xw_output *o = w->output;
+    long fbase = log_size_of(c.logpath);
+    xw_wm_fullscreen(t->comp->wm, w, true);
+    /* the fs resize reaches X as a ConfigureNotify (the mirror) */
+    XWT_ASSERT(client_wait_from(t, &c, "CONFIGURE", fbase, 400));
+    for (int i = 0; i < 100; i++)
+        xwt_pump(t);
+    long fbase1 = log_size_of(c.logpath);
+    proc_cmd(&c, "draw 0x66CC00\n");
+    XWT_ASSERT(client_wait_from(t, &c, "DREW", fbase1, 400));
+    for (int i = 0; i < 300; i++) {
+        xwt_pump(t);
+        usleep(2 * 1000);
+    }
+    XWT_CHECK(w->fullscreen && w->w == o->width && w->h == o->height &&
+              w->x == o->x && w->y == o->y,
+              "fullscreen model == output rect: %dx%d+%d+%d (output "
+              "%dx%d+%d+%d)", w->w, w->h, w->x, w->y,
+              o->width, o->height, o->x, o->y);
+    pix = xw_compositor_output_pixels(t->comp, 0, &pw, &ph);
+    {
+        int m = 2;
+        int want = 0x66CC00;
+        int c00 = pix[m * pw + m] & 0xffffff;
+        int c10 = pix[m * pw + (pw - m - 1)] & 0xffffff;
+        int c01 = pix[(ph - m - 1) * pw + m] & 0xffffff;
+        int c11 = pix[(ph - m - 1) * pw + (pw - m - 1)] & 0xffffff;
+        XWT_CHECK(c00 == want && c10 == want && c01 == want && c11 == want,
+                  "fullscreen fills all four corners: %06x %06x %06x "
+                  "%06x (want 66cc00 — no unexplained gap)", c00, c10,
+                  c01, c11);
+    }
+    /* X truth after the fullscreen settle: extent == output rect */
+    for (int i = 0; i < 200; i++)
+        xwt_pump(t);
+    long fbase2 = log_size_of(c.logpath);
+    proc_cmd(&c, "geom\n");
+    have_geom = client_wait_from(t, &c, "GEOM ", fbase2, 100);
+    have_geom = last_log_line_from(&c, "GEOM ", fbase2, gline, sizeof(gline));
+    if (have_geom && parse_geom_line(gline, &gw, &gh, &gx, &gy, &gbw)) {
+        XWT_CHECK(gx - gbw == o->x && gy - gbw == o->y &&
+                  gw + 2 * gbw == o->width && gh + 2 * gbw == o->height,
+                  "fullscreen X extent == output rect: X %dx%d+%d+%d bw "
+                  "%d (extent %dx%d+%d+%d) vs output %dx%d+%d+%d",
+                  gw, gh, gx, gy, gbw, gw + 2 * gbw, gh + 2 * gbw,
+                  gx - gbw, gy - gbw, o->width, o->height, o->x, o->y);
+    }
+
+    /* --- granted resize: the granted rect survives the round trip ---
+     * interactive resize to a new size, then the client redraws; the
+     * model must equal what was granted (buffer adoption may not
+     * clobber it), and X truth must follow. */
+    xw_wm_fullscreen(t->comp->wm, w, false);
+    for (int i = 0; i < 200; i++)
+        xwt_pump(t);
+    int target_w = 360, target_h = 240;
+    xw_wm_interactive_begin_resize(t->comp->wm, w, XW_EDGE_R | XW_EDGE_B,
+                                   w->x + w->w, w->y + w->h);
+    xw_wm_interactive_motion(t->comp->wm, w, w->x + target_w,
+                             w->y + target_h);
+    for (int i = 0; i < 50; i++)
+        xwt_pump(t);
+    XWT_CHECK(w->w == target_w && w->h == target_h,
+              "interactive resize granted %dx%d: model %dx%d", target_w,
+              target_h, w->w, w->h);
+    long rbase = log_size_of(c.logpath);
+    proc_cmd(&c, "draw 0x3366CC\n");
+    XWT_ASSERT(client_wait_from(t, &c, "DREW", rbase, 400));
+    for (int i = 0; i < 300; i++) {
+        xwt_pump(t);
+        usleep(2 * 1000);
+    }
+    XWT_CHECK(w->w == target_w && w->h == target_h,
+              "granted geometry stable after the client redraw: model "
+              "%dx%d (granted %dx%d)", w->w, w->h, target_w, target_h);
+    long rbase2 = log_size_of(c.logpath);
+    proc_cmd(&c, "geom\n");
+    have_geom = client_wait_from(t, &c, "GEOM ", rbase2, 100);
+    have_geom = last_log_line_from(&c, "GEOM ", rbase2, gline, sizeof(gline));
+    if (have_geom && parse_geom_line(gline, &gw, &gh, &gx, &gy, &gbw)) {
+        XWT_CHECK(gw + 2 * gbw == target_w && gh + 2 * gbw == target_h,
+                  "X extent == granted size after resize: X %dx%d bw %d "
+                  "(extent %dx%d) vs granted %dx%d", gw, gh, gbw,
+                  gw + 2 * gbw, gh + 2 * gbw, target_w, target_h);
+        XWT_CHECK(gx - gbw == w->x && gy - gbw == w->y,
+                  "X position == granted position: +%d+%d vs model "
+                  "+%d+%d", gx - gbw, gy - gbw, w->x, w->y);
+    }
+
+    proc_cmd(&c, "exit\n");
+    usleep(150 * 1000);
+    for (int i = 0; i < 100; i++)
+        xwt_pump(t);
+    proc_close(&c);
+    stack_down(t, &s);
+}
+
 static const struct xwt_test tests[] = {
     {"xwm-configure-mask", test_xwm_configure_mask},
     {"xwm-identity", test_xwm_identity},
@@ -1021,6 +1403,7 @@ static const struct xwt_test tests[] = {
     {"xwm-close-delete", test_xwm_close_delete},
     {"xwm-close-kill", test_xwm_close_kill},
     {"xwm-fullscreen", test_xwm_fullscreen},
+    {"xwm-geometry-truth", test_xwm_geometry_truth},
     {"xwm-teardown", test_xwm_teardown},
     {"xwm-xterm-real", test_xwm_xterm_real},
 };

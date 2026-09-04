@@ -324,6 +324,23 @@ void xw_surface_get_pos(struct xw_surface *s, int *x, int *y, int *w, int *h) {
         if (y) *y = win->y;
         if (w) *w = win->w;
         if (h) *h = win->h;
+    } else if (s->role == XW_SURFACE_ROLE_XWAYLAND && s->role_data) {
+        /* THE CANONICAL RECT: xwayland surfaces report the managed
+         * window's model rect, exactly like xdg toplevels. Before the
+         * 2026-09-05 geometry round this branch was missing and every
+         * XWayland surface reported (0,0)+buffer-size: rendering used
+         * the model while hit-testing, pointer-event translation and
+         * damage used the phantom origin — the grab/hit offset, the
+         * clicks landing in the wrong window, X11 clients receiving
+         * GLOBAL pointer coordinates (every widget hit-test off by
+         * the window position — "the app is non-functional"), and
+         * damage rects at the top-left of the layout. One rect, four
+         * consumers: render, hit-test, pointer translation, damage. */
+        struct xw_window *win = s->role_data;
+        if (x) *x = win->x;
+        if (y) *y = win->y;
+        if (w) *w = win->w;
+        if (h) *h = win->h;
     } else if (s->role == XW_SURFACE_ROLE_XDG_POPUP && s->role_data) {
         struct xw_popup *p = s->role_data;
         if (x) *x = p->anchor_x;

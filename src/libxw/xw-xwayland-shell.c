@@ -364,8 +364,21 @@ static void wc_set_geometry(struct wl_client *client,
         return; /* OR geometry flows through set_override_redirect */
     if (width <= 0 || height <= 0)
         return;
-    if (w->x == x && w->y == y && w->w == width && w->h == height)
+    if (w->fullscreen || w->maximized) {
+        /* the state rect is authoritative while state-held: an X-side
+         * geometry push that disagrees (e.g. a fixed-size client
+         * re-asking for its own size) must not clobber the granted
+         * rect — the compositor re-asserts it instead */
+        xw_wm_trace_geometry(w, "x-adopt-blocked");
+        w->xw_geom_pending = false; /* the echo landed; state still wins */
+        xw_xwayland_notify_geometry(w);
+        return;
+    }
+    if (w->x == x && w->y == y && w->w == width && w->h == height) {
+        w->xw_geom_pending = false; /* the grant echoed back */
         return; /* converged — no damage churn */
+    }
+    w->xw_geom_pending = false; /* X truth supersedes any in-flight grant */
     if (w->mapped) {
         xw_wm_damage_window(c->wm, w);
         w->x = x;
@@ -380,6 +393,7 @@ static void wc_set_geometry(struct wl_client *client,
         w->w = width;
         w->h = height;
     }
+    xw_wm_trace_geometry(w, "x-adopt-geom");
     xw_log(XW_LOG_INFO,
            "xwayland: window %u adopted X geometry %dx%d+%d+%d (extent)",
            w->id, width, height, x, y);
@@ -495,6 +509,10 @@ void xw_xwayland_notify_geometry(struct xw_window *w) {
         return; /* X owns popup geometry; mirroring would fight it */
     if (w->w <= 0 || w->h <= 0)
         return; /* not mapped yet: nothing meaningful to mirror */
+    /* mark the grant as in flight: until the X window echoes this
+     * geometry (set_geometry) or commits a buffer of this size, older
+     * commits are stale pre-grant state, not client truth */
+    w->xw_geom_pending = true;
     struct xw_wc_manager *m;
     wl_list_for_each(m, &w->comp->wc_managers, link) {
         xw_window_control_manager_v1_send_geometry(
@@ -609,6 +627,7 @@ void xw_xwayland_role_commit(struct xw_surface *s) {
                 w->w = bw;
                 w->h = bh;
             }
+            xw_wm_trace_geometry(w, "xwl-commit-map");
             if (w->xw_override_redirect) {
                 /* popup-class X11 window: X owns geometry, no managed
                  * toplevel flow (no rules/cascade/taskbar/focus) */
@@ -630,13 +649,38 @@ void xw_xwayland_role_commit(struct xw_surface *s) {
                 }
             }
         } else if (w->w != bw || w->h != bh) {
-            xw_wm_damage_window(c->wm, w);
-            w->w = bw;
-            w->h = bh;
-            xw_wm_damage_window(c->wm, w);
-            if (!w->xw_override_redirect) {
-                xw_foreign_toplevel_notify(c, w);
+            xw_wm_trace_geometry(w, "xwl-commit-size");
+            if (w->fullscreen || w->maximized) {
+                /* state rect is authoritative: a stale-size commit
+                 * (the client has not redrawn into the granted rect
+                 * yet) must NOT clobber the model. Re-assert the
+                 * granted geometry to the X side instead — the
+                 * helper's loop guard makes repeated re-asserts
+                 * no-ops. Adopting here was the fullscreen-gap and
+                 * resize-revert bug: model -> stale size -> mirror
+                 * pushes stale size -> X client reverts its resize. */
                 xw_xwayland_notify_geometry(w);
+            } else if (w->xw_geom_pending && bw != w->w && bh != w->h) {
+                /* granted-vs-committed: a grant is in flight and this
+                 * commit carries a different (older) size — stale
+                 * pre-grant state (e.g. the resize-cleared backing of
+                 * the PREVIOUS geometry still presenting). Keep the
+                 * granted model; the echo will land as set_geometry
+                 * or as a matching commit. */
+                xw_log(XW_LOG_DEBUG,
+                       "xwayland: window %u commit %dx%d ignored "
+                       "(grant %dx%d in flight)", w->id, bw, bh, w->w,
+                       w->h);
+            } else {
+                w->xw_geom_pending = false;
+                xw_wm_damage_window(c->wm, w);
+                w->w = bw;
+                w->h = bh;
+                xw_wm_damage_window(c->wm, w);
+                if (!w->xw_override_redirect) {
+                    xw_foreign_toplevel_notify(c, w);
+                    xw_xwayland_notify_geometry(w);
+                }
             }
         }
         xw_subsurface_parent_committed(s);

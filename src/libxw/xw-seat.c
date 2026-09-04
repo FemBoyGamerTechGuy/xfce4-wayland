@@ -797,7 +797,6 @@ void xw_seat_pointer_motion(struct xw_seat *s, int x, int y) {
     s->cursor_x = x;
     s->cursor_y = y;
     xw_idle_activity(s);
-
     if (s->drag.active && !xw_session_lock_active(c)) {
         xw_data_device_drag_motion(c, s, x, y);
         damage_cursor(c, old_x, old_y);
@@ -824,6 +823,11 @@ void xw_seat_pointer_motion(struct xw_seat *s, int x, int y) {
         struct wl_resource *p;
         int sx = 0, sy = 0;
         xw_surface_get_pos(s->ptr_focus, &sx, &sy, NULL, NULL);
+        if (getenv("XW_GEOMETRY_TRACE"))
+            fprintf(stderr,
+                    "[geom] motion      global (%d,%d) -> surface-local "
+                    "(%d,%d) [origin %d,%d]\n",
+                    x, y, x - sx, y - sy, sx, sy);
         PTR_FOR_EACH(s->ptr_focus, p) {
             wl_pointer_send_motion(p, (uint32_t)xw_now_ms(),
                                    wl_fixed_from_int(x - sx),

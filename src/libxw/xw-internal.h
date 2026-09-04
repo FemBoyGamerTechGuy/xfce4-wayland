@@ -508,6 +508,16 @@ struct xw_window {
      * placed one, exactly as if the request had arrived one moment
      * later. 0 = none, 1 = enter, 2 = leave. */
     uint8_t xw_fs_pending;
+
+    /* a geometry grant we pushed to the X side (notify_geometry) that
+     * the X window has not echoed back yet (set_geometry / a
+     * matching commit). While set, buffer commits carrying the OLD
+     * size are in-flight stale state from before the grant and must
+     * NOT be adopted into the model — the granted-vs-committed
+     * distinction: "compositor granted 360x240" is not "client
+     * committed 360x240". The unfullscreen+resize race that rewound
+     * live resizes lived exactly here. */
+    bool xw_geom_pending;
 };
 
 enum { XW_EDGE_L = 1, XW_EDGE_R = 2, XW_EDGE_T = 4, XW_EDGE_B = 8 };
@@ -566,6 +576,11 @@ void xw_wm_tile(struct xw_wm *wm, struct xw_window *w, int edges);
 void xw_wm_center(struct xw_wm *wm, struct xw_window *w);
 
 void xw_wm_update_window_output(struct xw_wm *wm, struct xw_window *w);
+/* canonical geometry instrumentation (stderr, gated by XW_GEOMETRY_TRACE):
+ * one line with every coordinate space of a window; the pick trace shows
+ * what the wm's hit-test resolves for a global point */
+void xw_wm_trace_geometry(const struct xw_window *w, const char *tag);
+void xw_wm_trace_pick(struct xw_wm *wm, int px, int py);
 /* visible = mapped && !minimized && (sticky or on current workspace) */
 bool xw_wm_window_visible(struct xw_wm *wm, struct xw_window *w);
 struct xw_window *xw_wm_window_at(struct xw_wm *wm, int x, int y,

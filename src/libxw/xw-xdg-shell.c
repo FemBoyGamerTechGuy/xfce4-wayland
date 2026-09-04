@@ -1071,15 +1071,28 @@ static void toplevel_apply_commit(struct xw_surface *s) {
         return;
 
     if (!w->mapped) {
-        w->w = bw;
-        w->h = bh;
+        /* state windows map at their state rect (window_map sets it);
+         * the buffer size never overrides a granted rect */
+        if (!w->fullscreen && !w->maximized) {
+            w->w = bw;
+            w->h = bh;
+        }
+        xw_wm_trace_geometry(w, "xdg-commit-map");
         xw_wm_window_map(c->wm, w);
     } else if (w->w != bw || w->h != bh) {
-        xw_wm_damage_window(c->wm, w);
-        w->w = bw;
-        w->h = bh;
-        xw_wm_damage_window(c->wm, w);
-        xw_foreign_toplevel_notify(c, w);
+        xw_wm_trace_geometry(w, "xdg-commit-size");
+        if (w->fullscreen || w->maximized) {
+            /* stale-size commit while state-held: keep the granted
+             * rect and re-assert it (the client will redraw into it;
+             * adopting here reverts maximize/fullscreen) */
+            xw_xdg_send_configure(w);
+        } else {
+            xw_wm_damage_window(c->wm, w);
+            w->w = bw;
+            w->h = bh;
+            xw_wm_damage_window(c->wm, w);
+            xw_foreign_toplevel_notify(c, w);
+        }
     }
 }
 

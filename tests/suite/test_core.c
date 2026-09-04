@@ -1,6 +1,8 @@
 /* test_core.c — lifecycle, windows, rendering, input, shortcuts. */
 #include "xwtest.h"
 
+#include <unistd.h>
+
 /* ------------------------------------------------------------- lifecycle */
 
 static void test_lifecycle(struct xwt_ctx *t) {
@@ -53,6 +55,132 @@ static bool server_window_ready(struct xwt_ctx *t) {
         return false;
     struct xw_window *w = wl_container_of(wm->windows.next, w, link);
     return w->mapped && w->surface && w->surface->shm;
+}
+
+static void frame_done_cb(void *data, struct wl_callback *cb,
+                           uint32_t callback_data) {
+    (void)callback_data;
+    *(int *)data += 1;
+    wl_callback_destroy(cb);
+}
+
+
+/* --------------------------------------------------------- geometry ---- */
+
+/* THE native-window twin of the X11 geometry battery (2026-09-05):
+ * the same three coordinate agreements for a native Wayland window —
+ * hit-test == render rect, pointer events window-local, pixels at the
+ * model rect — plus fullscreen pixel coverage and the frame-callback
+ * liveness that every frame-clocked client (GTK's frame clock,
+ * Xwayland's present path) depends on. */
+static void test_geometry_native(struct xwt_ctx *t) {
+    uint32_t color = 0xff9a3c2e;
+    struct xwc_win *win = xwt_window_solid(t, color, 320, 220, "GeoN");
+    XWT_ASSERT(win);
+    XWT_WAIT(t, xw_compositor_window_count(t->comp) == 1);
+    struct xw_wm *wm = t->comp->wm;
+    struct xw_window *w = wl_container_of(wm->windows.next, w, link);
+    XWT_WAIT(t, w->mapped);
+
+    /* hit-test: model rect center + 4 inner corners */
+    int hits = 0;
+    for (int i = 0; i < 5; i++) {
+        int px = (i & 1) ? (w->x + w->w - 3) : (w->x + 2);
+        int py = (i & 2) ? (w->y + w->h - 3) : (w->y + 2);
+        if (i == 4) {
+            px = w->x + w->w / 2;
+            py = w->y + w->h / 2;
+        }
+        if (xw_wm_window_at(wm, px, py, NULL) == w)
+            hits++;
+    }
+    XWT_CHECK(hits == 5, "hit-test covers the model rect: %d/5 at "
+              "%dx%d+%d+%d", hits, w->w, w->h, w->x, w->y);
+
+    /* pixels: bbox of the window color == model rect (no border for
+     * native full-buffer fills) */
+    for (int i = 0; i < 100; i++)
+        xwt_pump(t);
+    int pw = 0, ph = 0;
+    const uint32_t *pix = xw_compositor_output_pixels(t->comp, 0, &pw, &ph);
+    XWT_ASSERT(pix);
+    int x0 = pw, y0 = ph, x1 = -1, y1 = -1;
+    for (int y = 0; y < ph; y++)
+        for (int x = 0; x < pw; x++)
+            if ((pix[y * pw + x] & 0xffffff) == (color & 0xffffff)) {
+                if (x < x0) x0 = x;
+                if (y < y0) y0 = y;
+                if (x > x1) x1 = x;
+                if (y > y1) y1 = y;
+            }
+    XWT_CHECK(x1 >= x0 && x0 == w->x && y0 == w->y &&
+              x1 - x0 + 1 == w->w && y1 - y0 + 1 == w->h,
+              "render bbox == model rect: (%d,%d %dx%d) vs model "
+              "(%d,%d %dx%d)", x0, y0, x1 - x0 + 1, y1 - y0 + 1,
+              w->x, w->y, w->w, w->h);
+
+    /* pointer events are window-local: the toolkit's surface-local
+     * position after injection at the model center must be the
+     * model-relative point */
+    t->client.ptr_x = -9999;
+    t->client.ptr_y = -9999;
+    int mx = w->x + w->w / 2, my = w->y + w->h / 2;
+    xw_compositor_inject_pointer_motion(t->comp, mx, my);
+    XWT_WAIT(t, t->client.ptr_x != -9999);
+    XWT_CHECK(t->client.ptr_x == mx - w->x && t->client.ptr_y == my - w->y,
+              "pointer position is window-local: client (%d,%d), want "
+              "(%d,%d)", t->client.ptr_x, t->client.ptr_y, mx - w->x,
+              my - w->y);
+
+    /* fullscreen: model == output rect AND pixels fill edge-to-edge
+     * (the client redraws into the granted size; no gap may remain) */
+    struct xw_output *o = w->output;
+    xw_wm_fullscreen(wm, w, true);
+    bool sized = false;
+    for (int i = 0; i < 200 &&
+                    !(sized = (w->w == o->width && w->h == o->height));
+         i++) {
+        xwt_pump(t);
+        usleep(5 * 1000);
+    }
+    XWT_CHECK(sized, "fullscreen model == output rect");
+    bool filled = false;
+    for (int i = 0; i < 300 && !filled; i++) {
+        xwt_pump(t);
+        usleep(5 * 1000);
+        pix = xw_compositor_output_pixels(t->comp, 0, &pw, &ph);
+        int m = 2;
+        filled = (pix[m * pw + m] & 0xffffff) == (color & 0xffffff) &&
+                 (pix[m * pw + (pw - m - 1)] & 0xffffff) ==
+                     (color & 0xffffff) &&
+                 (pix[(ph - m - 1) * pw + m] & 0xffffff) ==
+                     (color & 0xffffff) &&
+                 (pix[(ph - m - 1) * pw + (pw - m - 1)] & 0xffffff) ==
+                     (color & 0xffffff);
+    }
+    XWT_CHECK(filled, "fullscreen fills all four corners (no gap)");
+
+    /* frame-callback liveness: a MAPPED toplevel's wl_callback MUST
+     * fire on the next repaint. This is the native twin of the
+     * Xwayland frozen-content bug: deliver_frame_callbacks skipped
+     * unmapped surfaces and nothing ever set surface->mapped for
+     * toplevels — every frame-clocked client presented one frame and
+     * stopped. */
+    static int frames_done;
+    frames_done = 0;
+    struct wl_surface *wsurf = xwc_win_surface(win);
+    struct wl_callback *cb = wl_surface_frame(wsurf);
+    static const struct wl_callback_listener fl = {
+        .done = frame_done_cb,
+    };
+    wl_callback_add_listener(cb, &fl, &frames_done);
+    wl_surface_commit(wsurf);
+    XWT_WAIT(t, frames_done > 0);
+    XWT_CHECK(frames_done > 0, "frame callback delivered on repaint");
+
+    xw_wm_fullscreen(wm, w, false);
+    for (int i = 0; i < 200; i++)
+        xwt_pump(t);
 }
 
 static void test_render_pixels(struct xwt_ctx *t) {
@@ -336,6 +464,7 @@ static const struct xwt_test tests[] = {
     {"multi-output-info", test_multi_output},
     {"window-map", test_window_map},
     {"render-pixels", test_render_pixels},
+    {"geometry-native", test_geometry_native},
     {"workspace-switch", test_workspace_switch},
     {"shortcut-close", test_shortcut_table},
     {"shortcut-suppression", test_shortcut_release_suppression},

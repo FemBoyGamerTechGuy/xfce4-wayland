@@ -115,13 +115,17 @@ struct xw_win {
      * make us reconfigure identical geometry forever) */
     int32_t last_x, last_y, last_w, last_h;
     bool have_last_geom;
-    /* geometry from CreateNotify/ConfigureNotify (X truth). x/y/w/h
-     * are the X11 INTERIOR geometry (root coordinates); bw is the
-     * border width — the wl_surface extent Xwayland sizes its
-     * buffers to is interior + 2*bw, and the extent origin sits at
-     * (x - bw, y - bw). Every conversion between compositor window
-     * geometry (extent space) and X11 geometry (interior space) goes
-     * through bw. */
+    /* geometry from CreateNotify/ConfigureNotify (X truth). x/y are
+     * the window's OUTER origin in root coordinates (what
+     * XGetGeometry/ConfigureWindow speak — the border is INSIDE this
+     * origin); w/h are the INTERIOR size (X reports the drawable
+     * size, border excluded); bw is the border width. The wl_surface
+     * extent Xwayland sizes its buffers to is w + 2*bw by h + 2*bw,
+     * anchored at (x, y) — i.e. THE EXTENT RECT IS (x, y, w+2bw,
+     * h+2bw) with no offset. Compositor model == extent: positions
+     * are identity across the mirror, only SIZES convert by 2*bw.
+     * (The 2026-09-05 round found the position math adding +bw here
+     * — every mirror round shifted X11 windows 1px off the model.) */
     int32_t x, y, w, h;
     int32_t bw;
     /* Xwayland surface-space calibration, MEASURED per window: does
@@ -1033,11 +1037,13 @@ static int32_t surf_to_interior(struct xw_win *w, int32_t v) {
     return w->surf_mode == 2 ? v : v - 2 * (w->bw > 0 ? w->bw : 0);
 }
 
-/* compositor(surface) origin -> X11 window position: for
- * extent-space windows the interior origin sits bw inside the
- * surface; interior-space windows put the window right at it */
+/* compositor(extent) origin -> X11 window position: IDENTITY. The X
+ * window's outer origin IS the extent origin (the border is drawn
+ * inside it); the pre-fix code added +bw here, shifting every
+ * mirrored window 1*bw off the compositor model per round. */
 static int32_t surf_to_pos(struct xw_win *w, int32_t v) {
-    return w->surf_mode == 2 ? v : v + (w->bw > 0 ? w->bw : 0);
+    (void)w;
+    return v;
 }
 
 /* X11 interior -> compositor(surface) space (for the set_geometry
@@ -1048,7 +1054,8 @@ static int32_t interior_to_surf(struct xw_win *w, int32_t v) {
 }
 
 static int32_t interior_pos_to_surf(struct xw_win *w, int32_t v) {
-    return w->surf_mode == 2 ? v : v - (w->bw > 0 ? w->bw : 0);
+    (void)w;
+    return v;
 }
 
 /* ------------------------------------------------ EWMH fullscreen state */
@@ -1142,10 +1149,11 @@ static void win_send_identity(struct xw_win *w) {
         wc, (uint32_t)(w->serial >> 32), (uint32_t)w->serial, w->min_w,
         w->min_h, w->max_w, w->max_h, w->inc_w, w->inc_h);
     if (w->override)
-        /* extent space: Xwayland's surface covers interior + border */
+        /* extent space: the surface covers interior + border, anchored
+         * at the window's OUTER origin == X (x, y) directly */
         xw_window_control_manager_v1_set_override_redirect(
             wc, (uint32_t)(w->serial >> 32), (uint32_t)w->serial,
-            w->x - w->bw, w->y - w->bw, w->w + 2 * w->bw, w->h + 2 * w->bw);
+            w->x, w->y, w->w + 2 * w->bw, w->h + 2 * w->bw);
 }
 
 /* apply compositor focus to the X side; remember it when the serial
@@ -1273,11 +1281,11 @@ void xwm_handle_event(const uint8_t *ev) {
                 if (have_w) wi->w = wq;
                 if (have_h) wi->h = hq;
                 if (wi->serial && wc)
-                    /* extent space: Xwayland's surface covers the
-                     * border too */
+                    /* extent space: surface covers interior + border,
+                     * anchored at the outer origin == X (x, y) */
                     xw_window_control_manager_v1_set_override_redirect(
                         wc, (uint32_t)(wi->serial >> 32),
-                        (uint32_t)wi->serial, wi->x - wi->bw, wi->y - wi->bw,
+                        (uint32_t)wi->serial, wi->x, wi->y,
                         wi->w + 2 * wi->bw, wi->h + 2 * wi->bw);
             }
             return;
@@ -1486,11 +1494,11 @@ void xwm_handle_event(const uint8_t *ev) {
         if (w->override && w->serial && wc) {
             XWM_LOG("info", "override-redirect 0x%x moved to %dx%d+%d+%d",
                     window, w->w, w->h, w->x, w->y);
-            /* extent space: Xwayland's surface covers interior+border */
+            /* extent space: surface covers interior+border, anchored
+             * at the outer origin == X (x, y) */
             xw_window_control_manager_v1_set_override_redirect(
                 wc, (uint32_t)(w->serial >> 32), (uint32_t)w->serial,
-                w->x - w->bw, w->y - w->bw, w->w + 2 * w->bw,
-                w->h + 2 * w->bw);
+                w->x, w->y, w->w + 2 * w->bw, w->h + 2 * w->bw);
         }
         break;
     }

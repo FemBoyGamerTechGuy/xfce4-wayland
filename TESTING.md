@@ -61,7 +61,11 @@ absent rather than half-working.
   input injections.
 - `tests/harness/client.c` — shared helpers for the in-process test
   client (solid-color windows).
-- `tests/suite/test_core.c` — core, WM, input/shortcut suite.
+- `tests/suite/test_core.c` — core, WM, input/shortcut suite,
+  including the native geometry battery (hit-test == model rect,
+  render bbox == model, pointer position window-local, fullscreen
+  pixel coverage, frame-callback liveness on a mapped toplevel —
+  the native twin of the Xwayland frozen-content bug).
 - `tests/suite/test_protocols.c` — desktop-integration protocol suite
   (layer-shell, popups, clipboard, foreign-toplevel, activation); raw
   Wayland objects are driven directly next to white-box assertions.
@@ -100,8 +104,15 @@ absent rather than half-working.
   _NET_WM_STATE message and map-time property: state + geometry +
   ConfigureNotify delivery + the WM-synced property), helper
   teardown, the real xterm's two-phase
-  resize, and the extent-vs-interior border model (the compositor
-  models interior + 2*border; the helper converts). Skips (counted,
+  resize, the extent-vs-interior border model (the compositor
+  models interior + 2*border; the helper converts), and the
+  **geometry-truth battery**: compositor model == X extent, hit-test
+  == render rect (center + 4 corners, no phantom input rect),
+  pointer events WINDOW-LOCAL in X, real pixels composited at the
+  model rect, fullscreen model == X extent == pixel corners (no
+  gap), and granted resizes stable across the client redraw (the
+  granted-vs-committed distinction). The x11client reports GEOM /
+  MOTION / BTN / ENTER with real Xlib truth. Skips (counted,
   not silent) when .apps-root is not populated.
 - `tests/suite/test_backends.c` — nested backend coverage: a real
   compositor (B, nested) running inside another real compositor (A,
@@ -216,7 +227,7 @@ requires a running udev instance; run
 what was verified (device, kernel, distro) in WORKLOG.md — that is
 what keeps "verified at Level 3" honest.
 
-## What is covered today (123 Level-1 tests + 144 Level-2 checks + 50-59 build-regression checks)
+## What is covered today (125 Level-1 tests + 144 Level-2 checks + 50-59 build-regression checks)
 
 The nested-session regression (session 5 below) is the reason several
 of these numbers exist: an invisible panel that looked like a working
@@ -508,6 +519,19 @@ speaks no X11 protocol — names would need an X property reader in
 xw-xwm); fullscreen X11 windows track the compositor geometry, not
 per-output modes.
 
+The 2026-09-05 geometry round adds the strongest headless coverage
+available for this checklist (`xwm-geometry-truth` + the
+`XW_GEOMETRY_TRACE=1` instrument): model == X extent, hit-test ==
+render rect, window-local pointer delivery, real pixels at the
+model rect, fullscreen corner coverage, granted-resize stability —
+all against REAL Xwayland + the real helper + a real Xlib client.
+What remains manual is exactly the physical part: real-hand drags,
+real menu interaction (Mirage-class apps), real selection in
+xterm. Set `XW_GEOMETRY_TRACE=1` in the session environment to get
+the per-window geometry line on stderr while testing by hand; when
+something looks off, that line answers "which coordinate space was
+wrong" without guessing.
+
 ### Manual real-client checklist (native Wayland applications)
 
 With `.apps-root` fetched (`scripts/fetch-test-apps.sh`) or foot/
@@ -532,6 +556,20 @@ workspace switches, closing it works; native apps still work
 afterward. Then the deliberately slow app (xw-demo --delay-ms 5000
 from a terminal): the session must never log a launch error or
 restart the compositor while it has not mapped yet.
+
+The 2026-09-05 round adds the geometry acceptance sequence to the
+same physical pass (each item is what the headless battery pins;
+the physical run is the final authority): app content appears at
+the location the window frame occupies; clicking anywhere in a
+window hits THAT window (not a neighbor, not the desktop); the
+grabbed window stays under the pointer during a whole drag; resize
+from any edge/corner lands the granted size; maximize and
+fullscreen fill the usable area / the output with no gap on any
+side; X11 and native windows agree on all of the above; a
+frame-clocked app (any GTK app, xterm with blinking cursor) keeps
+repainting indefinitely (the pre-fix freeze stopped after one
+frame — with `XW_GEOMETRY_TRACE=1` the compositor's `[geom]` lines
+and the helper's mirroring lines can be compared live).
 
 ## Regression policy
 
@@ -687,6 +725,42 @@ Highlights (each verifiable by reverting the fix):
   keeps the property in sync (regressed by `xwm-fullscreen` for both
   EWMH paths and the wmctrl/xeyes/xprop checks in
   scripts/test-realapps.sh)**
+- **XWayland surfaces had NO position in the canonical geometry
+  function: `xw_surface_get_pos` fell through to (0,0)+buffer-size
+  for the XWAYLAND role while rendering used the window model, so
+  hit-testing, pointer-event translation and damage used a phantom
+  rect at the layout origin — clicks landed on the wrong window or
+  nowhere, X11 clients received GLOBAL pointer coordinates (every
+  widget hit-test off by the window position), and Xwayland got no
+  pointer enter at all (the X pointer never moved: nothing
+  interactive). The XWAYLAND branch now returns the model rect —
+  one rect for render, hit-test, pointer translation and damage
+  (regressed by `xwm-geometry-truth`: 5-point hit battery +
+  phantom-rect denial + window-local MOTION/BTN checks)**
+- **frame callbacks were never delivered to toplevel surfaces:
+  `deliver_frame_callbacks` skips unmapped surfaces and nothing set
+  `surface->mapped` for xdg/XWAYLAND roles — Xwayland 24.1 (and any
+  frame-clocked native client) presents its next frame only after
+  the previous wl_callback fires, so every X11 window presented
+  exactly one frame and froze: the white/invisible-window symptom.
+  The map/unmap funnel maintains the bit now (regressed by
+  `geometry-native`'s frame-callback liveness check AND
+  `xwm-geometry-truth`'s pixel assertions — both verified red with
+  the fix reverted)**
+- **state geometry (fullscreen/maximized) was clobbered by
+  stale-size commits, and grants raced in-flight pre-grant
+  commits: the fullscreen gap and the resizes that "did not
+  reliably produce the geometry the client was granted". While
+  state-held the granted rect is authoritative (mismatched commits
+  re-assert, never adopt); state windows map at their state rect;
+  `xw_geom_pending` distinguishes granted from committed until the
+  X truth echoes back (regressed by the geometry battery's
+  fullscreen corner + resize-stability sections)**
+- **the helper's mirror positions were 1*bw off per round: X
+  window x/y IS the extent origin (the border is inside it), but
+  the conversion added +bw to positions (only sizes convert by
+  2*bw). Positions are identity across the mirror now (regressed
+  by `xwm-geometry-truth`'s model-vs-X-extent equality)**
 - **the XWayland test scaffold leaked the compositor's signalfd
   blocked-signal mask (HUP/INT/TERM/CHLD survive fork AND exec) into
   every spawned child: kill(SIGTERM) silently did nothing and the
