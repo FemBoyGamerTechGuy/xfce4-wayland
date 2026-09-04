@@ -625,6 +625,9 @@ build/tests/x11probe: $(OBJ)/tests/x11probe.o | build/tests
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/x11probe.o $(LDLIBS_X11) $(LDLIBS_XTST) -lm
 
 # nested-X11 regression probe: panel pixels + cursor path (Xvfb)
+build/tests/x11client: $(OBJ)/tests/x11client.o | build/tests
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/x11client.o $(LDLIBS_X11) -lm
+
 build/tests/panelprobe: $(OBJ)/tests/panelprobe.o | build/tests
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/panelprobe.o $(LDLIBS_X11) $(LDLIBS_XTST) -lm
 
@@ -654,6 +657,9 @@ endif
 $(OBJ)/tests/x11probe.o: tests/x11probe.c | $(OBJ)/tests
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(CFLAGS_X11) $(CFLAGS_XTST) -c $< -o $@
 
+$(OBJ)/tests/x11client.o: tests/x11client.c | $(OBJ)/tests
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 $(OBJ)/tests/panelprobe.o: tests/panelprobe.c | $(OBJ)/tests
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(CFLAGS_X11) $(CFLAGS_XTST) -c $< -o $@
 
@@ -682,7 +688,7 @@ all: build/.profile build/.features build/bin/xw-compositor $(SESSION_BINS) $(CL
 	build/tests/run-tests
 ifeq ($(X11_ON),y)
 all: build/tests/x11probe build/tests/panelprobe build/tests/miniwm \
-	build/tests/fdtest2
+	build/tests/fdtest2 build/tests/x11client
 endif
 all: build/tests/mockseatd
 

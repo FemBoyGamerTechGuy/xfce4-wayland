@@ -663,8 +663,8 @@ static void test_direct_no_vt(struct xwt_ctx *t) {
         bool is_vt = ioctl(tty, VT_GETSTATE, &vts) == 0;
         close(tty);
         if (is_vt) {
-            printf("  (skipped: running on a real VT; the direct provider "
-                   "is covered by the manual hardware checklist)\n");
+            XWT_SKIP("running on a real VT; direct provider covered by "
+                     "the manual hardware checklist");
             return;
         }
     }

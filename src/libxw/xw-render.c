@@ -262,6 +262,15 @@ void xw_render_output(struct xw_output *o) {
         render_window(o, w);
     }
 
+    /* 2b. override-redirect X11 windows (menus, tooltips): above all
+     * managed toplevels, below layer-shell top/overlay — same order in
+     * surface_at (hit-testing) so input lands where pixels are */
+    wl_list_for_each_reverse(w, &wm->or_windows, link) {
+        if (!w->mapped)
+            continue;
+        render_window(o, w);
+    }
+
     /* 3. layer-shell top + overlay */
     for (int layer = 2; layer <= 3; layer++) {
         struct xw_layer_surface *ls;

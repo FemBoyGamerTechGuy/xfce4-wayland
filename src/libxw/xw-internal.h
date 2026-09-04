@@ -492,6 +492,14 @@ struct xw_window {
      * session's WM helper uses it to mirror geometry and deliver closes */
     uint64_t xw_serial;
     bool xw_has_serial;
+
+    /* X-side truth pushed through xw_window_control_v1 (v2):
+     * override-redirect windows are popup-class (X-owned geometry,
+     * excluded from taskbar/focus/Alt+Tab; live in wm->or_windows);
+     * the increments are WM_NORMAL_HINTS resize steps (0 = unset).
+     * min/max reuse the xdg hint fields below. */
+    bool xw_override_redirect;
+    int xw_inc_w, xw_inc_h;
 };
 
 enum { XW_EDGE_L = 1, XW_EDGE_R = 2, XW_EDGE_T = 4, XW_EDGE_B = 8 };
@@ -500,6 +508,8 @@ struct xw_wm {
     struct xw_compositor *comp;
     struct wl_list windows; /* all windows incl. unmapped (xw_window.link) */
     struct wl_list stack;   /* stacking order, top first (stack_link) */
+    struct wl_list or_windows; /* override-redirect X11 windows (link):
+                                 popup-class, never focus/taskbar */
 
     int ws_count, ws_current;
     char ws_names[XW_MAX_WS][24];
@@ -528,6 +538,8 @@ void xw_wm_destroy(struct xw_wm *wm);
 void xw_wm_manage_toplevel(struct xw_wm *wm, struct xw_window *w);
 void xw_wm_unmanage(struct xw_wm *wm, struct xw_window *w, bool resources_gone);
 void xw_wm_window_map(struct xw_wm *wm, struct xw_window *w);
+void xw_wm_or_map(struct xw_wm *wm, struct xw_window *w);
+void xw_wm_or_reclassify(struct xw_wm *wm, struct xw_window *w);
 void xw_wm_window_unmap(struct xw_wm *wm, struct xw_window *w);
 
 void xw_wm_focus_window(struct xw_wm *wm, struct xw_window *w, bool activate);
@@ -788,6 +800,11 @@ bool xw_xwayland_window_close(struct xw_window *w);
 /* compositor geometry changed for an Xwayland window: mirror it to the
  * WM helper (no-op for other roles / no serial yet) */
 void xw_xwayland_notify_geometry(struct xw_window *w);
+/* push the compositor keyboard focus to the WM helper (X input focus
+ * routing). Called from the seat's focus funnel; NULL/native surface =
+ * release the X focus. */
+void xw_xwayland_notify_focus(struct xw_compositor *c,
+                               struct xw_surface *focus_surface);
 
 /* ------------------------------------------------------------ compositor */
 
@@ -864,6 +881,12 @@ struct xw_compositor {
     struct wl_list ws_managers;      /* ext workspace managers */
     struct wl_list activation_tokens; /* xw_activation_token.link */
     struct wl_list wc_managers;       /* xw_wc_manager (window control) */
+    struct wl_list xw_pending_idents; /* xw_pending_ident: helper identity
+                                         racing the set_serial arrival */
+    uint64_t xw_focus_serial;        /* last X focus serial pushed to the
+                                        WM helper (dedupe; focus(0) when no
+                                        X window is focused) */
+    bool xw_focus_serial_set;
 
     /* resolved commands for spawn-based actions (actions.conf) */
     char cmd_terminal[256], cmd_appfinder[256], cmd_exit[256], cmd_lock[256];

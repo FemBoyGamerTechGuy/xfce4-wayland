@@ -87,6 +87,19 @@ absent rather than half-working.
   semantics, stacking, both destroy orderings), and the slow-start
   contract (a client that idles between connect and first commit is
   never a failure).
+- `tests/suite/test_xwm.c` — the X11-first-class regressions: a full
+  stack per test (in-process compositor + REAL Xwayland rootless +
+  the real xw-xwm helper), driven by a controllable real X11 client
+  (`build/tests/x11client`, Xlib) and the real xterm. Pins:
+  mask-aware ConfigureRequest parsing (the 3x14 xterm), WM_NAME /
+  WM_CLASS identity over window-control v2, PropertyNotify retitling,
+  X input focus mirroring, WM_TAKE_FOCUS delivery (the SendEvent
+  format-byte bug), override-redirect classification and invariants
+  (X-owned geometry, no taskbar/focus, move refused), WM_DELETE vs
+  destroy fallback, helper teardown, the real xterm's two-phase
+  resize, and the extent-vs-interior border model (the compositor
+  models interior + 2*border; the helper converts). Skips (counted,
+  not silent) when .apps-root is not populated.
 - `tests/suite/test_backends.c` — nested backend coverage: a real
   compositor (B, nested) running inside another real compositor (A,
   headless) in one process. Asserts topology, the present pipeline
@@ -190,7 +203,7 @@ requires a running udev instance; run
 what was verified (device, kernel, distro) in WORKLOG.md — that is
 what keeps "verified at Level 3" honest.
 
-## What is covered today (112 Level-1 tests + 144 Level-2 checks + 50-59 build-regression checks)
+## What is covered today (122 Level-1 tests + 144 Level-2 checks + 50-59 build-regression checks)
 
 The nested-session regression (session 5 below) is the reason several
 of these numbers exist: an invisible panel that looked like a working
@@ -607,3 +620,36 @@ Highlights (each verifiable by reverting the fix):
   present: without all three, X clients connect and render but no
   window ever reaches the compositor (regressed by
   scripts/test-xwayland.sh + scripts/test-realapps.sh)**
+- **the XWM helper's SendEvent set the "generated" bit on the FORMAT
+  byte (32|0x80 = 160): invalid ClientMessage format, BadValue on
+  every delivery — WM_DELETE_WINDOW never reached supporting clients
+  and WM_TAKE_FOCUS apps (the GTK input model) never learned they had
+  focus (regressed by `xwm-close-delete` / `xwm-focus-protocol`)**
+- **the override-redirect byte in CreateNotify was read from offset 24
+  (padding; it sits at 22 — ConfigureNotify's is at 26, its layout
+  differs): popups/menus/tooltips were never classified; additionally
+  classification waited for a buffer commit, leaving undrawn popups
+  as ghosts in the managed list (regressed by
+  `xwm-override-redirect`)**
+- **the helper never selected PropertyChangeMask on managed client
+  windows: terminals retitled themselves and the taskbar never heard
+  (regressed by `xwm-title-change`)**
+- **the geometry mirror confused the wl_surface EXTENT (interior +
+  X border) with the ConfigureWindow INTERIOR: each mirror round grew
+  the window by its own border — a ratchet for every drawn client —
+  and granted resizes never reached the compositor at all for
+  undrawn ones (no set_geometry channel); both directions now
+  convert through the border width (regressed by
+  `xwm-configure-mask`; the real-xterm resize is covered by
+  `xwm-xterm-real`)**
+- **the XWayland test scaffold leaked the compositor's signalfd
+  blocked-signal mask (HUP/INT/TERM/CHLD survive fork AND exec) into
+  every spawned child: kill(SIGTERM) silently did nothing and the
+  suite wedged in wait4(); children now restore default signal state,
+  and xterm requires an absolute argv[0] (regressed by the suite
+  completing at all — test_xwm.c's child_signal_defaults)**
+- **a clean rebuild silently skipped the whole XWayland suite: the
+  x11client probe was not wired into `make all`, and a skip counted
+  as a pass in the summary — the ASan round had 10 invisible skips
+  inside a green "121/121" (the probe is built with `all`, and the
+  summary now reports "(N skipped)")**

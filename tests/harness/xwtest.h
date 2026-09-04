@@ -55,7 +55,15 @@
 
 extern int xwt_failures;
 extern int xwt_tests;
+extern int xwt_skips;
 extern const char *xwt_current;
+
+#define XWT_SKIP(why)                                                      \
+    do {                                                                    \
+        xwt_skips++;                                                        \
+        printf("  SKIP %s: %s\n", xwt_current, why);                         \
+        fflush(stdout);                                                     \
+    } while (0)
 
 #define XWT_CHECK(cond, ...)                                                  \
     do {                                                                      \
@@ -64,6 +72,7 @@ extern const char *xwt_current;
             printf("  FAIL %s:%d: %s — ", xwt_current, __LINE__, #cond);      \
             printf(__VA_ARGS__);                                              \
             printf("\n");                                                     \
+            fflush(stdout);                                                   \
         }                                                                     \
     } while (0)
 

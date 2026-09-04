@@ -268,9 +268,19 @@ done item carries automated coverage noted in [TESTING.md](TESTING.md).
   WM_DELETE_WINDOW delivery via the private xw_window_control_v1
   protocol. Regressions: `scripts/test-xwayland.sh`,
   `scripts/test-realapps.sh`.
-- TODO X11 window titles/app-ids (X property reads in xw-xwm →
-  window-control protocol extension), per-output X mode tracking for
-  fullscreen X11 apps, X11 clipboard bridge.
+- DONE X11 window identity and lifecycle in the one compositor model
+  (window-control v2): WM_NAME/_NET_WM_NAME titles (with
+  PropertyNotify retitling), WM_CLASS res_class app-ids, ICCCM
+  WM_NORMAL_HINTS constraints, override-redirect popups (X-owned
+  geometry, above managed windows, no taskbar/focus — classified at
+  CreateNotify, not at first draw), granted client resizes reported
+  back through set_geometry (extent space: interior + X border),
+  WM_DELETE_WINDOW / WM_TAKE_FOCUS delivery with correct SendEvent
+  format bytes, border-aware geometry mirroring both directions.
+  Regressions: tests/suite/test_xwm.c (10 tests, real Xwayland +
+  real helper + controllable X11 client + the real xterm).
+- TODO per-output X mode tracking for fullscreen X11 apps, X11
+  clipboard bridge.
 
 ## M9 — Hardening/quality
 - DONE zero-warning builds (-Wall -Wextra -Werror, also under -O1),

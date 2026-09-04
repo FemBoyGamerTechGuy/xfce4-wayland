@@ -49,6 +49,7 @@ struct xw_wm *xw_wm_create(struct xw_compositor *c, const char *config_dir) {
     wm->comp = c;
     wl_list_init(&wm->windows);
     wl_list_init(&wm->stack);
+    wl_list_init(&wm->or_windows);
     for (int i = 0; i < 4; i++)
         wl_list_init(&wm->layers[i]);
     wm->ws_count = 4;
@@ -116,6 +117,13 @@ void xw_wm_manage_toplevel(struct xw_wm *wm, struct xw_window *w) {
 void xw_wm_window_map(struct xw_wm *wm, struct xw_window *w) {
     if (w->mapped)
         return;
+    if (w->xw_override_redirect) {
+        /* popup-class X11 windows never enter the managed flow (the
+         * role commit routes them to xw_wm_or_map; this guard is the
+         * safety net for a late OR conversion racing the commit) */
+        xw_wm_or_map(wm, w);
+        return;
+    }
     w->mapped = true;
 
     struct xw_output *o = w->output;
@@ -195,9 +203,60 @@ void xw_wm_window_map(struct xw_wm *wm, struct xw_window *w) {
            w->output ? w->output->name : "(unset)", w->ws);
 }
 
+/* classify an UNMAPPED xwayland window as override-redirect NOW: popups
+ * must leave the managed set the moment the WM helper says so — the
+ * client may never draw (no buffer commit → no or_map), and a ghost
+ * popup sitting in wm->windows would surface in taskbar/Alt+Tab
+ * iterations. wl_list_remove works from whichever list holds the
+ * link; stack_link was initialized empty at manage. */
+void xw_wm_or_reclassify(struct xw_wm *wm, struct xw_window *w) {
+    if (w->xw_override_redirect && w->mapped)
+        return; /* already an active popup: or_map owns it */
+    wl_list_remove(&w->link);
+    wl_list_remove(&w->stack_link);
+    wl_list_init(&w->stack_link);
+    wl_list_insert(wm->or_windows.prev, &w->link);
+    xw_log(XW_LOG_DEBUG,
+           "wm: window %u reclassified override-redirect (pre-commit)", w->id);
+}
+
+/* override-redirect (popup-class) X11 window mapped: X owns the
+ * geometry, no rules, no cascade placement, no taskbar presence, no
+ * focus — render above every managed window. */
+void xw_wm_or_map(struct xw_wm *wm, struct xw_window *w) {
+    if (w->mapped)
+        return;
+    w->mapped = true;
+    struct xw_output *o = w->output;
+    if (!o && !wl_list_empty(&wm->comp->outputs)) {
+        o = wl_container_of(wm->comp->outputs.next, o, link);
+        w->output = o;
+    }
+    wl_list_remove(&w->link);
+    wl_list_remove(&w->stack_link);
+    wl_list_init(&w->stack_link);
+    wl_list_insert(wm->or_windows.prev, &w->link);
+    xw_wm_damage_window(wm, w);
+    /* a menu that opens under the stationary cursor must receive the
+     * pointer immediately (hover before any motion) */
+    xw_seat_repointer(wm->comp);
+    xw_log(XW_LOG_INFO,
+           "wm: X11 popup (OR) window %u MAPPED (surface %u, %dx%d+%d+%d)",
+           w->id, w->surface ? wl_resource_get_id(w->surface->res) : 0,
+           w->w, w->h, w->x, w->y);
+}
+
 void xw_wm_window_unmap(struct xw_wm *wm, struct xw_window *w) {
     if (!w->mapped)
         return;
+    if (w->xw_override_redirect) {
+        xw_log(XW_LOG_INFO, "wm: X11 popup (OR) window %u UNMAPPED", w->id);
+        xw_wm_damage_window(wm, w);
+        w->mapped = false;
+        /* the pointer may now sit over a different surface */
+        xw_seat_repointer(wm->comp);
+        return;
+    }
     xw_log(XW_LOG_INFO, "wm: window %u UNMAPPED (app '%s', title '%s')",
            w->id, w->app_id, w->title);
     xw_wm_damage_window(wm, w);
@@ -247,6 +306,8 @@ void xw_wm_unmanage(struct xw_wm *wm, struct xw_window *w, bool resources_gone) 
 /* ------------------------------------------------------------- focus */
 
 void xw_wm_focus_window(struct xw_wm *wm, struct xw_window *w, bool activate) {
+    if (w && w->xw_override_redirect)
+        return; /* popup-class windows never take keyboard focus */
     if (w && !xw_wm_window_visible(wm, w)) {
         xw_log(XW_LOG_WARN, "wm: refusing to focus invisible window");
         return;
@@ -561,6 +622,16 @@ bool xw_wm_window_visible(struct xw_wm *wm, struct xw_window *w) {
 struct xw_window *xw_wm_window_at(struct xw_wm *wm, int x, int y,
                                   struct xw_surface **surface_out) {
     struct xw_window *w;
+    /* override-redirect windows sit above all managed windows */
+    wl_list_for_each(w, &wm->or_windows, link) {
+        if (!w->mapped || !w->surface)
+            continue;
+        if (xw_surface_has_input_at(w->surface, x, y)) {
+            if (surface_out)
+                *surface_out = w->surface;
+            return w;
+        }
+    }
     wl_list_for_each(w, &wm->stack, stack_link) {
         if (!xw_wm_window_visible(wm, w) || !w->surface)
             continue;
@@ -577,7 +648,7 @@ struct xw_window *xw_wm_window_at(struct xw_wm *wm, int x, int y,
 
 bool xw_wm_interactive_begin_move(struct xw_wm *wm, struct xw_window *w, int px,
                                   int py) {
-    if (!w || w->fullscreen)
+    if (!w || w->fullscreen || w->xw_override_redirect)
         return false;
     if (w->maximized) {
         /* xfwm4: moving a maximized window restores it under the cursor */
@@ -597,7 +668,7 @@ bool xw_wm_interactive_begin_resize(struct xw_wm *wm, struct xw_window *w,
     (void)wm;
     (void)px;
     (void)py;
-    if (!w || w->fullscreen || w->maximized)
+    if (!w || w->fullscreen || w->maximized || w->xw_override_redirect)
         return false;
     if (!edges)
         edges = XW_EDGE_B | XW_EDGE_R;
@@ -639,27 +710,44 @@ void xw_wm_interactive_motion(struct xw_wm *wm, struct xw_window *w, int px,
         if (o)
             w->inter.snap = snap_candidate(wm, o, px, py);
     } else if (w->inter.mode == 2) {
-        int min_w = 50, min_h = 50;
-        if (w->inter.edges & XW_EDGE_R)
+        /* size constraints: xdg set_min/max_size and (for Xwayland
+         * windows) WM_NORMAL_HINTS pushed over the window-control
+         * channel — one clamp for both window families */
+        int min_w = w->min_w > 0 ? w->min_w : 50;
+        int min_h = w->min_h > 0 ? w->min_h : 50;
+        int max_w = w->max_w, max_h = w->max_h; /* 0 = unset */
+        int inc_w = w->xw_inc_w > 0 ? w->xw_inc_w : 0;
+        int inc_h = w->xw_inc_h > 0 ? w->xw_inc_h : 0;
+        if (w->inter.edges & XW_EDGE_R) {
             w->w = px - w->x > min_w ? px - w->x : min_w;
-        if (w->inter.edges & XW_EDGE_B)
+            if (max_w > 0 && w->w > max_w) w->w = max_w;
+            if (inc_w > 1) w->w -= w->w % inc_w;
+        }
+        if (w->inter.edges & XW_EDGE_B) {
             w->h = py - w->y > min_h ? py - w->y : min_h;
+            if (max_h > 0 && w->h > max_h) w->h = max_h;
+            if (inc_h > 1) w->h -= w->h % inc_h;
+        }
         if (w->inter.edges & XW_EDGE_L) {
-            int newx = px, neww = w->inter.start_x + w->inter.start_w - px;
-            if (neww < min_w) {
+            int neww = w->inter.start_x + w->inter.start_w - px;
+            if (neww < min_w)
                 neww = min_w;
-                newx = w->inter.start_x + w->inter.start_w - min_w;
-            }
-            w->x = newx;
+            if (max_w > 0 && neww > max_w)
+                neww = max_w;
+            if (inc_w > 1 && (neww / inc_w) * inc_w >= min_w)
+                neww = (neww / inc_w) * inc_w;
+            w->x = w->inter.start_x + w->inter.start_w - neww;
             w->w = neww;
         }
         if (w->inter.edges & XW_EDGE_T) {
-            int newy = py, newh = w->inter.start_y + w->inter.start_h - py;
-            if (newh < min_h) {
+            int newh = w->inter.start_y + w->inter.start_h - py;
+            if (newh < min_h)
                 newh = min_h;
-                newy = w->inter.start_y + w->inter.start_h - min_h;
-            }
-            w->y = newy;
+            if (max_h > 0 && newh > max_h)
+                newh = max_h;
+            if (inc_h > 1 && (newh / inc_h) * inc_h >= min_h)
+                newh = (newh / inc_h) * inc_h;
+            w->y = w->inter.start_y + w->inter.start_h - newh;
             w->h = newh;
         }
         xw_xdg_send_configure(w);

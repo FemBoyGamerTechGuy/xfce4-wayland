@@ -242,7 +242,7 @@ static void test_png_direct(struct xwt_ctx *t) {
     const char *p = asset("red16.png");
     XWT_ASSERT(p);
     if (!xwc_icon_png()) {
-        printf("  (png not compiled in: decode test skipped)\n");
+        XWT_SKIP("png not compiled in: decode test");
         return;
     }
     env_snapshot();

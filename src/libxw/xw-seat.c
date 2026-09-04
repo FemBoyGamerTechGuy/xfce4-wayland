@@ -449,6 +449,12 @@ void xw_seat_set_kb_focus(struct xw_seat *s, struct xw_surface *surface) {
         send_modifiers(s);
     }
     xw_data_device_notify_focus(s->comp, s);
+    /* X input focus routing: whenever the compositor's keyboard focus
+     * moves, tell the X WM helper which X11 window (if any) now owns
+     * it, so it can SetInputFocus / deliver WM_TAKE_FOCUS on the X
+     * side. Without this, keys typed into the focused window land in
+     * whichever X window held focus at map time. */
+    xw_xwayland_notify_focus(s->comp, surface);
 }
 
 static void set_ptr_focus(struct xw_seat *s, struct xw_surface *surface) {

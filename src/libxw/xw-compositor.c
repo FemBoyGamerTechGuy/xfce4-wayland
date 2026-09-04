@@ -285,6 +285,7 @@ struct xw_compositor *xw_compositor_create(const struct xw_compositor_config *cf
     wl_list_init(&c->wsi_managers);
     wl_list_init(&c->activation_tokens);
     wl_list_init(&c->wc_managers);
+    wl_list_init(&c->xw_pending_idents);
 
     c->display = wl_display_create();
     if (!c->display)

@@ -6,6 +6,7 @@
 
 int xwt_failures = 0;
 int xwt_tests = 0;
+int xwt_skips = 0;
 const char *xwt_current = "?";
 
 static char s_runtimedir[128];
@@ -73,7 +74,15 @@ int xwt_begin(struct xwt_ctx *t, const char *config_dir) {
     struct xw_compositor_config cfg = {0};
     cfg.config_dir = config_dir;
     cfg.socket_name = t->socket_name;
+    /* XWT_LOG_LEVEL: 0=error..3=debug — the default stays ERROR to
+     * keep suite output clean; xwm debugging needs the compositor's
+     * client-lifecycle lines (XWT_LOG_LEVEL=3 XWT_FILTER=xwm-...) */
     cfg.log_level = XW_LOG_ERROR;
+    {
+        const char *lv = getenv("XWT_LOG_LEVEL");
+        if (lv)
+            cfg.log_level = (enum xw_log_level)atoi(lv);
+    }
 
     t->comp = xw_compositor_create(&cfg);
     if (!t->comp) {
@@ -134,7 +143,12 @@ int xwt_run_all(void) {
             printf("(failure)\n");
         }
     }
-    printf("%d/%d tests passed, %d failures\n", passed, xwt_tests,
-           xwt_failures);
+    char skipnote[48];
+    if (xwt_skips)
+        snprintf(skipnote, sizeof(skipnote), " (%d skipped)", xwt_skips);
+    else
+        skipnote[0] = 0;
+    printf("%d/%d tests passed, %d failures%s\n", passed, xwt_tests,
+           xwt_failures, skipnote);
     return xwt_failures ? 1 : 0;
 }

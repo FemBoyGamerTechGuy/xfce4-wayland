@@ -39,13 +39,22 @@
     and close flow one way, compositor to WM).
   </description>
 
-  <interface name="xw_window_control_manager_v1" version="1">
+  <interface name="xw_window_control_manager_v1" version="2">
     <description summary="window control events for the X WM helper">
       The compositor emits these events whenever an Xwayland-managed
-      window changes geometry or is asked to close. The helper mirrors
-      the geometry onto the X11 window (keeping X input coordinates
-      aligned with the compositor placement) and performs the actual
-      X11 close (WM_DELETE_WINDOW, else destroy).
+      window changes geometry or focus, or is asked to close. The helper
+      mirrors the geometry onto the X11 window (keeping X input
+      coordinates aligned with the compositor placement), mirrors
+      compositor keyboard focus into the X input focus, and performs
+      the actual X11 close (WM_DELETE_WINDOW, else destroy).
+
+      Version 2 adds the reverse direction: the helper reports window
+      identity (WM_NAME / WM_CLASS), override-redirect state and ICCCM
+      size hints for windows it associates with a serial, so X11
+      windows become first-class citizens of the one compositor window
+      model (taskbar titles, popup placement, resize constraints).
+      Version 1 helpers never send the new requests and never receive
+      the focus event.
     </description>
 
     <event name="geometry">
@@ -73,8 +82,103 @@
       <arg name="serial_lo" type="uint" summary="lower 32 bits of the xwayland surface serial"/>
     </event>
 
+
     <request name="destroy" type="destructor">
       <description summary="unbind the manager"/>
+    </request>
+
+    <event name="focus" since="2">
+      <description summary="compositor keyboard focus moved to an X window">
+        The compositor's keyboard focus is now the window with the given
+        serial; the helper must route the X input focus accordingly
+        (SetInputFocus and/or a WM_TAKE_FOCUS ClientMessage, per the
+        window's ICCCM input model). A serial of 0 means no X11 window
+        holds compositor focus (a native window, or none) and the X
+        input focus should be released.
+      </description>
+      <arg name="serial_hi" type="uint" summary="upper 32 bits of the xwayland surface serial"/>
+      <arg name="serial_lo" type="uint" summary="lower 32 bits of the xwayland surface serial"/>
+    </event>
+
+    <request name="set_title" since="2">
+      <description summary="the X11 window's name">
+        The window's WM_NAME (STRING) or _NET_WM_NAME (UTF8_STRING,
+        preferred when present) as the X WM helper read it. Sent when
+        the serial is first associated and again whenever the property
+        changes (xterm and every terminal retitle themselves).
+      </description>
+      <arg name="serial_hi" type="uint" summary="upper 32 bits of the xwayland surface serial"/>
+      <arg name="serial_lo" type="uint" summary="lower 32 bits of the xwayland surface serial"/>
+      <arg name="title" type="string" summary="the window name, UTF-8"/>
+    </request>
+
+    <request name="set_app_id" since="2">
+      <description summary="the X11 window's class">
+        The res_class field of WM_CLASS — the same identity level the
+        xdg-shell app_id carries for native windows, and what taskbars
+        match rules and icons against.
+      </description>
+      <arg name="serial_hi" type="uint" summary="upper 32 bits of the xwayland surface serial"/>
+      <arg name="serial_lo" type="uint" summary="lower 32 bits of the xwayland surface serial"/>
+      <arg name="app_id" type="string" summary="WM_CLASS res_class"/>
+    </request>
+
+    <request name="set_override_redirect" since="2">
+      <description summary="the window is override-redirect (popup-class)">
+        The X11 window behind this serial has override-redirect set
+        (menus, tooltips, combo dropdowns). It is not a managed
+        toplevel: the compositor must place it at exactly the given X11
+        geometry (the X client owns the position), keep it above all
+        managed windows, and exclude it from the taskbar, focus and
+        workspace switching. Re-sent whenever the window's X11
+        geometry changes.
+      </description>
+      <arg name="serial_hi" type="uint" summary="upper 32 bits of the xwayland surface serial"/>
+      <arg name="serial_lo" type="uint" summary="lower 32 bits of the xwayland surface serial"/>
+      <arg name="x" type="int" summary="x position (X root coordinates, which are compositor layout coordinates)"/>
+      <arg name="y" type="int" summary="y position (X root coordinates, which are compositor layout coordinates)"/>
+      <arg name="width" type="int" summary="width in X11 pixels"/>
+      <arg name="height" type="int" summary="height in X11 pixels"/>
+    </request>
+
+    <request name="set_size_hints" since="2">
+      <description summary="ICCCM WM_NORMAL_HINTS constraints">
+        The window's WM_NORMAL_HINTS size constraints (0 = unset). The
+        compositor applies them to interactive and programmatic resizes
+        of this window, exactly as xdg-shell min/max sizes are applied
+        to native windows; the helper additionally rounds
+        client-initiated ConfigureRequest sizes itself.
+      </description>
+      <arg name="serial_hi" type="uint" summary="upper 32 bits of the xwayland surface serial"/>
+      <arg name="serial_lo" type="uint" summary="lower 32 bits of the xwayland surface serial"/>
+      <arg name="min_width" type="int" summary="minimum width, 0 = unset"/>
+      <arg name="min_height" type="int" summary="minimum height, 0 = unset"/>
+      <arg name="max_width" type="int" summary="maximum width, 0 = unset"/>
+      <arg name="max_height" type="int" summary="maximum height, 0 = unset"/>
+      <arg name="width_inc" type="int" summary="width resize increment, 0 = unset"/>
+      <arg name="height_inc" type="int" summary="height resize increment, 0 = unset"/>
+    </request>
+
+    <request name="set_geometry" since="2">
+      <description summary="the X-side truth geometry of a managed window">
+        The helper reports the window's geometry in compositor layout
+        coordinates — the wl_surface extent (X11 interior size plus
+        border) — after it granted a client-initiated resize
+        (ConfigureRequest). The compositor adopts it as the window's
+        geometry so its model matches X reality even when the client
+        draws nothing after resizing: Xwayland only pushes a new
+        surface buffer on damage, so an undrawn resize is invisible to
+        the buffer-commit path. The compositor must not echo this back
+        through the geometry event — the X side already has this
+        state, and the helper's loop guard would drop a redundant
+        configure anyway.
+      </description>
+      <arg name="serial_hi" type="uint" summary="upper 32 bits of the xwayland surface serial"/>
+      <arg name="serial_lo" type="uint" summary="lower 32 bits of the xwayland surface serial"/>
+      <arg name="x" type="int" summary="x position of the window extent in compositor layout coordinates"/>
+      <arg name="y" type="int" summary="y position of the window extent in compositor layout coordinates"/>
+      <arg name="width" type="int" summary="extent width: X11 interior width + 2 * border width"/>
+      <arg name="height" type="int" summary="extent height: X11 interior height + 2 * border width"/>
     </request>
   </interface>
 </protocol>

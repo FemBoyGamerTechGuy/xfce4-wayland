@@ -17,7 +17,14 @@ PREFIX="$ROOT/.apps-root"
 CACHE="$PREFIX/debs"
 mkdir -p "$PREFIX" "$CACHE"
 
-PKGS="${*:-foot zenity xterm x11-apps xwayland}"
+# libegl1 + libegl-mesa0 + libglvnd0 are NOT in xwayland's dependency
+# closure: libepoxy0 (satisfied by the system, so skipped by the
+# "already installed" filter below) dlopen()s libEGL.so.1 at RUNTIME.
+# Without it, epoxy_has_egl_extension() calls abort() and Xwayland dies
+# with signal 6 the moment it initializes glamor — before any window
+# exists. The user's real box always has an EGL stack installed, so the
+# in-container reproduction must provide one too.
+PKGS="${*:-foot zenity xterm x11-apps xwayland libegl1 libegl-mesa0 libglvnd0}"
 
 # 1. recursive dependency closure of the requested packages
 DEPLIST="$(apt-cache depends --recurse --no-recommends --no-suggests \

@@ -96,8 +96,13 @@ N3=$(grep -c "MAPPED" "$LOG")
 [ "$N3" -gt "$N2" ] && ok "X11 window mapped through XWayland" || bad "X11 window mapped (N2=$N2 N3=$N3)"
 kill -0 "$XE" 2>/dev/null && ok "X11 app alive" || bad "X11 app alive"
 kill -0 "$SESS_PID" 2>/dev/null && ok "session alive after X11 launch" || bad "session alive after X11 launch"
-grep -q "xwayland: window .* MAPPED\|app 'xwayland'" "$LOG" && \
+grep -q "wm: window .* MAPPED.*output" "$LOG" && \
     ok "X11 window uses the same window-management path" || bad "X11 window managed path"
+# the X11 window must carry its REAL identity (WM_NAME/WM_CLASS read by
+# the WM helper and pushed over xw_window_control_v1 v2), not the v0
+# static fallbacks
+grep -q "title 'xeyes'" "$LOG" && ok "X11 window title = WM_NAME" || bad "X11 window title = WM_NAME"
+grep -q "app 'XEyes'" "$LOG" && ok "X11 window app_id = WM_CLASS" || bad "X11 window app_id = WM_CLASS"
 
 # ---- 5. slow-starting client must not be treated as a failure
 WAYLAND_DISPLAY="$WLDISPLAY" XDG_RUNTIME_DIR="$RTD" \
