@@ -20,6 +20,16 @@
  * Everything it does is logged; a session with one xterm should print
  * each lifecycle stage (WM established, window mapped, serial, geometry
  * mirrored).
+ *
+ * Connection-loss triage: the helper lives on exactly two sockets and
+ * exits the moment either side is gone. Both gone (X and the
+ * compositor) is an orderly stack teardown — info, exit 0. One gone
+ * while the other lives is that peer's crash, reported loudly so the
+ * session supervisor (which watches Xwayland itself) and the user see
+ * the real event. Before this existed the Wayland side was never
+ * checked: a dead compositor left the helper spinning on a HUPed fd
+ * until Xwayland noticed and died too, misreporting the failure as
+ * "X server connection lost".
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -1485,6 +1495,57 @@ static void usage(const char *prog) {
            prog);
 }
 
+/* ------------------------------------------------------- loss triage */
+
+/* Is the peer on fd dead RIGHT NOW (0-timeout poll)? POLLHUP/ERR/NVAL
+ * on a stream socket is direct kernel evidence; it is the same signal
+ * the main loop reacts to, asked ad-hoc when the OTHER side died first
+ * and we need to tell "stack teardown" from "one peer crashed". */
+static bool peer_gone(int fd) {
+    struct pollfd p = {.fd = fd, .events = POLLIN};
+    if (fd < 0)
+        return true;
+    if (poll(&p, 1, 0) < 0)
+        return true; /* cannot even ask — treat as gone */
+    return (p.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0;
+}
+
+/* The compositor side died (poll flags, dispatch or flush error).
+ * Distinguish the two meanings before dying: X also gone = teardown;
+ * X alive = the compositor itself crashed. A wl PROTOCOL error is
+ * reported as such — it is a compositor bug, not a lost socket. */
+static void wl_lost(void) {
+    int err = wl_display_get_error(wl_dpy);
+    uint32_t pcode = 0, pop = 0;
+    const struct wl_interface *pi = NULL;
+    /* wl_display_get_protocol_error is only meaningful when
+     * wl_display_get_error returned EPROTO; ask unconditionally and
+     * report what it finds, if anything — a non-zero protocol code is
+     * a compositor bug, not a lost socket */
+    pcode = wl_display_get_protocol_error(wl_dpy, &pi, &pop);
+    if (peer_gone(x_fd)) {
+        XWM_LOG("info", "X stack teardown: compositor connection gone "
+                "(%s) and the X server is too — exiting",
+                err ? strerror(err) : "socket closed by the peer");
+        exit(0);
+    }
+    if (pcode) {
+        fprintf(stderr,
+                "[xw-xwm] fatal: compositor protocol error %u on "
+                "%s opcode %u (X server still up) — this is a "
+                "compositor bug, please report it\n",
+                pcode, pi ? pi->name : "(unknown interface)", pop);
+        exit(1);
+    }
+    fprintf(stderr,
+            "[xw-xwm] fatal: compositor connection lost (%s; the X "
+            "server is still up)\n",
+            err ? strerror(err) : "socket closed by the peer");
+    exit(1);
+}
+
+/* ------------------------------------------------------------ main loop */
+
 int main(int argc, char **argv) {
     const char *display = getenv("DISPLAY");
     const char *auth_file = NULL;
@@ -1618,13 +1679,25 @@ int main(int argc, char **argv) {
             {.fd = x_fd, .events = POLLIN},
             {.fd = wl_fd, .events = POLLIN},
         };
-        wl_display_flush(wl_dpy);
+        /* flush: -1 with EAGAIN is a full buffer (normal); -1 with
+         * anything else (EPIPE, ECONNRESET) means the compositor is
+         * gone and the socket will never drain */
+        if (wl_display_flush(wl_dpy) < 0 && errno != EAGAIN)
+            wl_lost();
         int rc = poll(pfds, 2, 500);
         if (rc < 0 && errno == EINTR)
             continue;
         if (rc < 0)
             die("poll()");
         if (pfds[0].revents & (POLLHUP | POLLERR)) {
+            if (peer_gone(wl_fd)) {
+                /* the compositor died with (or before) the X server:
+                 * the whole stack is being torn down — nothing to
+                 * manage and nobody to report to */
+                XWM_LOG("info", "X stack teardown: X server connection "
+                        "closed and the compositor is gone — exiting");
+                exit(0);
+            }
             /* do not report stale errno here: wl_display_flush leaves
              * EAGAIN on a healthy non-blocking socket constantly; the
              * poll flags are the actual evidence */
@@ -1638,12 +1711,20 @@ int main(int argc, char **argv) {
                         : "socket error pending");
             exit(1);
         }
+        /* the wl fd was NEVER checked here before: a dead compositor
+         * left the helper spinning at 100% CPU on a POLLHUP-only fd
+         * (no POLLIN, so no dispatch, and poll never blocks) */
+        if (pfds[1].revents & (POLLHUP | POLLERR | POLLNVAL))
+            wl_lost();
         if (pfds[0].revents & POLLIN)
             x_drain();
-        if (pfds[1].revents & POLLIN)
-            wl_display_dispatch(wl_dpy);
-        else if (rc == 0)
-            wl_display_dispatch_pending(wl_dpy);
+        if (pfds[1].revents & POLLIN) {
+            if (wl_display_dispatch(wl_dpy) < 0)
+                wl_lost();
+        } else if (rc == 0) {
+            if (wl_display_dispatch_pending(wl_dpy) < 0)
+                wl_lost();
+        }
     }
     return 0;
 }
