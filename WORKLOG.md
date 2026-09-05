@@ -2815,3 +2815,194 @@ same gates, now guaranteed observational.
 **Next**: unchanged — the physical NVIDIA decision run (A: probe +
 input trace diff against the reporting app; B: real-app CSD hit
 confirmation; C: the DRM output-setup line when a gap persists).
+
+---
+
+## Round 5 — the corrected session-path audit: the supervisor was the missing leg (2026-09-06)
+
+The correction that reframed Round 4: the physical machine runs
+`./build/bin/xw-session`, NOT a bare compositor — the earlier physical
+comparison (`xw-compositor -B drm` ± trace variables) never touched the
+real logout path (a bare compositor has no session manager for xw-exit
+to talk to; its "graphical logout" cannot work at all). Round 4's
+in-suite regression therefore modeled a REAL mechanism but an
+INCOMPLETE chain: the compositor with a stalled stderr pipe — with no
+supervisor in the picture. This round audited the real path and
+reproduced it end to end.
+
+### The real logout chain (audited, code-pinned)
+
+xw-exit (the graphical dialog, Ctrl+Alt+Del / panel exit button)
+writes `logout\n` to the session control socket -> xw-session's
+handle_ctl_line replies "ok ending session" and runs
+session_shutdown(false): SIGTERM to autostart/spawned children, then
+stop_compositor() — SIGTERM, 1s grace, SIGKILL — then the session bus,
+reap, cleanup_sockets, exit 0. The compositor's SIGTERM arrives via
+its event loop (wl_event_loop_add_signal/signalfd); its CLEAN exit
+runs the seat teardown that restores the VT (KD_TEXT, KDSKBMODE
+XLATE, VT_AUTO). Answers to the audit questions:
+
+A. **Trace variable propagation: YES.** start_compositor forks and
+execs without touching XW_INPUT_TRACE/XW_GEOMETRY_TRACE — the
+compositor child inherits the session's environment verbatim (only
+XDG_*/DISPLAY are adjusted). Empirically pinned: the file-sink control
+of the new harness shows 234,887 `[geom] xdg-commit-size` lines in the
+SESSION's stderr file — lines only the compositor child emits.
+
+B. **What blocks: the session manager itself, before any signal is
+sent.** The compositor leg (Round 4's fix, cdcf2c5) holds: during the
+wedge the compositor sits healthy in epoll_wait, still storming at
+~118k commits/s, dropping trace lines per the never-blocking sink.
+But xw-session's own `log_msg` was plain stdio fprintf on the
+inherited stderr — and the compositor child's trace flood fills that
+SAME sink (64KB in ~1ms under the storm). The FIRST shutdown log line
+("session ending") blocks forever: /proc shows `write(2, fd 2, 18)`
+wchan `pipe_write` — the 18 bytes are literally "[xw-session info] ".
+SIGTERM is never sent, the compositor never exits, the session never
+exits, and the ctl connection is never closed (xw-session-ctl /
+xw-exit's xw_ctl_send reads until EOF — the dialog client hangs too).
+That is "logout impossible" through the REAL path.
+
+C. **Logout initiation: the session manager, via the ctl socket** —
+not a compositor protocol request, not a raw signal. SIGTERM is
+xw-session's stop_compositor, the supervisor's first move against the
+compositor. Ctrl+Alt+Del only SPAWNS xw-exit (a compositor shortcut
+action); the decision then travels the control-socket line protocol.
+
+D. **Does the trace-only failure reproduce under xw-session?** YES —
+given a stalled stderr sink (any non-draining consumer: `2>&1 | tee`
+into a jammed reader, a held fifo, a stopped pipeline). Pre-fix
+(396d41f): BOTH processes wedge — the compositor in
+`write(fd 2, 128 bytes)` pipe_write AND the session in
+`write(fd 2, 18 bytes)` pipe_write. On cdcf2c5 as committed: the
+compositor is healthy, the session still wedges — cdcf2c5 alone does
+NOT fix the real reproduction. On this round's build: neither wedges;
+logout completes in ~104ms under all four permutations. With the
+DEFAULT sinks (inherited TTY — writes drain; regular file — never
+blocks) it never reproduced at any revision: the stalled-pipe sink is
+the one class that blocks, and it only occurs through user-side
+redirection choices.
+
+E. **Does cdcf2c5 fix the real xw-session reproduction?** No — see D.
+It fixed the compositor-only leg its RED test modeled. The complete
+fix is cdcf2c5 + this round's session leg (both changes are now in).
+
+### The two regressions, explicitly separated
+
+1. **compositor-only stderr-pipe deadlock** (Round 4, cdcf2c5): real
+   mechanism, partial coverage — a compositor whose stderr stalls
+   wedges in its own diagnostic writes; fixed by the never-blocking
+   xw_diag sink. This is what the in-suite `trace-shutdown-
+   observational` white-box regression pins (both variables,
+   independently, storm in-process).
+2. **the actual xw-session physical logout regression** (this round):
+   the same stalled sink ALSO wedges the supervisor — which is the
+   leg that owns the SIGTERM, the 1s grace, the SIGKILL, and the
+   control-socket close. A wedged supervisor turns "slow logout" into
+   "logout impossible" and (on DRM) "black screen with a RAW keyboard".
+   Fixed by giving xw-session's log_msg the same never-blocking
+   contract.
+
+Which one explains the NVIDIA/Artix observation: if the physical run
+piped or redirected the session's stderr into a non-draining consumer
+(the natural way to CAPTURE a trace whose TTY is hidden behind the DRM
+desktop), the full chain above is the explanation — and notably,
+cdcf2c5 alone would NOT have fixed it (the session leg still wedges).
+If the physical run left stderr on the TTY or wrote it to a file, the
+stderr-blocking theory explains nothing — and with every headless leg
+now pinned, the corrected 4-permutation physical matrix through
+xw-session (below) is the decisive experiment. Either way the
+observational contract is now enforced at BOTH ends: trace volume can
+cost at most dropped lines (reported with a count), never a wedged
+session.
+
+### The fixes
+
+`xw-session.c` (narrow, no behavior change beyond the contract):
+- log_msg funnels through a private never-blocking sink that mirrors
+  libxw's xw_diag discipline exactly: one bounded buffer, one write;
+  regular files use raw fd 2 (never blocks, shared offset); pipes and
+  terminals get a private O_NONBLOCK reopen of /proc/self/fd/2 (a new
+  file description — fd 2, the compositor child, every child keep
+  their semantics; O_CLOEXEC so exec starts clean); sockets fall back
+  to fd 2 behind a zero-timeout poll. Unwritable-now lines are
+  dropped and counted; the next successful write reports
+  "[xw-session] N diagnostic lines dropped (stderr stalled — output
+  incomplete)".
+- stop_compositor's SIGKILL leg now runs the crash-console-restore
+  net (restore_console_after_crash) when the compositor died by
+  signal: stop_compositor reaps internally, so the main loop's
+  crash-restore branch could never see this exit — on DRM, a
+  compositor that misses the 1s grace left the VT in graphics mode
+  and the keyboard RAW with NO net. Clean SIGTERM exits still do
+  their own (proper) seat teardown; the net is best-effort and a
+  no-op when /dev/tty is not a VT.
+
+### The instrument set (new)
+
+- `tests/geomstorm.c` — the external trace-volume driver: a raw
+  wayland client that commits alternating buffer sizes (96x96 /
+  110x84) in a flush-paced loop (~118k commits/s, one
+  `xdg-commit-size` [geom] line each). Pacing = the harness's second
+  observable: a wedged compositor stops consuming and geomstorm parks
+  in POLLOUT (heartbeat freezes). Also drains the server's event
+  stream — a client that never reads overflows the server's 4096-byte
+  connection buffer and gets dropped mid-storm.
+- `scripts/test-session-trace.sh` — the session-level regression:
+  the REAL chain (xw-session -B headless, real compositor child, real
+  ctl-socket logout) x the four trace permutations x a stalled-fifo
+  stderr (read end held open by a sleeping holder, never drained) +
+  a file-sink control. Assertions: session exits promptly (measured
+  ms), exit code 0, ctl socket removed; on failure it prints /proc
+  syscall+wchan for BOTH the session and the compositor child, plus
+  the ctl client's fate — the wedge is attributed, not guessed.
+  Takes an optional bin-dir argument (how the pre-fix builds were
+  compared). 21 checks.
+
+### Validation
+
+- harness on this round's build: 21/21 (all four stalled-pipe
+  permutations logout in ~104ms, exit 0, sockets cleaned; file
+  control: 234,887 propagated trace lines).
+- harness on pristine cdcf2c5: 15/21 — geometry/both stall variants
+  FAIL, session wedged in write(fd 2) pipe_write, compositor healthy
+  in epoll_wait, ctl client dead in read (rc=124).
+- harness on pristine 396d41f: 15/21 — both processes wedged in
+  write(fd 2) pipe_write (compositor 128 bytes, session 18 bytes).
+- in-process suite: 128/128 release and 128/128 under
+  ASan/UBSan/LSan with zero reports (the `make asan` pass fails only
+  at test-session.sh's 8 pre-existing environment-gated DRM checks —
+  byte-identical failure count on the pristine 396d41f/cdcf2c5
+  builds, verified).
+- scripts/test-session.sh: 116/124 (same 8 gated), physical-kbd PASS,
+  link-deps 7/7.
+
+### The corrected physical procedure (A/B/C, now through xw-session)
+
+The decision tables from Round 3 are unchanged — only the RUNNER
+changes (plus the trace-capture guidance):
+
+0. **The logout matrix first** (the observational contract checkout):
+   on the NVIDIA/Artix box, for each of (no trace / XW_INPUT_TRACE=1 /
+   XW_GEOMETRY_TRACE=1 / both): start `./build/bin/xw-session`, use
+   the desktop briefly, then Ctrl+Alt+Del -> Log Out (or
+   `build/bin/xw-session-ctl logout` from a second VT). PASS = the
+   dialog responds, the session ends, the shell prompt returns, the
+   keyboard types (not RAW), no black screen. Capture with
+   `2> trace.log` (file — always safe) — never an unread pipe.
+1. **A (backspace-u)**: `XW_INPUT_TRACE=1 XW_GEOMETRY_TRACE=1
+   ./build/bin/xw-session 2> trace.log`, then
+   `build/tests/keyboardprobe wayland-0` (the session's socket lives
+   in $XDG_RUNTIME_DIR) while typing Backspace / u / a /
+   Shift+Backspace / Ctrl+Backspace in both a probe window and the
+   reporting app. Same decision table as Round 3: probe decodes wl 22
+   -> BackSpace while the app shows 'u' — client-side keymap/RMLVO;
+   probe shows wl 30 or anomalies — compositor chain (capture the
+   [input] lines); no events reach the probe — focus/delivery, the
+   [input] per-outcome lines decide.
+2. **B (CSD hits)**: real apps on both stacks (title bar -> MOVE
+   cursor + drag, edges/corners -> resize, client area inert).
+3. **C (fullscreen gap)**: model rect == output rect but the gap on
+   screen — read the XW_GEOMETRY_TRACE output-setup line (mode/CRTC/
+   FB/pitch/layout/scale) from the trace.log; one-sided gap with a
+   pitch/stride mismatch points at the scanout FB pitch leg.

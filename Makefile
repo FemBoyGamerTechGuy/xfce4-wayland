@@ -655,6 +655,18 @@ build/tests/keyboardprobe: $(OBJ)/tests/keyboardprobe.o \
 $(OBJ)/tests/keyboardprobe.o: tests/keyboardprobe.c | $(OBJ)/tests
 	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_XKB) -c $< -o $@
 
+# external geometry-trace volume driver: commits alternating buffer
+# sizes in a tight loop, driving the "xdg-commit-size" [geom] lines of
+# a REAL compositor process from outside — the storm source for the
+# session-level trace-observational regression (xw-session path).
+build/tests/geomstorm: $(OBJ)/tests/geomstorm.o \
+	$(OBJ)/gen/xdg-shell-protocol.o | build/tests
+	$(CC) $(LDFLAGS) -o $@ $(OBJ)/tests/geomstorm.o \
+	$(OBJ)/gen/xdg-shell-protocol.o $(LDLIBS_WLC) -lm
+
+$(OBJ)/tests/geomstorm.o: tests/geomstorm.c | $(OBJ)/tests
+	$(CC) $(CSTD) $(CFLAGS) $(WARN) $(DEFS) $(INCLUDES) $(CFLAGS_WLC) -c $< -o $@
+
 # X-side key driver for the physical-kbd regression (XSendEvent;
 # libX11 only so it builds wherever the X11 backend does)
 build/tests/kbddriver: $(OBJ)/tests/kbddriver.o | build/tests
@@ -718,7 +730,8 @@ else
 	$(info x11probe: XTest dev files not found - build/tests/kbddriver (libX11 only) covers the key matrix)
 endif
 endif
-all: build/tests/mockseatd build/tests/keyboardprobe build/tests/kbddriver
+all: build/tests/mockseatd build/tests/keyboardprobe build/tests/kbddriver \
+	build/tests/geomstorm
 
 # profile stamp consulted by the PROFILE guard near the top
 build/.profile:

@@ -141,6 +141,83 @@ enum {
 
 static void log_msg(const char *level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
+/* ------------------------------------------- the observational sink
+ * The session manager's own diagnostics go through the SAME never-
+ * blocking discipline the compositor's trace instruments got in the
+ * observational round (xw_diag_line in libxw): whatever stderr is
+ * connected to, emitting a supervisor log line must never block.
+ * The reason is sharper here than for the compositor: the SUPER-
+ * VISOR is the one that sends the SIGTERM that ends the session. A
+ * session wedged inside log_msg never reaches stop_compositor, the
+ * compositor never terminates, the control connection never closes
+ * (xw-exit / xw-session-ctl read until EOF) and "logout becomes
+ * impossible" — reproduced through the real session chain: with the
+ * trace variables on and stderr a stalled pipe, the compositor's
+ * flood fills the sink, and the session wedges at the FIRST line of
+ * session_shutdown() ("session ending") — before any signal is
+ * sent. /proc attribution: write(2, fd 2, ...) wchan pipe_write.
+ *
+ * Mechanism (mirrors xw-util.c so both halves of the session share
+ * one contract): format into one bounded buffer, emit ONE write;
+ * regular files use raw fd 2 (never blocks, shared offset); pipes
+ * and terminals get a private O_NONBLOCK reopen of /proc/self/fd/2
+ * (a new file description — fd 2 and every child keep their
+ * semantics); sockets fall back to fd 2 behind a zero-timeout poll.
+ * Lines that cannot be written now are dropped and counted; the
+ * next successful write reports the loss so physical runs know the
+ * log is incomplete. */
+static long g_diag_dropped;
+
+static int diag_sink_fd(void) {
+    static int fd = -2; /* -2 = unresolved, -1 = use fd 2 (guarded) */
+    if (fd != -2)
+        return fd;
+    fd = -1;
+    struct stat st;
+    if (fstat(STDERR_FILENO, &st) == 0 && S_ISREG(st.st_mode))
+        return fd = -1;
+    int f = open("/proc/self/fd/2", O_WRONLY | O_NONBLOCK | O_APPEND |
+                                       O_CLOEXEC);
+    if (f >= 0)
+        fd = f;
+    return fd;
+}
+
+static void diag_write_raw(const char *buf, size_t len) {
+    if (len == 0)
+        return;
+    int fd = diag_sink_fd();
+    if (fd >= 0) {
+        if (write(fd, buf, len) != (ssize_t)len)
+            g_diag_dropped++;
+        return;
+    }
+    struct pollfd p = {.fd = STDERR_FILENO, .events = POLLOUT};
+    if (poll(&p, 1, 0) != 1 || !(p.revents & POLLOUT)) {
+        g_diag_dropped++;
+        return;
+    }
+    if (write(STDERR_FILENO, buf, len) != (ssize_t)len)
+        g_diag_dropped++;
+}
+
+/* the sink reports its losses before the next line: a physical run
+ * must know the session log is incomplete, not wonder silently */
+static void diag_note_dropped(void) {
+    if (g_diag_dropped <= 0)
+        return;
+    long d = g_diag_dropped;
+    g_diag_dropped = 0;
+    char note[96];
+    int n = snprintf(note, sizeof(note),
+                     "[xw-session] %ld diagnostic line%s dropped "
+                     "(stderr stalled — output incomplete)\n",
+                     d, d == 1 ? "" : "s");
+    if (n > 0)
+        diag_write_raw(note, (size_t)n < sizeof(note) - 1
+                                 ? (size_t)n : sizeof(note) - 1);
+}
+
 /* nested mode: run the desktop as a window inside the user's current
  * session (the primary development workflow before DRM/KMS). Backend
  * choice: explicit $XW_BACKEND, else a Wayland parent if
@@ -316,12 +393,21 @@ static void restore_console_after_crash(void) {
 }
 
 static void log_msg(const char *level, const char *fmt, ...) {
+    /* one bounded buffer, one never-blocking write: [xw-session L] body\n */
+    char buf[1024];
+    int off = snprintf(buf, sizeof(buf), "[xw-session %s] ", level);
+    if (off < 0 || (size_t)off >= sizeof(buf) - 1)
+        return;
     va_list ap;
-    fprintf(stderr, "[xw-session %s] ", level);
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    int n = vsnprintf(buf + off, sizeof(buf) - (size_t)off - 1, fmt, ap);
     va_end(ap);
-    fputc('\n', stderr);
+    size_t body = n > 0 ? (size_t)n : 0;
+    if (body > sizeof(buf) - (size_t)off - 1)
+        body = sizeof(buf) - (size_t)off - 1; /* truncated, one line */
+    buf[off + body] = '\n';
+    diag_note_dropped();
+    diag_write_raw(buf, (size_t)off + body + 1);
 }
 
 static void reap_all(void) {
@@ -360,8 +446,23 @@ static void stop_compositor(void) {
             usleep(20000); /* 20ms x 50 = 1s */
         }
         kill(S.comp_pid, SIGKILL);
-        waitpid(S.comp_pid, NULL, 0);
+        int status = 0;
+        waitpid(S.comp_pid, &status, 0);
         S.comp_pid = -1;
+        if (WIFSIGNALED(status)) {
+            /* the SIGKILL leg: the compositor died WITHOUT running its
+             * seat teardown (clean SIGTERM exit restores the terminal
+             * itself; the crash path has its net in the main loop —
+             * but stop_compositor reaps internally, so that branch
+             * never sees this exit). On a DRM session this is the
+             * difference between "session ended" and a black screen
+             * with a RAW keyboard: run the same best-effort console
+             * restore here. No-op when /dev/tty is not a VT. */
+            log_msg("warn", "compositor did not exit within the 1s grace "
+                            "— SIGKILL; restoring the console (a clean "
+                            "exit does this in seat teardown)");
+            restore_console_after_crash();
+        }
     }
 }
 

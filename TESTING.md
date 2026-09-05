@@ -133,6 +133,22 @@ absent rather than half-working.
   startup (udev-seat path or its honest logged refusal),
   `xw-session --nested`, and the nested Wayland backend across two
   real processes).
+- `scripts/test-session-trace.sh` + `tests/geomstorm.c` — **Level 2**:
+  the session-level trace-observational regression. `geomstorm` is an
+  external raw-wayland client that floods the geometry-trace volume
+  through a real compositor process (alternating buffer sizes); the
+  harness runs the REAL supervisor chain (`xw-session` -> compositor
+  child -> ctl-socket logout -> SIGTERM -> exit) under all four trace
+  permutations with the session's stderr on a STALLED pipe — the one
+  sink class where diagnostic writes block (physical `2>&1 | tee`-style
+  capture). PASS = the session ends promptly with code 0 and its
+  sockets are cleaned; a session that never exits is the reported
+  "logout impossible" and gets /proc syscall/wchan attribution for both
+  the session and the compositor. A file-sink control proves the trace
+  variables propagate to the compositor child (234k+ [geom] lines).
+  XW_INPUT_TRACE-only has no external volume driver (input injection
+  is compositor-internal); that permutation runs as the storm-inert
+  control, while the in-suite white-box regression covers input volume.
 - `scripts/fetch-test-apps.sh` — downloads REAL client applications
   (foot, zenity/GTK4, xterm, xeyes, Xwayland, plus their recursive
   runtime dependencies) as .debs WITHOUT root and extracts them into
