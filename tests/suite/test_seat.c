@@ -754,6 +754,223 @@ static void test_seat_keyboard_matrix(struct xwt_ctx *t) {
     xwc_win_destroy(win);
 }
 
+/* ------------------------------------------------------------- trace
+ * XW_INPUT_TRACE / XW_GEOMETRY_TRACE must be purely observational:
+ * enabling either must never change compositor or session behavior —
+ * in particular shutdown/logout. Regression shape (the reported
+ * physical-box failure): a compositor whose stderr goes to a pipe
+ * nobody drains (redirected diagnostics, a stalled reader — any sink
+ * that stops consuming) receives a storm of key + motion events, then
+ * SIGTERM — exactly what xw-session's logout path sends. A blocking
+ * diagnostic write wedges the event loop; the SIGTERM source lives IN
+ * the loop, so the signal is never dispatched; the supervisor's 1s
+ * grace expires and the SIGKILL tears the process down with the VT
+ * still in graphics mode and the keyboard still RAW — "logout becomes
+ * impossible". The control variant proves the storm itself is
+ * harmless; every trace variant must shut down just as fast. */
+struct trace_variant {
+    const char *name;
+    int input, geom;
+};
+
+static const struct trace_variant trace_variants[] = {
+    {"no-trace", 0, 0},         /* control: same storm, no instruments */
+    {"input-trace", 1, 0},      /* XW_INPUT_TRACE=1 only */
+    {"geometry-trace", 0, 1},   /* XW_GEOMETRY_TRACE=1 only */
+    {"both-traces", 1, 1},      /* XW_INPUT_TRACE=1 XW_GEOMETRY_TRACE=1 */
+};
+
+/* the child: fresh compositor + client, a focused window, then an
+ * input storm until SIGTERM arrives. stderr is the write end of a
+ * pipe the parent never reads. Exits 0 on a clean signal-driven
+ * shutdown, 2 on setup failure. */
+static void trace_child_run(int input, int geom) __attribute__((noreturn));
+static void trace_child_run(int input, int geom) {
+    if (input)
+        setenv("XW_INPUT_TRACE", "1", 1);
+    else
+        unsetenv("XW_INPUT_TRACE");
+    if (geom)
+        setenv("XW_GEOMETRY_TRACE", "1", 1);
+    else
+        unsetenv("XW_GEOMETRY_TRACE");
+
+    struct xwt_ctx t;
+    if (xwt_begin(&t, NULL) < 0)
+        _exit(2);
+
+    struct xwc_win *win = xwt_window_solid(&t, 0xff40708a, 220, 160,
+                                           "TraceStorm");
+    if (!win)
+        _exit(2);
+
+    /* wait for the map + keyboard focus (bounded pump loop, no macro
+     * noise on the shared stdout) */
+    bool focused = false;
+    for (int i = 0; i < 800 && !focused; i++) {
+        focused = t.comp->wm->focused &&
+                  strcmp(t.comp->wm->focused->title, "TraceStorm") == 0 &&
+                  t.comp->wm->focused->surface != NULL;
+        xwt_pump(&t);
+    }
+    if (!focused)
+        _exit(2);
+
+    struct xw_window *fw = t.comp->wm->focused;
+    int wx = fw->x + fw->w / 4, wy = fw->y + fw->h / 3;
+
+    /* xw_compositor_run() owns the running flag in production; the
+     * white-box child drives the loop itself, so arm it here — the
+     * SIGTERM source (on_signal) clears it, exactly like production */
+    t.comp->running = true;
+
+    /* the storm: keys through the full seat chain (entry + outcome
+     * trace lines), three motions per iteration over the window (the
+     * pointer-motion trace lines + the per-motion [geom] line — the
+     * geometry instrument's hot-path volume). Three motions keep the
+     * volume high enough that ANY instrument's line stream exceeds the
+     * 64KB pipe capacity well before the parent's SIGTERM, so the
+     * wedge/no-wedge outcome never depends on a timing race. */
+    for (int i = 0; i < 3000; i++) {
+        xw_compositor_inject_key(t.comp, 30, i & 1); /* KEY_A down/up */
+        for (int m = 0; m < 3; m++)
+            xw_compositor_inject_pointer_motion(
+                t.comp, wx + ((i + m * 21) % 64), wy + ((i + m * 13) % 32));
+        xw_compositor_dispatch(t.comp, 0);
+        if ((i & 15) == 0)
+            xwt_pump(&t); /* keep the client socket drained */
+        if (!t.comp->running)
+            break;
+    }
+
+    /* idle dispatch until the SIGTERM arrives (the supervisor's
+     * stop_compositor path) */
+    while (t.comp->running)
+        xw_compositor_dispatch(t.comp, 20);
+
+    xwt_end(&t);
+    _exit(0);
+}
+
+static void test_trace_shutdown_observational(struct xwt_ctx *t) {
+    (void)t; /* the parent runs no compositor work itself: children do */
+    for (size_t v = 0; v < sizeof(trace_variants) / sizeof(trace_variants[0]);
+         v++) {
+        const struct trace_variant *tv = &trace_variants[v];
+        int err_pipe[2];
+        if (pipe(err_pipe) < 0) {
+            XWT_CHECK(false, "pipe() failed: %s", strerror(errno));
+            return;
+        }
+        pid_t pid = fork();
+        if (pid < 0) {
+            XWT_CHECK(false, "fork() failed: %s", strerror(errno));
+            close(err_pipe[0]);
+            close(err_pipe[1]);
+            return;
+        }
+        if (pid == 0) {
+            /* stderr -> a pipe the parent holds open but NEVER reads:
+             * the stalled sink. stdout stays the suite's stdout; the
+             * child prints nothing on the success path. */
+            close(err_pipe[0]);
+            dup2(err_pipe[1], STDERR_FILENO);
+            if (err_pipe[1] != STDERR_FILENO)
+                close(err_pipe[1]);
+            trace_child_run(tv->input, tv->geom);
+        }
+        close(err_pipe[1]);
+
+        /* setup + storm: long enough for any instrument's line stream
+         * to exceed the pipe capacity (the wedge, pre-fix) or for the
+         * storm to finish (post-fix) */
+        usleep(800000);
+        kill(pid, SIGTERM); /* the logout path's first move */
+
+        int status = 0;
+        bool exited = false;
+        for (int i = 0; i < 250 && !exited; i++) { /* 2.5s budget */
+            if (waitpid(pid, &status, WNOHANG) == pid) {
+                exited = true;
+                break;
+            }
+            usleep(10000);
+        }
+        if (!exited) {
+            /* the supervisor's fallback: SIGKILL, the broken logout.
+             * First: WHERE is the child stuck? /proc syscall + wchan
+             * turn "wedged" into an attributable fact. */
+            char path[64], sbuf[256];
+            int fd;
+            snprintf(path, sizeof(path), "/proc/%d/syscall", (int)pid);
+            fd = open(path, O_RDONLY);
+            if (fd >= 0) {
+                ssize_t n = read(fd, sbuf, sizeof(sbuf) - 1);
+                close(fd);
+                if (n > 0) {
+                    sbuf[n] = 0;
+                    printf("    [wedge %s] syscall: %s", tv->name, sbuf);
+                }
+            }
+            snprintf(path, sizeof(path), "/proc/%d/wchan", (int)pid);
+            fd = open(path, O_RDONLY);
+            if (fd >= 0) {
+                ssize_t n = read(fd, sbuf, sizeof(sbuf) - 1);
+                close(fd);
+                if (n > 0) {
+                    sbuf[n] = 0;
+                    printf("    [wedge %s] wchan: %s\n", tv->name, sbuf);
+                }
+            }
+            fflush(stdout);
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            XWT_CHECK(false,
+                      "variant '%s': SIGTERM was never dispatched — the "
+                      "compositor is wedged inside a diagnostic write to a "
+                      "stalled stderr sink (tracing changed shutdown "
+                      "behavior)",
+                      tv->name);
+        } else {
+            XWT_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                      "variant '%s': child exit status %d (expected clean "
+                      "exit 0)",
+                      tv->name, status);
+        }
+        if (getenv("XWT_TRACE_DEBUG")) {
+            char dbuf[4097];
+            ssize_t dn;
+            size_t total = 0;
+            char tail[1200];
+            size_t tlen = 0;
+            while ((dn = read(err_pipe[0], dbuf, sizeof(dbuf) - 1)) > 0) {
+                total += (size_t)dn;
+                if (total == (size_t)dn) {
+                    dbuf[dn] = 0;
+                    printf("    [debug %s] first %zd bytes:\n%.900s",
+                           tv->name, dn, dbuf);
+                }
+                size_t take = (size_t)dn < sizeof(tail) ? (size_t)dn
+                                                        : sizeof(tail);
+                const char *src = dbuf + dn - take;
+                if (tlen + take > sizeof(tail)) {
+                    size_t drop = tlen + take - sizeof(tail);
+                    memmove(tail, tail + drop, tlen - drop);
+                    tlen -= drop;
+                }
+                memcpy(tail + tlen, src, take);
+                tlen += take;
+            }
+            if (tlen > 0)
+                printf("    [debug %s] tail:\n%.*s\n", tv->name, (int)tlen,
+                       tail);
+            printf("    [debug %s] pipe backlog: %zu bytes\n", tv->name,
+                   total);
+        }
+        close(err_pipe[0]);
+    }
+}
+
 static void test_seatd_switch_session(struct xwt_ctx *t) {
     pid_t pid;
     char sock[108];
@@ -880,6 +1097,7 @@ __attribute__((constructor)) static void register_seat(void) {
         {"seat-seatd-disable-autoack", test_seatd_disable_autoack},
         {"seat-vt-switch-keys", test_seat_vt_switch_keys},
         {"seat-keyboard-matrix", test_seat_keyboard_matrix},
+        {"trace-shutdown-observational", test_trace_shutdown_observational},
         {"seat-seatd-switch-session", test_seatd_switch_session},
         {"seat-seatd-server-error", test_seatd_server_error},
         {"seat-seatd-garbage", test_seatd_garbage},

@@ -3,11 +3,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -34,6 +37,113 @@ static const char *level_name(int level) {
     }
 }
 
+/* --------------------------------------------- the observational sink
+ * Every line-level diagnostic (the XW_INPUT_TRACE / XW_GEOMETRY_TRACE
+ * instruments and the default log sink) funnels through here. The
+ * contract: emitting a line must NEVER block the caller for
+ * unbounded time, whatever stderr is connected to — a pipe nobody
+ * drains (redirected diagnostics, a stalled reader), a slow console,
+ * an ssh connection that went away. The reason is not cosmetic: the
+ * event loop owns the signal sources (signalfd), so a compositor
+ * wedged inside a diagnostic write NEVER dispatches SIGTERM; the
+ * session supervisor's 1s grace expires, the SIGKILL fallback tears
+ * the process down with the VT still in graphics mode and the
+ * keyboard still RAW — "logout becomes impossible". Observed on the
+ * physical DRM box as: logout fine without XW_*_TRACE, dead with it.
+ *
+ * Mechanism: lines that cannot be written NOW are dropped and
+ * counted; the count is reported on the next successful write. Sink
+ * selection keeps every other writer (and every child process)
+ * untouched:
+ *   - regular files never block and must share fd 2's offset (the
+ *     compositor binary's own fprintf would otherwise interleave
+ *     destructively with an O_APPEND description) -> raw fd 2;
+ *   - pipes and terminals get a PRIVATE reopen through
+ *     /proc/self/fd/2 (a new file description) with O_NONBLOCK, so
+ *     neither fd 2 nor any inherited descriptor changes semantics;
+ *   - sockets cannot be reopened through /proc (open fails) -> fd 2
+ *     guarded by a zero-timeout poll, accepting only the microscopic
+ *     race of another process sharing the pipe between poll and
+ *     write; lines stay atomic (single write, well under PIPE_BUF).
+ */
+static long g_diag_dropped;
+
+static int diag_sink_fd(void) {
+    static int fd = -2; /* -2 = unresolved, -1 = use fd 2 (guarded) */
+    if (fd != -2)
+        return fd;
+    fd = -1;
+    struct stat st;
+    if (fstat(STDERR_FILENO, &st) == 0 && S_ISREG(st.st_mode)) {
+        /* regular file: never blocks; must share offset with stdio
+         * writers on fd 2 — use fd 2 directly */
+        return fd = -1;
+    }
+    int f = open("/proc/self/fd/2", O_WRONLY | O_NONBLOCK | O_APPEND |
+                                       O_CLOEXEC);
+    if (f >= 0)
+        fd = f;
+    return fd;
+}
+
+static void diag_write_raw(const char *buf, size_t len) {
+    if (len == 0)
+        return;
+    int fd = diag_sink_fd();
+    if (fd >= 0) {
+        ssize_t w = write(fd, buf, len);
+        if (w != (ssize_t)len)
+            g_diag_dropped++;
+        return;
+    }
+    struct pollfd p = {.fd = STDERR_FILENO, .events = POLLOUT};
+    if (poll(&p, 1, 0) != 1 || !(p.revents & POLLOUT)) {
+        g_diag_dropped++;
+        return;
+    }
+    if (write(STDERR_FILENO, buf, len) != (ssize_t)len)
+        g_diag_dropped++;
+}
+
+void xw_diag_vline(const char *prefix, const char *fmt, va_list ap) {
+    char buf[1024];
+    size_t plen = strlen(prefix);
+    if (plen + 2 > sizeof(buf))
+        return;
+    memcpy(buf, prefix, plen);
+    int n = vsnprintf(buf + plen, sizeof(buf) - plen - 1, fmt, ap);
+    if (n < 0)
+        return;
+    size_t body = (size_t)n;
+    if (body > sizeof(buf) - plen - 1)
+        body = sizeof(buf) - plen - 1; /* truncated, still one line */
+    buf[plen + body] = '\n';
+
+    /* a sink that stalled reports its losses before the next line:
+     * the physical runs must know the trace is incomplete */
+    if (g_diag_dropped > 0) {
+        long d = g_diag_dropped;
+        g_diag_dropped = 0;
+        char note[96];
+        int nn = snprintf(note, sizeof(note),
+                          "[trace] %ld diagnostic line%s dropped (stderr "
+                          "stalled — output incomplete)\n",
+                          d, d == 1 ? "" : "s");
+        if (nn > 0)
+            diag_write_raw(note, (size_t)nn < sizeof(note) - 1
+                                     ? (size_t)nn
+                                     : sizeof(note) - 1);
+    }
+    diag_write_raw(buf, plen + body + 1);
+}
+
+void xw_diag_line(const char *prefix, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    xw_diag_vline(prefix, fmt, ap);
+    va_end(ap);
+}
+
 void xw_log(int level, const char *fmt, ...) {
     char buf[1024];
     va_list ap;
@@ -47,7 +157,9 @@ void xw_log(int level, const char *fmt, ...) {
         g_log_fn(level, buf, g_log_ud);
         return;
     }
-    fprintf(stderr, "[xw-%s] %s\n", level_name(level), buf);
+    char prefix[16];
+    snprintf(prefix, sizeof(prefix), "[xw-%s] ", level_name(level));
+    xw_diag_line(prefix, "%s", buf);
 }
 
 int64_t xw_now_ms(void) {

@@ -346,9 +346,7 @@ void xw_input_trace(const char *fmt, ...) {
         return;
     va_list ap;
     va_start(ap, fmt);
-    fputs("[input] ", stderr);
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
+    xw_diag_vline("[input] ", fmt, ap);
     va_end(ap);
 }
 
@@ -1066,11 +1064,17 @@ void xw_seat_pointer_motion(struct xw_seat *s, int x, int y) {
                            surface_desc(s->ptr_focus, dbuf, sizeof(dbuf)),
                            lx, ly);
         }
-        if (getenv("XW_GEOMETRY_TRACE")) {
-            fprintf(stderr,
-                    "[geom] motion      global (%d,%d) -> surface-local "
-                    "(%d,%d) [buffer-relative]\n",
-                    x, y, lx, ly);
+        /* the geometry instrument's motion line: same sink, cached
+         * gate (a per-event getenv was pure waste) */
+        {
+            static int geom_trace = -1;
+            if (geom_trace < 0)
+                geom_trace = getenv("XW_GEOMETRY_TRACE") != NULL;
+            if (geom_trace)
+                xw_diag_line("[geom] ",
+                             "motion      global (%d,%d) -> surface-local "
+                             "(%d,%d) [buffer-relative]",
+                             x, y, lx, ly);
         }
         PTR_FOR_EACH(s->ptr_focus, p) {
             wl_pointer_send_motion(p, (uint32_t)xw_now_ms(),

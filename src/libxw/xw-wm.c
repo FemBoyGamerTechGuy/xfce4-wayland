@@ -131,27 +131,27 @@ void xw_wm_trace_geometry(const struct xw_window *w, const char *tag) {
         xw_surface_get_pos((struct xw_surface *)w->surface, &gx, &gy, &gw, &gh);
     struct xw_output *o = w->output;
     struct xw_seat *seat = xw_seat_first(w->comp);
-    fprintf(stderr,
-            "[geom] %-12s win %u role %s | model %dx%d+%d+%d "
-            "| surface-pos %dx%d+%d+%d | buffer %dx%d scale %d "
-            "| output '%s' %dx%d+%d+%d usable %dx%d+%d+%d "
-            "| state%s%s%s | restore %dx%d+%d+%d "
-            "| seat %d,%d\n",
-            tag, w->id, role,
-            w->w, w->h, w->x, w->y,
-            gw, gh, gx, gy,
-            w->surface ? w->surface->buf_w : 0,
-            w->surface ? w->surface->buf_h : 0,
-            w->surface ? w->surface->scale : 0,
-            o ? o->name : "(none)",
-            o ? o->width : 0, o ? o->height : 0,
-            o ? o->x : 0, o ? o->y : 0,
-            o ? o->usable.w : 0, o ? o->usable.h : 0,
-            o ? o->usable.x : 0, o ? o->usable.y : 0,
-            w->fullscreen ? " FS" : "", w->maximized ? " MAX" : "",
-            w->minimized ? " MIN" : "",
-            w->restore.w, w->restore.h, w->restore.x, w->restore.y,
-            seat ? seat->cursor_x : -1, seat ? seat->cursor_y : -1);
+    xw_diag_line("[geom] ",
+                 "%-12s win %u role %s | model %dx%d+%d+%d "
+                 "| surface-pos %dx%d+%d+%d | buffer %dx%d scale %d "
+                 "| output '%s' %dx%d+%d+%d usable %dx%d+%d+%d "
+                 "| state%s%s%s | restore %dx%d+%d+%d "
+                 "| seat %d,%d",
+                 tag, w->id, role,
+                 w->w, w->h, w->x, w->y,
+                 gw, gh, gx, gy,
+                 w->surface ? w->surface->buf_w : 0,
+                 w->surface ? w->surface->buf_h : 0,
+                 w->surface ? w->surface->scale : 0,
+                 o ? o->name : "(none)",
+                 o ? o->width : 0, o ? o->height : 0,
+                 o ? o->x : 0, o ? o->y : 0,
+                 o ? o->usable.w : 0, o ? o->usable.h : 0,
+                 o ? o->usable.x : 0, o ? o->usable.y : 0,
+                 w->fullscreen ? " FS" : "", w->maximized ? " MAX" : "",
+                 w->minimized ? " MIN" : "",
+                 w->restore.w, w->restore.h, w->restore.x, w->restore.y,
+                 seat ? seat->cursor_x : -1, seat ? seat->cursor_y : -1);
 }
 
 /* hit-test truth for the trace: which window does the wm think sits
@@ -164,10 +164,10 @@ void xw_wm_trace_pick(struct xw_wm *wm, int px, int py) {
         return;
     struct xw_surface *surf = NULL;
     struct xw_window *hit = xw_wm_window_at(wm, px, py, &surf);
-    fprintf(stderr, "[geom] pick %-6s (%d,%d) -> win %u surface %u\n",
-            "pointer", px, py,
-            hit ? hit->id : 0,
-            surf ? wl_resource_get_id(surf->res) : 0);
+    xw_diag_line("[geom] ", "pick %-6s (%d,%d) -> win %u surface %u",
+                 "pointer", px, py,
+                 hit ? hit->id : 0,
+                 surf ? wl_resource_get_id(surf->res) : 0);
     (void)hit;
 }
 
@@ -782,9 +782,20 @@ bool xw_wm_interactive_begin_move(struct xw_wm *wm, struct xw_window *w, int px,
     w->inter.grab_dy = py - w->y;
     w->inter.snap = 0;
     xw_wm_trace_geometry(w, "move-begin");
-    fprintf(stderr, "[geom]   grab offset %d,%d (pointer %d,%d - frame "
-            "%d,%d)\n", w->inter.grab_dx, w->inter.grab_dy, px, py,
-            w->x, w->y);
+    /* the grab-offset detail line: behind the same gate as its
+     * sibling (it used to print UNCONDITIONALLY — a trace leak into
+     * un-instrumented runs), through the same never-blocking sink */
+    {
+        static int enabled = -1;
+        if (enabled < 0)
+            enabled = getenv("XW_GEOMETRY_TRACE") != NULL;
+        if (enabled)
+            xw_diag_line("[geom] ",
+                         "  grab offset %d,%d (pointer %d,%d - frame "
+                         "%d,%d)",
+                         w->inter.grab_dx, w->inter.grab_dy, px, py,
+                         w->x, w->y);
+    }
     return true;
 }
 

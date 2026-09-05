@@ -93,6 +93,53 @@ static void on_signal(int sig) {
     g_stop = 1;
 }
 
+/* full teardown for EVERY exit path: proxies + the client-side xkb
+ * objects. Keeps the probe LSan-clean under the asan build (the
+ * round-2 note "destroys every proxy" missed the xkb side — and LSan
+ * ends the process with _exit, which also skips the stdio flush,
+ * eating the summary line; hence the explicit fflush at the end) */
+static void probe_teardown(struct probe *p) {
+    if (p->state) {
+        xkb_state_unref(p->state);
+        p->state = NULL;
+    }
+    if (p->keymap) {
+        xkb_keymap_unref(p->keymap);
+        p->keymap = NULL;
+    }
+    if (p->keymap_text) {
+        munmap(p->keymap_text, p->keymap_text_size);
+        p->keymap_text = NULL;
+        p->keymap_text_size = 0;
+    }
+    if (p->xkb_ctx) {
+        xkb_context_unref(p->xkb_ctx);
+        p->xkb_ctx = NULL;
+    }
+    if (p->top)
+        xdg_toplevel_destroy(p->top);
+    if (p->xdg)
+        xdg_surface_destroy(p->xdg);
+    if (p->surf)
+        wl_surface_destroy(p->surf);
+    if (p->buf)
+        wl_buffer_destroy(p->buf);
+    if (p->kb)
+        wl_keyboard_release(p->kb);
+    if (p->wm_base)
+        xdg_wm_base_destroy(p->wm_base);
+    if (p->shm)
+        wl_shm_destroy(p->shm);
+    if (p->comp)
+        wl_compositor_destroy(p->comp);
+    if (p->seat)
+        wl_seat_release(p->seat);
+    if (p->reg)
+        wl_registry_destroy(p->reg);
+    if (p->d)
+        wl_display_disconnect(p->d);
+}
+
 static void anomaly(struct probe *p, const char *fmt, ...) {
     va_list ap;
     fputs("ANOMALY: ", stdout);
@@ -497,6 +544,7 @@ int main(int argc, char **argv) {
     if (!p.d) {
         fprintf(stderr, "connect to '%s' failed (XDG_RUNTIME_DIR?)\n",
                 argv[1]);
+        probe_teardown(&p);
         return 4;
     }
     p.reg = wl_display_get_registry(p.d);
@@ -507,6 +555,7 @@ int main(int argc, char **argv) {
                 "missing globals (seat=%p comp=%p shm=%p wm_base=%p)\n",
                 (void *)p.seat, (void *)p.comp, (void *)p.shm,
                 (void *)p.wm_base);
+        probe_teardown(&p);
         return 5;
     }
     wl_display_roundtrip(p.d); /* seat caps -> wl_keyboard + keymap */
@@ -521,6 +570,7 @@ int main(int argc, char **argv) {
     xdg_toplevel_set_app_id(p.top, "xw.keyboardprobe");
     if (!make_buffer(&p)) {
         fprintf(stderr, "buffer creation failed\n");
+        probe_teardown(&p);
         return 6;
     }
     /* the pre-configure commit (empty role commit): asks the server
@@ -567,5 +617,8 @@ int main(int argc, char **argv) {
                                                           "the probe get "
                                                           "focus?")
                : "ANOMALIES ABOVE — each line is a finding");
+    fflush(stdout); /* durable before teardown AND before any exit-time
+                     * leak report's _exit (which skips the flush) */
+    probe_teardown(&p);
     return p.n_anom == 0 ? 0 : 1;
 }

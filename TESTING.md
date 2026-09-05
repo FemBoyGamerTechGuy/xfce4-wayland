@@ -828,6 +828,23 @@ the hit-test pick, the delivery target, and every cursor state
 transition (old/requested/applied, serial, rejection reason) —
 the instrument for the physical pass.
 
+**Observational contract (both trace variables):** instrumentation
+must never change compositor, input, or shutdown behavior. All trace
+lines (and the default log sink) go through a never-blocking
+diagnostic channel: if stderr stalls (a redirected pipe nobody
+drains, a dead ssh consumer, a wedged terminal), lines are DROPPED
+and counted — a `[trace] N diagnostic lines dropped (stderr
+stalled)` note reports the loss on the next successful write —
+instead of blocking the event loop. The regression that pins this:
+`trace-shutdown-observational` (in the suite) forks a compositor
+whose stderr is a pipe nobody reads, storms it with key + motion
+events under each variable alone and both together, then sends
+SIGTERM (the logout path's first move); every variant must exit
+cleanly — the pre-fix failure mode was a compositor wedged in
+`write(2)` (`wchan: pipe_write`), its signalfd SIGTERM never
+dispatched, the supervisor's SIGKILL leaving the VT in graphics mode
+and the keyboard RAW: logout dead with tracing on, fine without.
+
 Regression highlights added to the policy list:
 
 - **R-cursor-reset**: cross-client focus transitions reset the
@@ -842,3 +859,7 @@ Regression highlights added to the policy list:
   memory — the ASan SEGV).
 - **R-bare-activate-restores**: a bare `activate` on a minimized
   window unminimizes, focuses and raises it.
+- **R-trace-observational**: XW_INPUT_TRACE / XW_GEOMETRY_TRACE
+  (alone or together) never wedge shutdown — a stalled stderr sink
+  drops lines, the SIGTERM logout signal is always dispatched
+  (`trace-shutdown-observational`).

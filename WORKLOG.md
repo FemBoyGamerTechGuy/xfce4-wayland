@@ -2745,3 +2745,73 @@ stacks. (C) with the model rect == output rect and the gap still on
 screen, the XW_GEOMETRY_TRACE output-setup line (mode/CRTC/FB/pitch/
 layout/scale) is the one place left to look — one-sided gap with a
 zero-pitch/stride mismatch points at the scanout FB pitch leg.
+
+---
+
+## Round 4 — the trace-observability round (2026-09-06)
+
+The physical report: with
+`XW_INPUT_TRACE=1 XW_GEOMETRY_TRACE=1 ./build/bin/xw-compositor -B drm`
+graphical logout becomes impossible/awkward; without the variables it
+works. That is by definition NOT a TTY/session consequence — the
+instruments were changing behavior.
+
+**Root cause (reproduced headlessly, RED first)**: every trace line
+(and the default `xw_log` sink) was synchronous stdio on stderr. The
+compositor's signal sources live in the event loop
+(wl_event_loop_add_signal, signalfd-style), so a compositor blocked
+inside `write(2, ...)` to a stalled stderr NEVER dispatches SIGTERM.
+xw-session's logout path (stop_compositor) gives 1s grace then
+SIGKILLs: no VT restore (still graphics mode), no KDSKBMODE XLATE
+(keyboard still RAW), no DRM teardown — "logout impossible". The
+regression `trace-shutdown-observational` (in the suite) reproduces
+it deterministically: forked compositor children with stderr = a
+pipe the parent never reads, storm of keys + motions under each
+variable alone and both together, then SIGTERM. Pre-fix all three
+trace variants wedge (verified by /proc diagnostics: `syscall: 1
+0x2 ... wchan: pipe_write` — literally blocked writing stderr), the
+no-trace control passes. Answer to "which variable": BOTH,
+independently — input carries the per-event volume on a live
+desktop, geometry's per-motion line does the same; whichever fills
+the stalled sink first kills the logout.
+
+**The fix — one never-blocking diagnostic sink**
+(`xw_diag_line`/`xw_diag_vline`, xw-util.c): every line-level
+diagnostic (input trace, geometry trace, drm setup trace, default
+log sink) formats into a bounded stack buffer and emits ONE write.
+Sink selection: regular files use raw fd 2 (never blocks, keeps the
+shared offset with the binary's own fprintf); pipes and terminals
+get a PRIVATE reopen through /proc/self/fd/2 with O_NONBLOCK (a new
+file description — fd 2, children, nothing else changes semantics);
+sockets fall back to fd 2 guarded by a zero-timeout poll. A line
+that cannot be written now is DROPPED and counted; the first
+successful write after a stall reports `[trace] N diagnostic lines
+dropped (stderr stalled)` so physical runs know the trace is
+incomplete. Line formats are byte-identical to the old ones (the
+physical decision tables in Round 3 depend on them). Also fixed
+along the way: the move-begin grab-offset line printed
+UNCONDITIONALLY (a trace leak into un-instrumented runs — now gated
+like its siblings), the per-motion getenv in the seat is cached,
+and the compositor's crash handler writes with raw write() instead
+of fprintf (a fault landing inside any stdio writer used to
+deadlock the handler on the stderr lock and swallow the backtrace).
+
+**keyboardprobe (the physical key-wire recorder) under the asan
+build**: LSan found the probe's own leaks (xkb_context/keymap/state
+on every exit path — round 3's "destroys every proxy" missed the
+xkb side), and LSan's _exit skips the stdio flush, which silently
+ate the probe's summary line and failed the physical-kbd script.
+Fixed: full teardown on every exit path (connect failure, missing
+globals, buffer failure, normal exit) + explicit fflush before
+teardown. physical-kbd now PASSes under BOTH profiles.
+
+**Validation**: 128/128 in-process release, 128/128 under
+ASan/UBSan/LSan with zero reports (the new test forks children;
+_exit keeps their teardown out of the parent's leak check),
+physical-kbd PASS (asan and release), link-deps 7/7. The instrument
+set and decision tables from Round 3 are unchanged — same lines,
+same gates, now guaranteed observational.
+
+**Next**: unchanged — the physical NVIDIA decision run (A: probe +
+input trace diff against the reporting app; B: real-app CSD hit
+confirmation; C: the DRM output-setup line when a gap persists).

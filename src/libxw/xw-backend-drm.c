@@ -801,12 +801,12 @@ static int add_output(struct drm_backend *db, drmModeConnectorPtr conn,
      * physical gap with a correct model rect points HERE (mode !=
      * logical, CRTC offset, or a scaled native mismatch). */
     if (getenv("XW_GEOMETRY_TRACE")) {
-        fprintf(stderr,
-                "[geom] drm output %s: mode %dx%d@%u crtc=%u@0,0 "
-                "fb=%ux%u pitch=%u layout=%d,%d logical=%dx%d scale=%d\n",
-                op->name, w, h, op->mode.vrefresh, crtc_id, w, h,
-                (int)op->bos[0].pitch, op->out->x, op->out->y,
-                op->out->width, op->out->height, op->out->scale);
+        xw_diag_line("[geom] ",
+                     "drm output %s: mode %dx%d@%u crtc=%u@0,0 "
+                     "fb=%ux%u pitch=%u layout=%d,%d logical=%dx%d scale=%d",
+                     op->name, w, h, op->mode.vrefresh, crtc_id, w, h,
+                     (int)op->bos[0].pitch, op->out->x, op->out->y,
+                     op->out->width, op->out->height, op->out->scale);
     }
     return w;
 }

@@ -809,6 +809,16 @@ void xw_subsurface_parent_destroyed(struct xw_surface *parent);
 /* XW_INPUT_TRACE=1 instrument (xw-seat.c): pointer/cursor/focus
  * event lines on stderr for physical debugging */
 void xw_input_trace(const char *fmt, ...);
+/* the never-blocking diagnostic sink (xw-util.c): every line-level
+ * diagnostic (trace instruments, default log sink) goes through it.
+ * prefix + printf body + '\n', ONE non-blocking write; when stderr
+ * stalls (pipe nobody drains, dead consumer) lines are dropped and
+ * counted instead of blocking the event loop — the observational
+ * contract: XW_INPUT_TRACE / XW_GEOMETRY_TRACE must never change
+ * compositor, signal-dispatch, or shutdown behavior. */
+void xw_diag_line(const char *prefix, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+void xw_diag_vline(const char *prefix, const char *fmt, va_list ap);
 
 void xw_seat_forget_cursor_surface(struct xw_compositor *c,
                                    struct xw_surface *s);

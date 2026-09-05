@@ -17,12 +17,32 @@
 #include <execinfo.h>
 #include <getopt.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 static struct xw_compositor *g_comp;
+
+/* crash-path message: write() straight to fd 2. fprintf holds the
+ * stderr stdio lock — a fault landing inside ANY stdio writer (the
+ * old synchronous trace path printed constantly) would deadlock the
+ * handler and swallow the diagnostics + the honest re-raise. Raw
+ * writes have no locks to deadlock on. snprintf in a handler is the
+ * accepted glibc practice (no allocation, no locking). */
+static void crash_msg(const char *fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n <= 0)
+        return;
+    if ((size_t)n > sizeof(buf) - 1)
+        n = (int)sizeof(buf) - 1;
+    (void)!write(STDERR_FILENO, buf, (size_t)n);
+}
 
 static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     (void)ctx;
@@ -42,31 +62,31 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
 
     /* the message libwayland prints for a NULL request listener dies
      * with the process; make OUR message impossible to miss */
-    fprintf(stderr,
-            "\n[xw-fatal] xw-compositor caught signal %d (%s) at %s\n",
-            sig, why,
-            sig == SIGSEGV || sig == SIGBUS ? "(faulting address below)" : "");
+    crash_msg("\n[xw-fatal] xw-compositor caught signal %d (%s) at %s\n",
+              sig, why,
+              sig == SIGSEGV || sig == SIGBUS ? "(faulting address below)"
+                                              : "");
 
     if (sig == SIGSEGV || sig == SIGBUS) {
         char addr[32];
         snprintf(addr, sizeof(addr), "%p", si->si_addr);
-        fprintf(stderr, "[xw-fatal] fault address: %s (code %d)\n", addr,
-                si->si_code);
+        crash_msg("[xw-fatal] fault address: %s (code %d)\n", addr,
+                  si->si_code);
     }
     if (si->si_code == SI_USER || si->si_code == SI_QUEUE)
-        fprintf(stderr, "[xw-fatal] sent by pid %d, uid %d\n",
-                (int)si->si_pid, (int)si->si_uid);
+        crash_msg("[xw-fatal] sent by pid %d, uid %d\n",
+                  (int)si->si_pid, (int)si->si_uid);
 
     xw_compositor_dump_state(g_comp);
 
     void *bt[40];
     int n = backtrace(bt, 40);
     if (n > 0) {
-        fprintf(stderr, "[xw-fatal] backtrace (%d frames):\n", n);
+        crash_msg("[xw-fatal] backtrace (%d frames):\n", n);
         backtrace_symbols_fd(bt, n, STDERR_FILENO);
     }
-    fprintf(stderr, "[xw-fatal] dying now (default disposition re-raised; "
-                    "the session manager will restart the compositor)\n");
+    crash_msg("[xw-fatal] dying now (default disposition re-raised; "
+              "the session manager will restart the compositor)\n");
 
     /* re-raise so the wait status stays WIFSIGNALED: honest crash,
      * never a masked silent exit */
