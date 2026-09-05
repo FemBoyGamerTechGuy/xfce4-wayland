@@ -149,6 +149,23 @@ absent rather than half-working.
   XW_INPUT_TRACE-only has no external volume driver (input injection
   is compositor-internal); that permutation runs as the storm-inert
   control, while the in-suite white-box regression covers input volume.
+- `scripts/pixman-bug-count.sh` — **Level 2**: the region16 domain
+  guard regression at the REAL session level. Runs the
+  test-session-trace environment (no trace variables — the pixman spam
+  is trace-independent) with the geometry storm against a file sink
+  and counts pixman `Invalid rectangle` BUG blocks in the compositor's
+  stderr: pre-fix the storm's full-damage rect
+  (0,0,INT32_MAX,INT32_MAX) logged a saturating ~10 per session (x2
+  truncates into the int16 region16 domain as -1 — an inverted box);
+  post-fix the count must be 0. The in-suite white-box companion is
+  `damage-rect-boundary` (test_core.c), which drives every
+  protocol-invalid rect shape through wl_surface.damage /
+  damage_buffer / wl_region.add / subtract with the libc `stderr`
+  FILE* swapped to a pipe — pixman writes its BUG blocks through that
+  pointer, so the capture is the exact assertion (a valid-rect
+  positive control guards against over-fixing, and the clamped
+  overflow semantics are pinned: full-damage rects survive as
+  (0,0,32767,32767)).
 - `scripts/fetch-test-apps.sh` — downloads REAL client applications
   (foot, zenity/GTK4, xterm, xeyes, Xwayland, plus their recursive
   runtime dependencies) as .debs WITHOUT root and extracts them into

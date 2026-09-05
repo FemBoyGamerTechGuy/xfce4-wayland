@@ -65,13 +65,18 @@ static void region_add(struct wl_client *client, struct wl_resource *res,
                        int32_t x, int32_t y, int32_t w, int32_t h) {
     (void)client;
     pixman_region16_t *r = wl_resource_get_user_data(res);
-    pixman_region_union_rect(r, r, x, y, w, h);
+    /* protocol input — same region16 domain clamp as the damage path */
+    if (xw_region16_rect_clamp(&x, &y, &w, &h))
+        pixman_region_union_rect(r, r, x, y, w, h);
 }
 static void region_sub(struct wl_client *client, struct wl_resource *res,
                        int32_t x, int32_t y, int32_t w, int32_t h) {
     (void)client;
     pixman_region16_t *r = wl_resource_get_user_data(res);
     pixman_region16_t tmp;
+    /* protocol input — clamped, so init_rect never wraps or logs */
+    if (!xw_region16_rect_clamp(&x, &y, &w, &h))
+        return; /* nothing to subtract */
     pixman_region_init_rect(&tmp, x, y, w, h);
     pixman_region_subtract(r, r, &tmp);
     pixman_region_fini(&tmp);

@@ -39,6 +39,41 @@ pid_t xw_spawn_command(struct xw_compositor *c, const char *cmdline);
  * (used by xw_spawn_command after fork). */
 void xw_compositor_track_child(struct xw_compositor *c, pid_t pid);
 
+/* ------------------------------------------------------ region16 domain */
+/* Region16 boxes are int16 on every axis. The client-facing rect
+ * handlers (wl_surface.damage, wl_surface.damage_buffer,
+ * wl_region.add/subtract) used to forward protocol ints to pixman
+ * verbatim, and pixman has two failure classes for out-of-domain
+ * input: NEGATIVE extents make it log "*** BUG *** In
+ * pixman_region_union_rect: Invalid rectangle passed" and drop the rect
+ * (the 2026-09-06 physical session log carried 11 of these from a real
+ * client; geomstorm's damage(0,0,INT32_MAX,INT32_MAX) — x2 truncates
+ * into int16 as -1 — produces a saturating ~10 per storm), while
+ * coordinates BEYOND the int16 domain wrap silently into garbage
+ * extents (x=40000 becomes x=-25536: wrong damage with no diagnostic
+ * at all). Damage is a hint, never a wedge: clamp each rect into the
+ * representable domain, drop what is empty/inverted or falls outside
+ * entirely. Valid rects — including negative origins, which are legal
+ * surface-local coordinates — pass through unchanged. Returns false
+ * when the rect should be ignored. */
+static inline bool xw_region16_rect_clamp(int *x, int *y, int *w, int *h) {
+    if (*w <= 0 || *h <= 0)
+        return false;
+    /* 64-bit corners: x + w must not overflow int before clamping */
+    int64_t x2 = (int64_t)*x + *w, y2 = (int64_t)*y + *h;
+    int x1 = *x < INT16_MIN ? INT16_MIN : *x;
+    int y1 = *y < INT16_MIN ? INT16_MIN : *y;
+    int ex2 = x2 > INT16_MAX ? INT16_MAX : (int)x2;
+    int ey2 = y2 > INT16_MAX ? INT16_MAX : (int)y2;
+    if (x1 >= ex2 || y1 >= ey2)
+        return false; /* entirely beyond the representable domain */
+    *x = x1;
+    *y = y1;
+    *w = ex2 - x1;
+    *h = ey2 - y1;
+    return true;
+}
+
 /* --------------------------------------------------------------- ini file */
 struct xw_ini_entry {
     char *key, *value;

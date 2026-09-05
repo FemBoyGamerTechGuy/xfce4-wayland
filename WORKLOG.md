@@ -3006,3 +3006,140 @@ changes (plus the trace-capture guidance):
    screen — read the XW_GEOMETRY_TRACE output-setup line (mode/CRTC/
    FB/pitch/layout/scale) from the trace.log; one-sided gap with a
    pitch/stride mismatch points at the scanout FB pitch leg.
+
+## Round 6 — the first physical matrix feedback: logout ① PASS, and the 11 pixman BUG blocks (2026-09-06)
+
+The physical box delivered its first matrix leg: a full no-trace
+session log through `./build/bin/xw-session` (the REAL runner, the
+corrected procedure from Round 5). Read in order:
+
+### What the physical log says
+
+- **Permutation ① (no trace): PASS.** The logout ran the complete
+  audited chain — exit click -> ctl -> `session ending` -> autostarts
+  stopped in order -> compositor stopped -> clients saw the pipe break
+  (`Conductă(pipe) ruptă` = the GTK locale string for EPIPE on the
+  compositor's socket death) -> session d-bus stopped -> `session
+  manager exiting`, all inside ~191ms (10:43:04.849 ->
+  10:43:05.040). The supervisor leg holds on real hardware. The
+  stderr sink was the TTY itself (no pipe), so the stalled-sink class
+  was not in play — permutations ②③④ with `2> trace.log` remain the
+  open legs of the matrix.
+- **Eleven pixman BUG blocks, exactly while kitty was the active
+  client**: `*** BUG *** In pixman_region_union_rect: Invalid
+  rectangle passed` — a NEW physical signal, this round's root cause
+  (below).
+- The NVIDIA page-flip timeout fired once at startup and the fallback
+  engaged as designed: `page flip on HDMI-A-1 never completed ... the
+  driver ACCEPTED the flip but no vblank event arrived within 300ms ->
+  immediate buffer updates`. Expected on the legacy flip path; the
+  desktop rendered and interacted normally after it.
+- **XWayland is missing on the box** (`no Xwayland binary found`): X11
+  apps cannot start, so the B-leg (CSD hits on BOTH stacks) is blocked
+  until Xwayland is installed or `$XW_XWAYLAND_CMD` points at one.
+- Expected noise, no action: wlr-output-power-management and
+  wlr-output-management unsupported (unimplemented protocols —
+  XFCE DPMS and display-settings tools degrade, documented), RTKit
+  `ServiceUnknown` (no rtkit service on the box; PipeWire falls back
+  to priority 1), icon-name fallbacks (missing theme icons).
+
+### The 11 BUG blocks: root cause
+
+All region16 call sites in libxw are the 16-bit pixman API (the error
+message has no `32`) — and three client-facing handlers forwarded
+protocol ints to pixman VERBATIM: `wl_surface.damage`,
+`wl_surface.damage_buffer` (÷ scale, sign preserved), and
+`wl_region.add`/`subtract`. pixman's failure classes for
+out-of-domain input (pinned empirically, scripts/pixman-semantics.c
+et al. during the round, then distilled into the committed harness):
+
+- negative w/h: `*** BUG *** Invalid rectangle passed` logged, rect
+  DROPPED (the unsigned width parameter wraps, x2 < x1);
+- zero w/h: silently dropped;
+- coordinates beyond the int16 box domain: SILENTLY WRAPPED into
+  garbage extents (x=40000 becomes x=-25536 — wrong damage, no
+  diagnostic at all);
+- negative ORIGINS: legal (surface-local coords) and always worked.
+
+The physical 11: kitty streamed protocol-invalid damage rects; our
+handlers handed them to pixman; pixman logged ~10-11 and then went
+quiet — the count SATURATES (measured: `union(bad)+clear` cycled on
+one region produces exactly ~10 blocks whether the cycle count is 50
+or 225,373 — pixman's internal validation settles into a
+non-erroring accumulation). The magnitude match (physical 11, storm
+10) is the attribution: same mechanism, one surface, saturating
+validator.
+
+The in-suite twin: `tests/geomstorm.c` sends
+`damage(0, 0, INT32_MAX, INT32_MAX)` on EVERY commit (x2 truncates
+into int16 as -1 — inverted box), so every session-trace harness run
+has been carrying the same ~10 BUG blocks in its stderr sinks all
+along; we only grepped [geom] lines and never noticed until the
+physical log made pixman's own voice audible.
+
+### The fix (protocol-boundary sanitation, zero behavior change)
+
+`xw_region16_rect_clamp()` (xw-internal.h, static inline): 64-bit
+corners first (x+w must not overflow int before clamping), then clamp
+into the int16 box domain; drop empty/inverted rects and rects
+entirely outside the domain; valid rects — including negative origins
+— pass through UNCHANGED. Applied at the four protocol boundary
+handlers: `surface_damage`, `surface_damage_buffer` (after the scale
+division), `region_add`, `region_subtract` (a dropped rect subtracts
+nothing — semantically identical to pixman's own drop, minus the BUG
+spam; a clamped rect gives init_rect a domain-valid box so it can
+never wrap either). The internal union sites keep their existing
+guards (`w > 0 && h > 0` at every caller of xw_output_damage_rect;
+full-output damage at (0,0,w,h)).
+
+`pending_damage` is write-only in the render path today (cleared at
+commit; repaint extent comes from window-extent damage), so the
+clamp/drop distinction has no rendering consequence — but the
+accumulator now holds HONEST state for the day something consumes it:
+the storm's full-damage rect survives as (0,0,32767,32767) instead of
+being dropped, and nothing pixman-side can log or wrap.
+
+### The instrument set (new)
+
+- `tests/suite/test_core.c: damage-rect-boundary` — the white-box RED:
+  fresh surface, valid-rect positive control (union + extents, commit
+  clears), then the invalid batch under an intercepted `stderr` (the
+  libc `stderr` FILE* swapped to a pipe — pixman writes its BUG
+  blocks through that pointer, verified before designing the test;
+  the swap window contains no asserts so it is always undone).
+  Assertions: zero captured BUG text, and the post-fix accumulation
+  semantics (negative/zero dropped, overflow clamped+coalesced to
+  (0,0,32767,32767)). Pre-fix: 4 failures, 9 BUG blocks captured
+  (1042 bytes). Post-fix: clean.
+- `scripts/pixman-bug-count.sh` — the session-level RED through the
+  REAL chain (test-session-trace environment minus trace variables):
+  storm + file sink + ctl logout, then count `Invalid rectangle`
+  blocks in the session's stderr. Pre-fix: 10. Post-fix: 0, exit 0.
+
+### Validation
+
+- in-process: 130/130 (13 skips — the XWayland apps-root gates),
+  ASan/UBSan/LSan clean (`make asan` PASS + 130/130).
+- session-trace harness: 21/21 (all four stalled-pipe permutations
+  logout ~104ms; file-sink control 190,630 propagated [geom] lines).
+- pixman-bug-count: 0 (pre-fix 10).
+- test-session.sh: 128/128 (the environment-gated legs now PASS in
+  this container — the sysroot bootstrap installed the DRM dev stack,
+  so the "fails honestly without KMS" checks exercise the real
+  refusal path; Xvfb legs SKIP).
+- link-deps: 7/7.
+
+Build-hygiene note (pre-existing, not this round): the Makefile has no
+header dependency tracking — xw-internal.h edits do not rebuild the
+objects that include it; clean profiles (`make` / `make asan`) remain
+the guaranteed path.
+
+### Physical next steps (the matrix continues)
+
+Permutations ② (XW_INPUT_TRACE=1) ③ (XW_GEOMETRY_TRACE=1) ④ (both),
+each `2> trace.log` through `./build/bin/xw-session`, brief use,
+Ctrl+Alt+Del -> Log Out; then the A/B/C probes per the Round 5
+procedure. kitty's damage stream is now a NON-issue (this fix), so a
+re-run of ① that USED to show 11 blocks should now show 0 — a quick
+confirmation that the physical box picked up the new build. B needs
+Xwayland installed on the box first.

@@ -2,6 +2,7 @@
 #include "xwtest.h"
 
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -852,6 +853,117 @@ static void test_geometry_fullscreen(struct xwt_ctx *t) {
     xwc_win_destroy(winC);
 }
 
+/* ------------------------------------------- damage/region rect boundary */
+/* The 2026-09-06 physical round: the NVIDIA/Artix session log carried
+ * eleven pixman "*** BUG *** In pixman_region_union_rect: Invalid
+ * rectangle passed" blocks while a real client (kitty) was running —
+ * and the in-suite geomstorm driver sends damage(0, 0, INT32_MAX,
+ * INT32_MAX) on every commit (x2 truncates into the int16 region16
+ * domain as -1: an inverted box), producing the same spam (measured: a
+ * saturating ~10 blocks per storm, pixman's internal validation goes
+ * quiet after that and silently accumulates garbage). The three
+ * client-facing rect handlers (wl_surface.damage, damage_buffer,
+ * wl_region.add/sub) forward protocol ints to pixman verbatim; pixman
+ * either logs+drops (negative extents), silently wraps (coordinates
+ * beyond the int16 domain — wrong damage with NO diagnostic), or drops
+ * (zero extents). The server must sanitize at the protocol boundary.
+ *
+ * Observability: pixman writes its BUG blocks through the libc stderr
+ * FILE*, so the test swaps the pointer for a pipe around the bad batch
+ * and asserts the capture is clean (verified: a single bad union on a
+ * freshly-cleared region logs exactly one block — deterministic RED). */
+static void test_damage_rect_boundary(struct xwt_ctx *t) {
+    struct wl_compositor *comp = t->client.compositor;
+    XWT_ASSERT(comp);
+    struct wl_surface *surf = wl_compositor_create_surface(comp);
+    XWT_ASSERT(surf);
+    wl_display_flush(t->client.display);
+    xwt_pump(t);
+    xwt_pump(t);
+    XWT_ASSERT(!wl_list_empty(&t->comp->surfaces));
+    struct xw_surface *s =
+        wl_container_of(t->comp->surfaces.next, s, link);
+
+    /* positive control: valid rects union into pending_damage; negative
+     * origins are legal surface-local coordinates and must keep working */
+    wl_surface_damage(surf, 10, 20, 30, 40);
+    wl_surface_damage(surf, -100, -100, 50, 50);
+    wl_display_flush(t->client.display);
+    xwt_pump(t);
+    xwt_pump(t);
+    int n = pixman_region_n_rects(&s->pending_damage);
+    pixman_box16_t *e = pixman_region_extents(&s->pending_damage);
+    XWT_CHECK(n == 2, "two valid damage rects union (got %d)", n);
+    XWT_CHECK(e->x1 == -100 && e->y1 == -100 && e->x2 == 40 && e->y2 == 60,
+              "damage extents (-100,-100 40,60), got (%d,%d %d,%d)", e->x1,
+              e->y1, e->x2, e->y2);
+
+    /* commit consumes the accumulator (role-less commit clears it) */
+    wl_surface_commit(surf);
+    wl_display_flush(t->client.display);
+    xwt_pump(t);
+    XWT_CHECK(pixman_region_n_rects(&s->pending_damage) == 0,
+              "commit clears pending_damage");
+
+    /* the invalid batch — every protocol-invalid shape at once, stderr
+     * intercepted. NO asserts inside the window: the swap must be undone
+     * unconditionally. */
+    int fds[2];
+    XWT_ASSERT(pipe(fds) == 0);
+    FILE *saved = stderr;
+    FILE *fake = fdopen(fds[1], "w");
+    XWT_ASSERT(fake);
+    stderr = fake;
+
+    wl_surface_damage(surf, 5, 5, -3, 10); /* negative width */
+    wl_surface_damage(surf, 5, 5, 10, -3); /* negative height */
+    wl_surface_damage(surf, 5, 5, 0, 10);  /* zero width (pixman-silent,
+                                              still a protocol-invalid hint) */
+    wl_surface_damage(surf, 0, 0, INT32_MAX, INT32_MAX); /* storm full-damage:
+                                                            int16 overflow */
+    wl_surface_damage_buffer(surf, -5, -5, -3, 10); /* buffer variants */
+    wl_surface_damage_buffer(surf, 0, 0, INT32_MAX, INT32_MAX);
+    struct wl_region *reg = wl_compositor_create_region(comp);
+    wl_region_add(reg, 5, 5, -3, 10);
+    wl_region_add(reg, 0, 0, INT32_MAX, INT32_MAX);
+    wl_region_subtract(reg, 5, 5, -3, 10);
+    wl_region_subtract(reg, 0, 0, INT32_MAX, INT32_MAX);
+    wl_region_destroy(reg);
+    wl_display_flush(t->client.display);
+    xwt_pump(t);
+    xwt_pump(t);
+
+    fflush(fake);
+    fclose(fake);
+    stderr = saved;
+
+    char cap[8192];
+    ssize_t got = read(fds[0], cap, sizeof(cap) - 1);
+    close(fds[0]);
+    if (got < 0)
+        got = 0;
+    cap[got] = 0;
+    XWT_CHECK(!strstr(cap, "Invalid rectangle"),
+              "pixman rejected a protocol rect (%zd bytes captured)", got);
+    XWT_CHECK(!strstr(cap, "*** BUG ***"), "pixman BUG block: %.120s", cap);
+
+    /* post-fix accumulation semantics: negative/zero extents drop; the
+     * overflowing full-damage rects clamp into the region16 domain and
+     * union (damage is a hint — clamping keeps maximal coverage, and the
+     * two identical overflow rects coalesce) */
+    n = pixman_region_n_rects(&s->pending_damage);
+    e = pixman_region_extents(&s->pending_damage);
+    XWT_CHECK(n == 1, "only the clamped overflow rect survives (got %d)", n);
+    XWT_CHECK(e->x1 == 0 && e->y1 == 0 && e->x2 == INT16_MAX &&
+                  e->y2 == INT16_MAX,
+              "clamped full damage (0,0 %d,%d), got (%d,%d %d,%d)",
+              INT16_MAX, INT16_MAX, e->x1, e->y1, e->x2, e->y2);
+
+    wl_surface_destroy(surf);
+    wl_display_flush(t->client.display);
+    xwt_pump(t);
+}
+
 /* ------------------------------------------------------------ registration */
 
 static const struct xwt_test tests[] = {
@@ -867,6 +979,7 @@ static const struct xwt_test tests[] = {
     {"shortcut-all-defaults", test_all_default_shortcuts},
     {"shortcut-show-desktop", test_shortcut_show_desktop},
     {"pointer-focus", test_pointer_focus},
+    {"damage-rect-boundary", test_damage_rect_boundary},
 };
 
 __attribute__((constructor)) static void register_tests(void) {

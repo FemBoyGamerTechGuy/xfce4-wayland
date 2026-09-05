@@ -27,7 +27,13 @@ static void surface_damage(struct wl_client *client, struct wl_resource *res,
                            int32_t x, int32_t y, int32_t w, int32_t h) {
     (void)client;
     struct xw_surface *s = wl_resource_get_user_data(res);
-    pixman_region_union_rect(&s->pending_damage, &s->pending_damage, x, y, w, h);
+    /* protocol input, clamped into the region16 domain (see
+     * xw_region16_rect_clamp): a malformed hint is dropped, an
+     * overflowing one keeps maximal coverage — pixman never sees a
+     * rect it would reject or wrap */
+    if (xw_region16_rect_clamp(&x, &y, &w, &h))
+        pixman_region_union_rect(&s->pending_damage, &s->pending_damage, x,
+                                 y, w, h);
 }
 
 static void surface_frame(struct wl_client *client, struct wl_resource *res,
@@ -104,8 +110,14 @@ static void surface_damage_buffer(struct wl_client *client,
     (void)client;
     struct xw_surface *s = wl_resource_get_user_data(res);
     int scale = s->scale > 0 ? s->scale : 1;
-    pixman_region_union_rect(&s->pending_damage, &s->pending_damage, x / scale,
-                             y / scale, w / scale, h / scale);
+    x /= scale;
+    y /= scale;
+    w /= scale;
+    h /= scale;
+    /* same domain clamp as surface_damage (buffer-space, pre-scaled) */
+    if (xw_region16_rect_clamp(&x, &y, &w, &h))
+        pixman_region_union_rect(&s->pending_damage, &s->pending_damage, x,
+                                 y, w, h);
 }
 
 static void surface_offset(struct wl_client *client, struct wl_resource *res,
