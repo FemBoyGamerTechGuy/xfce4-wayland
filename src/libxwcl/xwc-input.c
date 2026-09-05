@@ -82,13 +82,17 @@ static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
     c->last_serial = serial;
     bool down = state == WL_KEYBOARD_KEY_STATE_PRESSED;
     if (c->xkb_state) {
-        xkb_state_update_key(c->xkb_state, key,
+        /* the wire keycode is the RAW evdev code; the shared keymap's
+         * keycode space is evdev + 8 (classic X space, <BKSP>=22) — the
+         * +8 belongs on THIS side of the wire, exactly like Xwayland,
+         * GTK and every other real client does it */
+        xkb_state_update_key(c->xkb_state, key + 8,
                              down ? XKB_KEY_DOWN : XKB_KEY_UP);
-        xkb_keysym_t sym = xkb_state_key_get_one_sym(c->xkb_state, key);
+        xkb_keysym_t sym = xkb_state_key_get_one_sym(c->xkb_state, key + 8);
         uint32_t mods = xkb_state_serialize_mods(c->xkb_state,
                                                  XKB_STATE_MODS_DEPRESSED);
-        /* back to raw linux keycode for the callback layer */
-        xwc_input_key(c, key - 8, down, sym, mods);
+        /* the callback layer receives the raw linux keycode unchanged */
+        xwc_input_key(c, key, down, sym, mods);
     }
 }
 

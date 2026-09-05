@@ -12,7 +12,7 @@
  * line flushed) and then executes stdin commands, one per line:
  *   resize WxH | title NAME | move X Y | queryfocus | fullscreen |
  *   unfullscreen | state | wait | exit | geom | draw [COLOR] |
- *   pointer on/off | button on/off
+ *   pointer on/off | button on/off | keys on
  * Output lines the tests assert on:
  *   WINDOW 0x...     (the toplevel id, right after creation)
  *   MAPPED
@@ -20,6 +20,11 @@
  *   GEOM WxH+X+Y BW B  (XGetGeometry + root-translation truth + border)
  *   MOTION X,Y        (PointerWindow motion, window-local coords)
  *   BTN d X,Y         (ButtonPress/Release with window-local coords)
+ *   KEY code sym press|release [text=c]
+ *                     (KeyPress/KeyRelease with the X keycode, the
+ *                      keysym name, and the translated text — the X
+ *                      side of the wire-keycode-space contract: the X
+ *                      keycode must be the raw evdev code + 8)
  *   ENTER X,Y         (EnterNotify, window-local)
  *   DELETE            (WM_DELETE_WINDOW received — client exits itself)
  *   TAKEFOCUS        (WM_TAKE_FOCUS received)
@@ -288,6 +293,23 @@ int main(int argc, char **argv) {
                     say("BTN %c %d,%d",
                         ev.type == ButtonPress ? 'd' : 'u', ev.xbutton.x,
                         ev.xbutton.y);
+            } else if (ev.type == KeyPress || ev.type == KeyRelease) {
+                if (ev.xkey.window == win) {
+                    KeySym ks = XLookupKeysym(&ev.xkey, 0);
+                    const char *kn = ks != NoSymbol ? XKeysymToString(ks)
+                                                    : "(nosym)";
+                    char txt[8] = "";
+                    if (ev.type == KeyPress) {
+                        int n = XLookupString(&ev.xkey, txt,
+                                              (int)sizeof(txt) - 1, NULL,
+                                              NULL);
+                        txt[n > 0 ? n : 0] = 0;
+                    }
+                    say("KEY %u %s %s%s%s",
+                        (unsigned)ev.xkey.keycode, kn ? kn : "(null)",
+                        ev.type == KeyPress ? "press" : "release",
+                        txt[0] ? " text=" : "", txt);
+                }
             } else if (ev.type == ClientMessage) {
                 if ((Atom)ev.xclient.data.l[0] == atom_wm_delete) {
                     say("DELETE");
@@ -402,6 +424,17 @@ int main(int argc, char **argv) {
                 send_state_msg(dpy, win, 0 /* _NET_WM_STATE_REMOVE */);
             } else if (strncmp(line, "state", 5) == 0) {
                 report_state(dpy, win);
+            } else if (strncmp(line, "keys", 4) == 0) {
+                /* add KeyPress/KeyRelease to OUR OWN selection (per-(client,
+                 * window) masks — the WM's selections never clobber these):
+                 * the X-side keyboard contract test */
+                XWindowAttributes wa;
+                if (XGetWindowAttributes(dpy, win, &wa)) {
+                    XSelectInput(dpy, win,
+                                 wa.your_event_mask | KeyPressMask |
+                                     KeyReleaseMask);
+                    say("KEYS-ON");
+                }
             } else if (strncmp(line, "queryfocus", 10) == 0) {
                 Window focus = None;
                 int revert = 0;

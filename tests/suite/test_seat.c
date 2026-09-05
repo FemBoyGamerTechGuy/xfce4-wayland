@@ -575,10 +575,13 @@ static void test_seat_vt_switch_keys(struct xwt_ctx *t) {
  * exact wl_keyboard event stream a raw client must observe for every
  * key combination of the report, plus the keycode space of the
  * delivered keymap itself. The xwc key callback reports the RAW linux
- * keycode (wire - 8) and the keysym IT computed from the delivered
- * keymap + modifiers events — so a double +8, a raw-space keymap, or
- * a corrupted modifier stream all fail here with a diff of exactly
- * which event was wrong. */
+ * keycode (the literal wire code — raw evdev) and the keysym IT
+ * computed from the delivered keymap + modifiers events (decoding at
+ * wire+8 like every real client) — so a +8/−8 wire offset, a
+ * raw-space keymap, or a corrupted modifier stream all fail here with
+ * a diff of exactly which event was wrong. The literal wire bytes are
+ * pinned separately (seat-wire-keycode-space) because this test moves
+ * with libxwcl's decode. */
 #include <xkbcommon/xkbcommon-keysyms.h>
 
 #define K_BKSP 14 /* linux KEY_BACKSPACE */
@@ -646,7 +649,8 @@ static void check_krec(struct xwt_ctx *t, int idx, uint32_t code, bool down,
         return;
     XWT_CHECK(g_krec[idx].code == code,
               "event %d (%s): raw keycode %u, expected %u — a wrong "
-              "number here means the wire keycode is not evdev+8",
+              "number here means the wire keycode is not the raw evdev "
+              "code the client reported",
               idx, what, g_krec[idx].code, code);
     XWT_CHECK(g_krec[idx].sym == sym,
               "event %d (%s): client decoded keysym %#x, expected %#x — "
@@ -751,6 +755,176 @@ static void test_seat_keyboard_matrix(struct xwt_ctx *t) {
                              "(extras = stale/replayed events)",
               g_nkrec);
 
+    xwc_win_destroy(win);
+}
+
+/* --------------------------------------------- raw wire keycode pin */
+/* The matrix above observes the key stream THROUGH libxwcl, which (like
+ * Xwayland, GTK and every real client) decodes at wire+8 — a +8-on-the-
+ * wire bug shifts the compositor's send and libxwcl's decode together
+ * and the matrix cannot see it. That is exactly how the physical
+ * "Backspace types u" survived every in-container suite: every observer
+ * in the repo shared the compositor's convention. This test binds a
+ * SECOND wl_seat/wl_keyboard on the same client connection with a raw
+ * listener and asserts the LITERAL wire keycodes: the raw evdev codes
+ * (14/22/30), no offset. Xwayland and all real clients add 8 on their
+ * side; a compositor that puts evdev+8 on the wire makes every real
+ * client type one row off (Backspace -> 'u') while the whole in-repo
+ * stack keeps passing. */
+struct raw_wire {
+    struct wl_keyboard *kb;
+    uint32_t code;
+    uint32_t state;
+    int n;
+    bool saw_key;
+    uint32_t seat_name;
+    bool seat_found;
+};
+static void rw_keymap(void *data, struct wl_keyboard *kb, uint32_t format,
+                      int32_t fd, uint32_t size) {
+    (void)data;
+    (void)kb;
+    (void)format;
+    (void)size;
+    close(fd); /* the raw pin does not need the keymap contents */
+}
+static void rw_enter(void *data, struct wl_keyboard *kb, uint32_t serial,
+                     struct wl_surface *surface, struct wl_array *keys) {
+    (void)data;
+    (void)kb;
+    (void)serial;
+    (void)surface;
+    (void)keys;
+}
+static void rw_leave(void *data, struct wl_keyboard *kb, uint32_t serial,
+                     struct wl_surface *surface) {
+    (void)data;
+    (void)kb;
+    (void)serial;
+    (void)surface;
+}
+static void rw_key(void *data, struct wl_keyboard *kb, uint32_t serial,
+                   uint32_t time, uint32_t key, uint32_t state) {
+    (void)kb;
+    (void)serial;
+    (void)time;
+    struct raw_wire *r = data;
+    r->code = key;
+    r->state = state;
+    r->n++;
+    r->saw_key = true;
+}
+static void rw_mods(void *data, struct wl_keyboard *kb, uint32_t serial,
+                    uint32_t depressed, uint32_t latched, uint32_t locked,
+                    uint32_t group) {
+    (void)data;
+    (void)kb;
+    (void)serial;
+    (void)depressed;
+    (void)latched;
+    (void)locked;
+    (void)group;
+}
+static void rw_repeat(void *data, struct wl_keyboard *kb, int32_t rate,
+                      int32_t delay) {
+    (void)data;
+    (void)kb;
+    (void)rate;
+    (void)delay;
+}
+static const struct wl_keyboard_listener rw_listener = {
+    .keymap = rw_keymap,
+    .enter = rw_enter,
+    .leave = rw_leave,
+    .key = rw_key,
+    .modifiers = rw_mods,
+    .repeat_info = rw_repeat,
+};
+static void rw_global(void *data, struct wl_registry *r, uint32_t name,
+                      const char *iface, uint32_t version) {
+    (void)r;
+    (void)version;
+    struct raw_wire *rw = data;
+    if (strcmp(iface, "wl_seat") == 0) {
+        rw->seat_name = name;
+        rw->seat_found = true;
+    }
+}
+static void rw_global_remove(void *data, struct wl_registry *r,
+                             uint32_t name) {
+    (void)data;
+    (void)r;
+    (void)name;
+}
+static void test_seat_wire_keycode_space(struct xwt_ctx *t) {
+    /* a focused window first (the standard solid-fill pattern) */
+    static uint32_t color = 0xff226644;
+    struct xwc_callbacks cb = {0};
+    cb.configure = matrix_win_configure;
+    cb.ud = &color;
+    struct xwc_win *win =
+        xwc_win_create(&t->client, &cb, "RawWire", "rawwire", 200, 100);
+    XWT_ASSERT(win);
+    XWT_WAIT(t, t->client.has_focus);
+
+    /* bind a SECOND, raw keyboard on the same connection: fresh
+     * registry, find wl_seat, bind v1, get_keyboard, listen raw */
+    struct raw_wire rw = {0};
+    struct wl_registry *reg = wl_display_get_registry(t->client.display);
+    static const struct wl_registry_listener rgl = {
+        .global = rw_global,
+        .global_remove = rw_global_remove,
+    };
+    wl_registry_add_listener(reg, &rgl, &rw);
+    wl_display_flush(t->client.display);
+    for (int i = 0; i < 200 && !rw.seat_found; i++)
+        xwt_pump(t);
+    XWT_ASSERT(rw.seat_found);
+    struct wl_seat *seat =
+        wl_registry_bind(reg, rw.seat_name, &wl_seat_interface, 1);
+    XWT_ASSERT(seat);
+    rw.kb = wl_seat_get_keyboard(seat);
+    XWT_ASSERT(rw.kb);
+    wl_keyboard_add_listener(rw.kb, &rw_listener, &rw);
+    wl_display_flush(t->client.display);
+    for (int i = 0; i < 10; i++)
+        xwt_pump(t); /* keymap/enter events for the raw binding */
+
+    /* the literal wire bytes for the matrix head: raw evdev codes */
+    xw_compositor_inject_key(t->comp, K_BKSP, true);
+    xwt_pump(t);
+    XWT_CHECK(rw.saw_key && rw.code == K_BKSP,
+              "wire keycode for BackSpace press is %u, expected raw %u — "
+              "an evdev+8 keycode on the wire makes every real client "
+              "type 'u' for Backspace",
+              rw.code, K_BKSP);
+    XWT_CHECK(rw.state == WL_KEYBOARD_KEY_STATE_PRESSED,
+              "first raw event state was not PRESSED");
+    xw_compositor_inject_key(t->comp, K_BKSP, false);
+    xwt_pump(t);
+    XWT_CHECK(rw.code == K_BKSP && rw.state == WL_KEYBOARD_KEY_STATE_RELEASED,
+              "wire keycode for BackSpace release is %u state %u", rw.code,
+              rw.state);
+    xw_compositor_inject_key(t->comp, K_U, true);
+    xwt_pump(t);
+    XWT_CHECK(rw.code == K_U,
+              "wire keycode for U press is %u, expected raw %u — X-space "
+              "(+8) keycodes on the wire",
+              rw.code, K_U);
+    xw_compositor_inject_key(t->comp, K_U, false);
+    xwt_pump(t);
+    xw_compositor_inject_key(t->comp, K_A, true);
+    xwt_pump(t);
+    XWT_CHECK(rw.code == K_A,
+              "wire keycode for A press is %u, expected raw %u", rw.code,
+              K_A);
+    xw_compositor_inject_key(t->comp, K_A, false);
+    xwt_pump(t);
+    XWT_CHECK(rw.n == 6, "raw keyboard saw %d key events, expected 6", rw.n);
+
+    wl_keyboard_release(rw.kb);
+    wl_seat_release(seat);
+    wl_registry_destroy(reg);
     xwc_win_destroy(win);
 }
 
@@ -1097,6 +1271,7 @@ __attribute__((constructor)) static void register_seat(void) {
         {"seat-seatd-disable-autoack", test_seatd_disable_autoack},
         {"seat-vt-switch-keys", test_seat_vt_switch_keys},
         {"seat-keyboard-matrix", test_seat_keyboard_matrix},
+        {"seat-wire-keycode-space", test_seat_wire_keycode_space},
         {"trace-shutdown-observational", test_trace_shutdown_observational},
         {"seat-seatd-switch-session", test_seatd_switch_session},
         {"seat-seatd-server-error", test_seatd_server_error},

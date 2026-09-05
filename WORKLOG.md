@@ -3143,3 +3143,207 @@ procedure. kitty's damage stream is now a NON-issue (this fix), so a
 re-run of ① that USED to show 11 blocks should now show 0 — a quick
 confirmation that the physical box picked up the new build. B needs
 Xwayland installed on the box first.
+
+---
+
+## Round 7 — the wire keycode space and the activation lifetime: two spec-convention bugs, both reproduced headlessly (2026-09-06)
+
+The physical box delivered its second full session log: permutation ①
+(no trace) PASS again — the complete logout chain, ~191ms class; **zero
+pixman BUG blocks** (the Round 6 boundary fix confirmed on the box, 11
+→ 0); XWayland now LIVE on the box (started by the session, WM helper
+up, X11 socket present — the B-leg is unblocked). Two open wounds came
+with it: "the Keyboard is still fucked" and "the web browser still
+crashes". Both fell this round, headlessly, plus one honest
+non-reproduction.
+
+### The read of the physical log
+
+- LibreWolf (pid 7827) was a **direct Wayland client** — not X11: the
+  compositor's client-death line `error in client communication (pid
+  7827)` is libwayland-server's own EPIPE report and it names the
+  browser's pid, not Xwayland's (7526). Firefox ≥121 auto-selects
+  Wayland; the session exports XDG_SESSION_TYPE=wayland. Xwayland is a
+  red herring for the browser crash.
+- Two `[xw-warn] xdg-activation: invalid or used token` lines sit
+  between LibreWolf's startup and its death.
+- The xkbcomp blocks (FK23/FK24 redefined, unresolved
+  XF86ElectronicPrivacyScreen*/ActionOnSelection/Contextual* keysyms,
+  `Unsupported maximum keycode 709, clipping`) are **benign noise**:
+  our (correct, xkbcommon-generated, X-space) keymap compiled by the
+  box's Xwayland against a slightly older keysym table. Documented so
+  it stops alarming anyone.
+
+### Bug 1 — the keyboard: the wire keycode space (the actual "Backspace types u")
+
+`wl_keyboard_send_key(k, serial, time, keycode + 8, ...)` — the seat
+put **evdev+8** on the wire, with a comment codifying the belief
+("wayland/xkbcommon keycodes are evdev + 8"). The truth is split:
+xkbcommon STATE lookups use evdev+8 (the shared keymap's keycode space
+is the classic X space, `<BKSP>=22`) — but the WIRE keycode is the RAW
+evdev code, and every real client (Xwayland, GTK, kitty, Firefox)
+adds the 8 itself before its own lookups. We sent 22 for Backspace;
+clients looked up 30 and typed 'u'. Every key, every app, both stacks
+(X clients see wire+8 → evdev+16).
+
+**Why four rounds of tests never saw it: circular validation.** The
+probe (tests/keyboardprobe.c), libxwcl's kb_key (decoded the wire code
+as X-space and passed `key - 8` to the callback), the in-suite matrix
+and scripts/test-physical-kbd.sh ALL shared the compositor's
+convention — the probe's spot table asserted "wl 22 = BackSpace" and
+its anomaly check literally flagged raw-evdev codes as "raw linux code
+sent un-offset?". Round 3's decision table was therefore poisoned at
+the root: branch (A) — "probe decodes wl 22 -> BackSpace while the app
+shows 'u' — the app/keymap client-side, look at its RMLVO" — was the
+shared-convention blindness talking, not evidence. The probe was never
+"the way a compliant client must decode"; it decoded the way OUR
+compositor encodes. Meanwhile the nested backends' own comments
+("the parent delivers evdev keycodes / Wayland button codes [verbatim]")
+documented the REAL convention all along — including
+xw-backend-nested.c, i.e. running xw nested under sway/weston fed raw
+codes into a +8-sending seat.
+
+**The fix (convention alignment, zero behavior change on the seat's
+internal xkb math):**
+- seat: both `wl_keyboard_send_key` sites send the raw keycode; the
+  xkb_state updates stay at +8 (shortcut engine, modifiers — all
+  unchanged, which is why shortcuts worked while apps typed 'u').
+- trace: `raw=%u wire=%u xk=%u` (raw = what libinput reported, wire =
+  what's on the protocol, xk = the lookup address a compliant client
+  computes); the doc block rewritten around the true contract.
+- libxwcl: decode at wire+8, callback layer gets the raw wire code —
+  the callback VALUES are identical to before (the old code passed
+  `wire - 8` = raw), so the panel, lock passphrase and exit dialog key
+  handling is untouched.
+- keyboardprobe: compliant-client decode (+8), spot table in raw evdev
+  with both shift detectors: wire 14 decoding printable = shifted LOW;
+  wire 22 decoding to BackSpace = an X-space keycode on the wire —
+  "THIS IS the backspace-types-u bug".
+- scripts/test-physical-kbd.sh expectations flipped to the raw matrix
+  (wire 14 = BackSpace, 22 = u, 30 = a).
+
+**The pins (so it can never silently regress):**
+- `seat-wire-keycode-space` (test_seat.c): a SECOND raw wl_seat/
+  wl_keyboard binding on the test client's own connection, asserting
+  the LITERAL wire bytes for injected 14/22/30 — an observer that does
+  NOT move with libxwcl's decode. This is the test that would have
+  caught the bug on day one.
+- `xwm-x11-keys` (test_xwm.c): the X leg through a REAL Xwayland —
+  x11client learned `keys on` (per-(client,window) event masks, the
+  WM's own selections never clobber these) and reports
+  `KEY <code> <keysym> press|release [text=]`; injected raw 14/22/30
+  must arrive as X keycodes 22/30/38 with BackSpace/u/a. The nested-X
+  matrix could never cover this leg.
+
+### Bug 2 — xdg-activation: the token credential died with the token object
+
+Reproduced headlessly first: zenity (GTK4) through the realapps
+harness produced the SAME two `invalid or used token` warnings — one
+per presented window. The spec (staging/xdg-activation) says two
+things our implementation violated:
+
+1. `xdg_activation_token_v1.destroy` is a destructor whose text ends
+   "**The received token stays valid.**" — our token_resource_destroy
+   removed and freed the credential with the resource. GTK4 and
+   Firefox destroy the token object immediately after `done` and call
+   `activate()` later with the bare string → lookup always failed →
+   "invalid or used token" → every real activation (window present,
+   focus handover) rejected, forever.
+2. `set_surface` is "the surface **requesting** the activation. Note,
+   this is different from the surface that will be activated." — our
+   validation gate was `t->surface == s`, i.e. an equality demand
+   between the requester and the target, which is precisely the
+   launcher→app handover shape the protocol exists for.
+
+**The fix (xw-activation.c, restructured):** credential/wrapper split —
+`struct xw_activation_token` (the string, requester pointer (advisory,
+never deref'd), created_ms, link, res_dead flag) stays in
+`comp->activation_tokens` past the object's death;
+`struct token_res` (the wl_resource wrapper) dies with the resource and
+only flips `cred->res_dead`. GC frees dead-resource credentials after a
+60s TTL (live-object entries are never freed under their own handlers —
+bounded by client behavior); `xw_activation_fin` frees everything left
+(SAFE: `wl_display_destroy_clients` at compositor teardown runs BEFORE
+fin, so every wrapper is already dead — ordering pinned in
+xw-compositor.c). Validation: string match, single-use consumption on
+match, the equality gate REMOVED. Rejection stays warning-only (the
+spec gives clients "no way to discover the validity of the token" —
+posting an error would kill well-behaved clients).
+
+Pinned by the new destroy-before-activate leg in
+`foreign-toplevel-activation` (the exact GTK4/Firefox shape), and
+verified against the real thing: zenity's warnings GONE from the
+realapps log, zero rejections in the firefox run below.
+
+### The browser: an honest non-reproduction
+
+firefox-esr 140.14.0 fetched into .apps-root (5 debs — the container's
+system stack already satisfies the closure) and
+`scripts/repro-firefox.sh` written: a REAL Firefox as a native Wayland
+client of a headless xw-session, fresh profile, **its own stderr
+captured separately** (the physical box mixed all output into one TTY
+sink — that is why the death looked silent). Result: alive 40s+,
+window MAPPED, zero client-connection deaths, zero activation
+rejections, and a CLEAN session logout with the browser still attached.
+Then the A/B: the SAME firefox run against the PRE-ROUND build (git
+stash) — **also survives**. Conclusions:
+
+1. The activation bug and the keycode bug, while real, are NOT the
+   physical browser killer (activation rejection is non-fatal; wrong
+   keysyms don't crash Firefox).
+2. The physical crash is not reproducible on the software-rendering
+   path. The environmental delta is the **NVIDIA proprietary EGL
+   stack**: physical Firefox initializes WebRender via client-side EGL
+   on our socket, and NVIDIA's EGL needs wl_drm / linux-dmabuf /
+   egl-stream interfaces the compositor does not implement (the
+   documented dmabuf/GL backlog item — the same class of failure as
+   the box's own `Xwayland glamor: GBM Wayland interfaces not
+   available` line). A segfault in that path can't be caught by
+   Firefox and produces exactly the silent EPIPE we saw.
+
+The physical decision experiment (next round's first input):
+`MOZ_WEBRENDER_SOFTWARE=1 librewolf` (and/or
+`LIBGL_ALWAYS_SOFTWARE=1`), stderr captured separately
+(`librewolf ... 2> ff.log`), plus `dmesg | tail` after a crash (rule
+out the OOM killer — SIGKILL is equally silent). Survives with
+software WR → the fix is linux-dmabuf (backlog), interim workaround =
+the env var; still dies → the ff.log decides.
+
+### Validation
+
+- in-process: 132/132 release (13 skips only when apps-root is absent;
+  with it populated the XWayland legs including the two new pins run),
+  `make asan` PASS (132/132 + test-session 128/128, zero reports).
+- session-trace harness: 21/21. pixman-bug-count: 0.
+- scripts/test-physical-kbd.sh: PASS — the full X->seat->wire chain now
+  reads wire 14 = BackSpace, 22 = u, 30 = a, 16/16 events, 0 anomalies
+  (kbddriver's X-injected matrix decoded by the flipped probe).
+- test-realapps: no failures (wmctrl + x11-utils fetched into
+  apps-root; the fullscreen leg now runs).
+- repro-firefox: PASS on both builds (see above).
+- Build hygiene note (pre-existing): no header dependency tracking —
+  clean `make` / `make asan` remain the guaranteed path; `make asan`'s
+  restore step does not rebuild build/tests/x11client, so run
+  `make build/tests/x11client` after profile switches (the xwm tests
+  gate on its existence and silently skip otherwise).
+- scripts/test-physical-kbd.sh now sources env.sh (runtime libs when a
+  local sysroot provides libinput's dependencies — libmtdev).
+
+### Physical next steps (the Round 7 matrix)
+
+0. Rebuild + install on the box; re-run a no-trace session: the two
+   `xdg-activation: invalid or used token` lines must be GONE.
+1. Keyboard, the literal report: type Backspace / u / a /
+   Shift+Backspace / Ctrl+Backspace in kitty AND in LibreWolf AND in
+   an X11 app (xterm through the now-installed XWayland) — all three
+   stacks must agree. `build/tests/keyboardprobe <socket>` while
+   typing: zero ANOMALY lines, and its keymap spot table reads
+   "wire 14 (KEY_BACKSPACE, xk 22) -> BackSpace".
+2. The browser decision run: `MOZ_WEBRENDER_SOFTWARE=1 librewolf`
+   (+ separate stderr capture + dmesg check) — see the experiment
+   above; the answer routes the next round (linux-dmabuf vs.
+   ff.log-driven triage).
+3. Optional confirmation of the Round 7 keyboard fix shape:
+   `XW_INPUT_TRACE=1 ./build/bin/xw-session 2> trace.log`, type one
+   Backspace in kitty: the trace line must read
+   `key: raw=14 wire=14 xk=22 sym=0xff08 'BackSpace'`.

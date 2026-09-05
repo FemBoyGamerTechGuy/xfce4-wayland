@@ -56,6 +56,21 @@ Persistent task list (mirrors the live development tracker). Status:
 - [~] physical hardware verification of the DRM ioctl paths (manual
       checklist in TESTING.md; CI has no /dev/dri and refuses to fake)
 
+## Phase 7 (Round 7)
+- [x] wire keycode space: wl_keyboard.key carries RAW evdev codes (was
+      evdev+8 — every real client re-adds 8, "Backspace types u");
+      libxwcl decodes at +8, probe + tests flipped, two new pins
+      (seat-wire-keycode-space, xwm-x11-keys through real Xwayland)
+- [x] xdg-activation lifetime: the token STRING outlives the token
+      OBJECT (spec: "the received token stays valid"); set_surface is
+      the REQUESTING surface, never an equality gate; TTL + GC + fin
+      ordering; the GTK4/Firefox destroy-before-activate flow pinned
+- [x] firefox-esr as a real in-container Wayland client
+      (scripts/repro-firefox.sh): 40s+ survival, window mapped, clean
+      logout — on both pre-fix and post-fix builds (the physical
+      browser crash is not the in-container repro; prime suspect is
+      the NVIDIA client-EGL path with no wl_drm/linux-dmabuf)
+
 ## Backlog highlights (tracked in detail in ROADMAP.md)
 - [ ] touch input; per-seat layout switching
 - [ ] DRM refinements: atomic modesetting, live modeset of newly

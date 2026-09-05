@@ -3,8 +3,10 @@
  * Physical-debug instrument for the "Backspace types u" family: this
  * program is a RAW wl_keyboard consumer (no toolkit, no libxwcl) that
  * records the EXACT events the compositor puts on the wire and decodes
- * them the way a compliant client must (its own xkb state built from
- * the delivered keymap + modifiers events).
+ * them the way a compliant client must: the wire keycode is the RAW
+ * evdev code (KEY_BACKSPACE=14, KEY_U=22, KEY_A=30) and the keymap's
+ * keycode space is evdev+8 — so every lookup in this probe (and in
+ * Xwayland, GTK, kitty, Firefox...) happens at keycode + 8.
  *
  * Usage:
  *   keyboardprobe <socket-name> [seconds]
@@ -12,25 +14,30 @@
  *     [seconds]      run duration, default 60; SIGINT ends early
  *
  * What it prints (stdout, line-buffered; tail it live):
- *   keymap:    size + a spot-check keycode->keysym table. If wl 22 does
- *              not decode to BackSpace here, the keymap itself is in
- *              the wrong keycode space — that is the bug, no key
- *              pressing needed.
+ *   keymap:    size + a spot-check keycode->keysym table (at +8).
+ *              If wire 14 does not decode to BackSpace here, the
+ *              keymap itself is in the wrong keycode space — that is
+ *              the bug, no key pressing needed.
  *   enter/leave/modifiers/key/repeat_info: every wire event with its
  *              serial, and for key events the client-side decode
  *              (keysym name + utf8 text) — what a real text app would
  *              "type" for that event.
- *   ANOMALY:   wire-level inconsistencies: keycode < 8, serial not
- *              increasing, key release without a press, enter with
- *              keys already down, or a decode that maps the Backspace
- *              keycode to a printable letter (the literal symptom).
+ *   ANOMALY:   wire-level inconsistencies: serial not increasing, key
+ *              release without a press, enter with keys already down,
+ *              a keycode above the kernel KEY_MAX, or a decode that
+ *              reveals a shifted keycode space in EITHER direction:
+ *              wire 14 decoding to a printable letter (the old +8-on-
+ *              the-wire bug: the compositor sent X-space codes and this
+ *              client re-added 8) or wire 22 decoding to BackSpace
+ *              (X-space keycode on the wire: a compliant client would
+ *              type 'u' for Backspace — the literal symptom).
  *   summary:   event counts + anomaly count.
  *
  * Reading it against XW_INPUT_TRACE=1 on the compositor side: every
- * "key: raw=N wl=M ... delivered ... serial=S" line must match a
- * "wire key" line here (same M and S). If they match and the decode
- * here shows 'u' for Backspace, the compositor is fine and the
- * interpretation is broken; if they do not match, delivery is broken.
+ * "key: raw=N wire=N ... delivered ... serial=S" line must match a
+ * "key: serial=S ... wl=N" line here (same N and S). If they match
+ * and the decode here is right, the app-side interpretation is at
+ * fault; if they do not match, delivery is broken.
  *
  * Build-time linkage: libwayland-client + libxkbcommon.
  */
@@ -199,41 +206,45 @@ static void kb_keymap(void *data, struct wl_keyboard *kb, uint32_t format,
            xkb_keymap_min_keycode(p->keymap),
            xkb_keymap_max_keycode(p->keymap));
 
-    /* spot-check table: wl keycode -> keysym name. These are the
-     * physical keys of the report matrix; if the right-hand column is
-     * shifted by one row (22 -> 'u' instead of BackSpace), the keymap
-     * is in a raw/evdev keycode space instead of evdev+8 — that single
-     * line is the root cause of "Backspace types u". */
+    /* spot-check table: the compliant-client decode of a wire keycode
+     * is lookup(wire + 8) in the shared keymap. The left column is the
+     * RAW evdev code the compositor must put on the wire; the right
+     * column is what a text app would "type". If the compositor were
+     * still sending X-space keycodes on the wire (the old +8 bug),
+     * every left-column entry here decodes one row off — e.g. wire 22
+     * (which this probe looks up at 30) would come back 'u' — which is
+     * precisely the "Backspace types u" symptom on real compositors'
+     * clients. */
     static const struct {
-        uint32_t code;
+        uint32_t code; /* RAW evdev code as it must appear on the wire */
         const char *wl_name;
         const char *expect;
     } spot[] = {
-        {22, "22 (raw 14, KEY_BACKSPACE)", "BackSpace"},
-        {23, "23 (raw 15, KEY_TAB)", "Tab"},
-        {24, "24 (raw 16, KEY_Q)", "q"},
-        {30, "30 (raw 22, KEY_U)", "u"},
-        {36, "36 (raw 28, KEY_ENTER)", "Return"},
-        {38, "38 (raw 30, KEY_A)", "a"},
-        {37, "37 (raw 29, KEY_LEFTCTRL)", "Control_L"},
-        {50, "50 (raw 42, KEY_LEFTSHIFT)", "Shift_L"},
-        {67, "67 (raw 59, KEY_F1)", "F1"},
+        {14, "14 (KEY_BACKSPACE, xk 22)", "BackSpace"},
+        {15, "15 (KEY_TAB, xk 23)", "Tab"},
+        {16, "16 (KEY_Q, xk 24)", "q"},
+        {22, "22 (KEY_U, xk 30)", "u"},
+        {28, "28 (KEY_ENTER, xk 36)", "Return"},
+        {30, "30 (KEY_A, xk 38)", "a"},
+        {29, "29 (KEY_LEFTCTRL, xk 37)", "Control_L"},
+        {42, "42 (KEY_LEFTSHIFT, xk 50)", "Shift_L"},
+        {59, "59 (KEY_F1, xk 67)", "F1"},
     };
     for (size_t i = 0; i < sizeof(spot) / sizeof(spot[0]); i++) {
         xkb_keysym_t sym =
-            xkb_state_key_get_one_sym(p->state, spot[i].code);
+            xkb_state_key_get_one_sym(p->state, spot[i].code + 8);
         char name[64] = "(none)";
         if (sym != XKB_KEY_NoSymbol)
             xkb_keysym_get_name(sym, name, sizeof(name));
         const char *mark = strcmp(name, spot[i].expect) == 0
                                ? ""
                                : "   <-- MISMATCH (keymap space?)";
-        printf("keymap: wl %s -> %-12s (expected %s)%s\n", spot[i].wl_name,
+        printf("keymap: wire %s -> %-12s (expected %s)%s\n", spot[i].wl_name,
                name, spot[i].expect, mark);
         if (mark[0])
-            anomaly(p, "keymap spot-check: wl keycode %u decodes to %s, "
-                       "expected %s — keycode-space mismatch",
-                    spot[i].code, name, spot[i].expect);
+            anomaly(p, "keymap spot-check: wire keycode %u (+8=%u) decodes "
+                       "to %s, expected %s — keycode-space mismatch",
+                    spot[i].code, spot[i].code + 8, name, spot[i].expect);
     }
     fflush(stdout);
 }
@@ -290,14 +301,12 @@ static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
     const char *st =
         state == WL_KEYBOARD_KEY_STATE_PRESSED ? "press" : "release";
     if (key >= 512) {
-        anomaly(p, "wl keycode %u out of range", key);
+        anomaly(p, "wl keycode %u out of range (kernel KEY_MAX is 0x2ff)",
+                key);
         printf("key: serial=%u time=%u wl=%u %s (OUT OF RANGE)\n", serial,
                time, key, st);
         return;
     }
-    if (key < 8)
-        anomaly(p, "wl keycode %u < 8 (raw linux code sent un-offset?)",
-                key);
     if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
         if (p->pressed[key])
             anomaly(p, "press of wl %u while already down (double "
@@ -311,29 +320,40 @@ static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
     }
 
     /* the compliant-client decode: this is exactly what a text
-     * application computes from the wire stream */
+     * application computes from the wire stream — the wire keycode is
+     * raw evdev, the keymap lookup address is keycode + 8 */
     char symname[64] = "(?)";
     char text[16] = "";
     if (p->state) {
-        xkb_state_update_key(p->state, key,
+        xkb_state_update_key(p->state, key + 8,
                              state == WL_KEYBOARD_KEY_STATE_PRESSED
                                  ? XKB_KEY_DOWN
                                  : XKB_KEY_UP);
-        xkb_keysym_t sym = xkb_state_key_get_one_sym(p->state, key);
+        xkb_keysym_t sym = xkb_state_key_get_one_sym(p->state, key + 8);
         if (sym != XKB_KEY_NoSymbol)
             xkb_keysym_get_name(sym, symname, sizeof(symname));
-        ssize_t n = xkb_state_key_get_utf8(p->state, key, text,
+        ssize_t n = xkb_state_key_get_utf8(p->state, key + 8, text,
                                            sizeof(text));
         if (n < 0)
             n = 0;
         text[n] = 0;
-        /* the literal symptom: the BackSpace keycode decoding to a
-         * printable letter */
-        if (key == 22 && sym >= 0x20 && sym < 0x7f)
-            anomaly(p, "wl keycode 22 (BackSpace physical key) decoded "
-                       "to printable '%s' — this IS the "
-                       "backspace-types-a-letter bug",
+        /* shifted-space detectors, both directions:
+         *  - wire 14 is KEY_BACKSPACE; if its decode is a printable
+         *    letter, the compositor is sending keycodes BELOW the
+         *    evdev space (double -8);
+         *  - wire 22 is KEY_U; if it decodes to BackSpace, the
+         *    compositor put an X-space keycode on the wire (the +8
+         *    bug) — a real client would then type 'u' for Backspace,
+         *    the literal symptom this probe was built to catch. */
+        if (key == 14 && sym >= 0x20 && sym < 0x7f)
+            anomaly(p, "wire keycode 14 (KEY_BACKSPACE) decoded to "
+                       "printable '%s' — keycode space shifted LOW",
                     symname);
+        if (key == 22 && sym == XKB_KEY_BackSpace)
+            anomaly(p, "wire keycode 22 (KEY_U) decoded to BackSpace — "
+                       "an X-space (evdev+8) keycode was put on the wire: "
+                       "every real client re-adds 8 and types 'u' for "
+                       "Backspace. THIS IS the backspace-types-u bug");
     }
     printf("key: serial=%u time=%u wl=%u %s -> client decodes: keysym "
            "%s text='%s'\n",

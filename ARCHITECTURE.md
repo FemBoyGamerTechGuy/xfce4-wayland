@@ -129,7 +129,13 @@ therefore own the following responsibilities directly:
   test API; nested backends forward real parent events: evdev keycodes
   and Wayland button codes verbatim; a libinput backend is a roadmap
   item), then processed by a real xkbcommon state machine before
-  dispatch.
+  dispatch. The wire contract: `wl_keyboard.key` carries the RAW evdev
+  keycode — xkbcommon lookups happen at evdev+8 (the shared keymap's
+  classic X keycode space), and every real client (Xwayland, GTK,
+  kitty, Firefox) adds the 8 itself; putting it on the wire shifts
+  every key one row for every real app while in-repo observers built
+  on the same convention keep passing (see Round 7 in WORKLOG.md and
+  the `seat-wire-keycode-space` / `xwm-x11-keys` pins).
 
 Owning these is more work, but it is the point of the exercise: an XFCE
 experience on an architecture we fully understand and control.

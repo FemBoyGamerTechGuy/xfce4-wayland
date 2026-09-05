@@ -520,6 +520,30 @@ static void test_foreign_toplevel_and_activation(struct xwt_ctx *t) {
     XWT_CHECK(t->comp->wm->focused == wa,
               "replayed token is rejected (focus stays on Alpha)");
 
+    /* the GTK4/Firefox flow (the physical LibreWolf + zenity bug): the
+     * token OBJECT is destroyed immediately after done — spec: "the
+     * received token stays valid" — and activate() arrives later with
+     * the bare string. The old implementation deleted the credential
+     * with the resource and rejected every such activation with
+     * "invalid or used token". */
+    struct xdg_activation_token_v1 *tk2 =
+        xdg_activation_v1_get_activation_token(st.act);
+    XWT_ASSERT(tk2);
+    xdg_activation_token_v1_add_listener(tk2, &token_listener, &st);
+    xdg_activation_token_v1_commit(tk2);
+    xwc_sync(&t->client);
+    XWT_CHECK(st.token_done && st.token[0], "second token issued");
+    xdg_activation_token_v1_destroy(tk2); /* object dies BEFORE activate */
+    xwc_sync(&t->client);
+    xwt_pump(t);
+    xdg_activation_v1_activate(st.act, st.token,
+                               (struct wl_surface *)xwc_win_surface(b));
+    xwc_sync(&t->client);
+    xwt_pump(t);
+    XWT_CHECK(t->comp->wm->focused == wb,
+              "destroyed-object token still activates Beta (spec: the "
+              "received token stays valid after destroy)");
+
     /* cleanup: destroy the handle proxies while the objects are still
      * alive server-side, then stop the manager (its resources die with
      * it — a later destroy request would be a protocol error) */

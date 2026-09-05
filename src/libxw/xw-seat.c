@@ -841,13 +841,15 @@ static bool seat_vt_switch_key(struct xw_seat *s, uint32_t keycode,
  * printed at xw_seat_key entry (after the xkb state update, before any
  * consumption decision). Fields, in the order a physical bug hunt reads
  * them: the RAW linux keycode the seat was called with (what libinput
- * reported), the xkb/wl keycode that goes on the wire (+8), the keysym
- * a compliant client computes for that keycode under the CURRENT
- * modifier state, the state, the four modifier masks, and the keyboard
- * focus (surface + client pid). The outcome line (delivered serial /
- * consumed-by) is printed by the branches below — together they answer
- * "wrong event from the compositor, or wrong interpretation in the
- * client" without guessing. */
+ * reported — and EXACTLY what goes on the wire: the wl_keyboard.key
+ * protocol keycode is the raw evdev code, NOT evdev+8), the xkb keycode
+ * (raw + 8 — the address at which a compliant client looks the key up
+ * in the shared keymap), the keysym a compliant client therefore
+ * computes under the CURRENT modifier state, the state, the four
+ * modifier masks, and the keyboard focus (surface + client pid). The
+ * outcome line (delivered serial / consumed-by) is printed by the
+ * branches below — together they answer "wrong event from the
+ * compositor, or wrong interpretation in the client" without guessing. */
 static void trace_key_event(struct xw_seat *s, uint32_t keycode, bool down) {
     if (!input_trace_enabled())
         return;
@@ -867,9 +869,10 @@ static void trace_key_event(struct xw_seat *s, uint32_t keycode, bool down) {
                                ? wl_resource_get_client(s->kb_focus->res)
                                : NULL;
     xw_input_trace(
-        "key: raw=%u wl=%u sym=%#x '%s' %s mods=[d=%u l=%u k=%u g=%u] "
+        "key: raw=%u wire=%u xk=%u sym=%#x '%s' %s mods=[d=%u l=%u k=%u g=%u] "
         "focus=%s %s",
-        keycode, keycode + 8, (unsigned)sym, kbuf, down ? "press" : "release",
+        keycode, keycode, keycode + 8, (unsigned)sym, kbuf,
+        down ? "press" : "release",
         dep, lat, loc, grp, surface_desc(s->kb_focus, fbuf, sizeof(fbuf)),
         client_desc(cl, cbuf, sizeof(cbuf)));
 }
@@ -878,8 +881,12 @@ void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
     if (!s->xkb_state)
         return;
 
-    /* wayland/xkbcommon keycodes are evdev + 8; the injection API and
-     * the wm use raw linux keycodes */
+    /* xkbcommon consults the shared keymap at evdev + 8 (the keymap's
+     * keycode space is the classic X space, e.g. <BKSP>=22); the WIRE
+     * keycode is the RAW evdev code — Xwayland, GTK, kitty and every
+     * other real client adds 8 itself before its own keymap lookups,
+     * so sending +8 on the wire shifts every key by one row for every
+     * real app (the "Backspace types u" bug) */
     xkb_state_update_key(s->xkb_state, keycode + 8,
                          down ? XKB_KEY_DOWN : XKB_KEY_UP);
     trace_key_event(s, keycode, down);
@@ -915,13 +922,13 @@ void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
         wl_list_for_each(k, &s->keyboards, link) {
             if (wl_resource_get_client(k) == cl) {
                 uint32_t serial = ++s->serial;
-                wl_keyboard_send_key(k, serial, time, keycode + 8,
+                wl_keyboard_send_key(k, serial, time, keycode,
                                      down ? WL_KEYBOARD_KEY_STATE_PRESSED
                                           : WL_KEYBOARD_KEY_STATE_RELEASED);
                 char cbuf[32];
-                xw_input_trace("key: raw=%u delivered=lock wl=%u serial=%u "
+                xw_input_trace("key: raw=%u delivered=lock wire=%u serial=%u "
                                "-> %s",
-                               keycode, keycode + 8, serial,
+                               keycode, keycode, serial,
                                client_desc(cl, cbuf, sizeof(cbuf)));
             }
         }
@@ -970,7 +977,8 @@ void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
     if (!down && s->repeat_active && keycode == s->repeat_key)
         disarm_interactive_repeat(s);
 
-    /* 3. deliver to the focused client (evdev + 8) */
+    /* 3. deliver to the focused client (raw evdev keycode on the wire;
+     *    clients add 8 themselves against the shared keymap) */
     if (!s->kb_focus || wl_list_empty(&s->keyboards)) {
         xw_input_trace("key: raw=%u dropped (no keyboard focus — nothing "
                        "is focused or no wl_keyboard bound)",
@@ -982,12 +990,12 @@ void xw_seat_key(struct xw_seat *s, uint32_t keycode, bool down) {
     wl_list_for_each(k, &s->keyboards, link) {
         if (wl_resource_get_client(k) == cl) {
             uint32_t serial = ++s->serial;
-            wl_keyboard_send_key(k, serial, time, keycode + 8,
+            wl_keyboard_send_key(k, serial, time, keycode,
                                  down ? WL_KEYBOARD_KEY_STATE_PRESSED
                                       : WL_KEYBOARD_KEY_STATE_RELEASED);
             char cbuf[32];
-            xw_input_trace("key: raw=%u delivered wl=%u serial=%u -> %s",
-                           keycode, keycode + 8, serial,
+            xw_input_trace("key: raw=%u delivered wire=%u serial=%u -> %s",
+                           keycode, keycode, serial,
                            client_desc(cl, cbuf, sizeof(cbuf)));
         }
     }

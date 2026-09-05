@@ -585,6 +585,91 @@ static void test_xwm_focus_routing(struct xwt_ctx *t) {
     stack_down(t, &s);
 }
 
+/* ------------------------------------------------ x11 key routing */
+/* The X side of the wire-keycode-space contract: injected RAW evdev
+ * keycodes must reach the X11 client as X keycodes (evdev + 8) with
+ * the matching keysyms — the full path seat -> wl wire (RAW evdev) ->
+ * Xwayland (+8) -> X KeyPress. A +8-on-the-wire bug shifts every key
+ * one row off here too (BackSpace becomes 'u'), exactly like it does
+ * for native clients; this is the leg the nested-X matrix could never
+ * cover. */
+static void test_xwm_x11_keys(struct xwt_ctx *t) {
+    if (!s_apps_ok) {
+        XWT_SKIP("apps-root not populated (XWayland tests)");
+        return;
+    }
+    struct xw_stack s;
+    XWT_ASSERT(stack_up(t, &s));
+    struct xw_proc a;
+    XWT_ASSERT(client_spawn(&a, t, s.display, "200x150"));
+    XWT_ASSERT(client_wait(t, &a, "MAPPED", 400));
+    struct xw_window *wa = NULL;
+    for (int i = 0; i < 300 && !wa; i++) {
+        wa = win_by_title(t, "Probe Initial");
+        xwt_pump(t);
+        usleep(5 * 1000);
+    }
+    XWT_ASSERT(wa);
+    XWT_WAIT(t, t->comp->wm->focused == wa);
+    proc_cmd(&a, "keys on\n");
+    XWT_ASSERT(wait_log(t, a.logpath, "KEYS-ON", 200));
+
+    /* the report matrix as RAW evdev codes: KEY_BACKSPACE=14, KEY_U=22,
+     * KEY_A=30 — the compositor must put these on the wl wire as-is;
+     * Xwayland adds 8, so the X client must see 22/30/38 */
+    static const struct {
+        uint32_t raw;
+        unsigned xkey;
+        const char *keysym;
+    } matrix[] = {
+        {14, 22, "BackSpace"},
+        {22, 30, "u"},
+        {30, 38, "a"},
+    };
+    for (size_t k = 0; k < sizeof(matrix) / sizeof(matrix[0]); k++) {
+        xw_compositor_inject_key(t->comp, matrix[k].raw, true);
+        xwt_pump(t);
+        xw_compositor_inject_key(t->comp, matrix[k].raw, false);
+        xwt_pump(t);
+    }
+
+    /* wait for the last release to appear, then assert every line */
+    const char *want = "KEY 38 a release";
+    for (int i = 0; i < 400; i++) {
+        char wbuf[4096];
+        if (log_read(a.logpath, wbuf, sizeof(wbuf)) && strstr(wbuf, want))
+            break;
+        xwt_pump(t);
+        usleep(10 * 1000);
+    }
+    char buf[8192];
+    XWT_ASSERT(log_read(a.logpath, buf, sizeof(buf)));
+    int n_lines = 0;
+    for (const char *p = strstr(buf, "KEY "); p; p = strstr(p + 1, "KEY "))
+        n_lines++;
+    XWT_CHECK(n_lines == 6, "X client saw %d KEY events, expected 6",
+              n_lines);
+    for (size_t k = 0; k < sizeof(matrix) / sizeof(matrix[0]); k++) {
+        for (int press = 0; press < 2; press++) {
+            char line[64];
+            snprintf(line, sizeof(line), "KEY %u %s %s", matrix[k].xkey,
+                     matrix[k].keysym, press ? "press" : "release");
+            XWT_CHECK(strstr(buf, line) != NULL,
+                      "missing X key event '%s' — the X keycode must be "
+                      "the raw evdev code + 8 (a +8 wire bug shifts it to "
+                      "30/38/46 and BackSpace types 'u')",
+                      line);
+        }
+    }
+
+    proc_cmd(&a, "exit\n");
+    usleep(150 * 1000);
+    for (int i = 0; i < 100; i++)
+        xwt_pump(t);
+    proc_close(&a);
+    stack_down(t, &s);
+}
+
 static void test_xwm_override_redirect(struct xwt_ctx *t) {
     if (!s_apps_ok) {
         XWT_SKIP("apps-root not populated (XWayland tests)");
@@ -1398,6 +1483,7 @@ static const struct xwt_test tests[] = {
     {"xwm-identity", test_xwm_identity},
     {"xwm-title-change", test_xwm_title_change},
     {"xwm-focus-routing", test_xwm_focus_routing},
+    {"xwm-x11-keys", test_xwm_x11_keys},
     {"xwm-focus-protocol", test_xwm_focus_protocol},
     {"xwm-override-redirect", test_xwm_override_redirect},
     {"xwm-close-delete", test_xwm_close_delete},
