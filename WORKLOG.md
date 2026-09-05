@@ -3426,3 +3426,18 @@ keyboard was already fixed (Round 5); this round was the browser.
 - Pull + rebuild + retest LibreWolf: menus, URL bar autocomplete,
   tooltips, right-click + Escape — the interaction battery above.
   The previously-reported crash should be gone.
+
+---
+
+## Round 8 addendum — the f86ea88 push (2026-09-06)
+
+Pushed to origin/main (7b06cd3..f86ea88) for the physical box: the
+repro-script commit plus the subsurface fix, rebased clean on top of
+the remote keyboard round (only WORKLOG.md conflicted — two parallel
+"Round 7" narratives; the keyboard round kept Round 7, the subsurface
+round became Round 8). The .upstream checkouts carry pure file-mode
+noise (0644→0755, zero content lines) — not pushed, not load-bearing.
+Next: pull, rebuild, run the 16-step LibreWolf interaction battery
+(right-click + outside-dismiss + right-click again + Escape is the
+deterministic killer; add tooltips, URL-bar autocomplete, drag
+selection).
