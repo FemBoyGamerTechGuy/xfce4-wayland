@@ -160,7 +160,17 @@ static const struct wl_subsurface_interface subsurface_impl = {
     .set_desync = sub_set_desync,
 };
 
-/* role teardown for the child surface: unrole + damage + list removal */
+/* role teardown for the child surface: unrole + damage + list removal.
+ *
+ * OWNERSHIP RULE (learned the hard way, 2026-09-06): the wl_subsurface
+ * OBJECT is CLIENT-OWNED — only the client's wl_subsurface.destroy
+ * request may retire its id. Teardowns triggered by wl_surface
+ * destruction (either side of the pair) must DETACH the association
+ * and unrole the child, but leave the wl_subsurface resource alive
+ * and inert (user_data nulled below). Reference compositors behave
+ * the same way, and real toolkits (Firefox/GTK menu + tooltip
+ * teardown) destroy the surfaces first and the subsurface objects
+ * later, from a later widget-dispose cycle. */
 static void subsurface_destroy(struct xw_subsurface *sub) {
     if (!sub)
         return;
@@ -312,15 +322,20 @@ void xw_subsurface_parent_committed(struct xw_surface *parent) {
 }
 
 void xw_subsurface_parent_destroyed(struct xw_surface *parent) {
-    /* destroy every child's subsurface role; the wl_surface objects
-     * themselves stay alive (client-owned) but lose their role */
+    /* Detach every child's subsurface role: the wl_surface objects
+     * stay alive (client-owned) and lose their role. The wl_subsurface
+     * objects stay alive too — destroying them here (the old
+     * "the client's object is defunct" wl_resource_destroy) sent
+     * delete_id for an object the client still held; the client's
+     * later wl_subsurface.destroy then failed demarshal with
+     * "invalid object", the server posted a fatal protocol error, and
+     * libwayland killed the whole client (the physical
+     * "browser dies on interaction" crash: Firefox parent down, every
+     * child printing "Exiting due to channel error", the compositor
+     * logging "error in client communication"). */
     struct xw_subsurface *sub, *tmp;
-    wl_list_for_each_safe(sub, tmp, &parent->subsurfaces, parent_link) {
-        struct wl_resource *res = sub->res;
+    wl_list_for_each_safe(sub, tmp, &parent->subsurfaces, parent_link)
         subsurface_destroy(sub);
-        if (res)
-            wl_resource_destroy(res); /* the client's object is defunct */
-    }
 }
 
 /* ------------------------------------------------ surface role dispatch */
@@ -352,13 +367,13 @@ void xw_subsurface_role_commit(struct xw_surface *s) {
 
 /* called from xw-surface.c: a SUBSURFACE-role surface is destroyed */
 void xw_subsurface_role_destroy(struct xw_surface *s) {
+    /* the child surface died: detach the association, but the
+     * wl_subsurface object stays client-owned (see the ownership
+     * rule above subsurface_destroy) */
     struct xw_subsurface *sub = sub_of(s);
     if (!sub)
         return;
-    struct wl_resource *res = sub->res;
     subsurface_destroy(sub);
-    if (res)
-        wl_resource_destroy(res);
 }
 
 /* called from xw-surface.c: position query */

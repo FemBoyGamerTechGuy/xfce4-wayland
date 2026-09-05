@@ -3347,3 +3347,82 @@ the env var; still dies → the ff.log decides.
    `XW_INPUT_TRACE=1 ./build/bin/xw-session 2> trace.log`, type one
    Backspace in kitty: the trace line must read
    `key: raw=14 wire=14 xk=22 sym=0xff08 'BackSpace'`.
+
+---
+
+## Round 8 — the LibreWolf interaction-crash root cause: the unilateral wl_subsurface destroy (2026-09-06)
+
+Physical report: "browser opens, renders, dies the moment I interact
+with anything"; browser stderr 6x "Exiting due to channel error.",
+session trace 3x "error in client communication (pid ...)". The
+keyboard was already fixed (Round 5); this round was the browser.
+
+### Rig work (scripts/repro-browser-crash.sh)
+
+- The 7-step battery from the last session never exercised the
+  popup/subsurface paths, so it was vacuously green. Extended to 16
+  steps: link hover (set_cursor + tooltip popup), link navigation,
+  right-click context menu (xdg_popup + grab), outside-press
+  dismissal, Escape dismissal, hamburger-menu cycle, URL-bar
+  autocomplete (popup + reposition), drag selection, ctrl+a/ctrl+c
+  (set_selection).
+- Backend detection fixed: the old stat-inode compare could never
+  match (client fds carry their own endpoint inode); now ss-based
+  (firefox shows as "wayland (direct)").
+- New legs: --wl (client trace; Firefox's libwayland ignores
+  WAYLAND_DEBUG), --wlsrv (server-side wire trace — the one that
+  worked), --a11y (session dbus + at-spi, which also silences
+  Firefox's org.a11y.Bus autolaunch warning).
+- Fixed a bash trap: an EMPTY array prefix before an assignment
+  prefix (DISPLAY=...) makes bash re-parse the assignment as a
+  command name at execution time ("DISPLAY=:96: command not
+  found"). The prefix is now always `env` / `env WAYLAND_DEBUG=1`.
+
+### Reproduction and root cause
+
+- Deterministic repro: right-click context menu, dismiss with
+  outside click, right-click again, Escape -> Firefox parent dies
+  (SIGSEGV, 7 children "Exiting due to channel error.", compositor
+  "error in client communication (pid N)") — the exact physical
+  signature. GFX1: "Wayland protocol error: wl_display#1: error 0:
+  invalid object 47".
+- The --wlsrv wire trace: wl_surface#40.destroy() (the dismissed
+  menu's surface, PARENT of wl_subsurface#47) made our compositor
+  unilaterally wl_resource_destroy the wl_subsurface#47 resource ->
+  delete_id(47) for an object the client still owns. Firefox's
+  widget dispose later sends wl_subsurface#47.destroy(); the request
+  fails demarshal server-side ("invalid object", untraceable — the
+  print happens only after successful demarshal), the server posts
+  the fatal protocol error, libwayland kills the client.
+- spec check (wayland.xml): wl_subsurface.destroy is a CLIENT
+  request ("remove sub-surface interface"); wl_surface.destroy
+  "deletes the surface and invalidates ITS object ID" — neither
+  grants the server a unilateral wl_subsurface retirement. The
+  pre-fix comment ("the client's object is defunct") was simply
+  wrong: Firefox/GTK finalize subsurface objects after the surfaces,
+  from a later dispose cycle. Legal client behavior.
+
+### Fix
+
+- src/libxw/xw-subcompositor.c: xw_subsurface_parent_destroyed() and
+  xw_subsurface_role_destroy() now only DETACH (damage + unrole +
+  unlink + null the resource user_data) — the wl_subsurface object
+  stays alive and inert until the client destroys it; every request
+  on a detached object is a no-op via the existing NULL-user_data
+  guards. The OWNERSHIP RULE is documented above
+  subsurface_destroy().
+
+### Validation
+
+- 16/16 steps survive in all three legs (plain / --wlsrv / --a11y),
+  0 "error in client communication" lines.
+- wire proof post-fix: wl_subsurface#47.destroy() arrives 1.1s AFTER
+  the popup teardown and is accepted cleanly (pre-fix: death); the
+  second menu repeats the pattern clean.
+- make check: test-session 128/128, build-regressions 51/51.
+
+### Physical next steps
+
+- Pull + rebuild + retest LibreWolf: menus, URL bar autocomplete,
+  tooltips, right-click + Escape — the interaction battery above.
+  The previously-reported crash should be gone.
