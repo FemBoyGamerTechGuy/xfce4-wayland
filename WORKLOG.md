@@ -2723,3 +2723,25 @@ where libXtst is absent: x11probe is now auto-gated on XTest
 availability (kbddriver covers the same key matrix with plain
 libX11). Backlog unchanged: X11 clipboard bridge, EWMH workspace
 mirroring, X-side activation channel.
+
+Push addendum (2026-09-06): 854d49e pushed to origin/main clean
+(f49614f..854d49e) with a fresh one-shot PAT via
+scripts/git-askpass-env.sh — nothing persisted to disk or config,
+verified no ~/.git-credentials. Remote head confirmed at 854d49e.
+
+**Next — the physical NVIDIA decision run** (this container is done;
+every headless layer is pinned): build and run on the physical box
+with `XW_INPUT_TRACE=1 XW_GEOMETRY_TRACE=1` (stderr), and
+`build/tests/keyboardprobe <socket> [seconds]` while typing
+Backspace / u / a / Shift+Backspace / Ctrl+Backspace in both a probe
+window and the reporting app. Decision table: (A) probe decodes wl 22
+-> BackSpace while the app shows 'u' — the app/keymap client-side,
+look at its RMLVO/xkb config; probe shows wl 30 or anomalies — capture
+the trace lines, the compositor input chain is implicated; no events
+reach the probe — focus/delivery, XW_INPUT_TRACE's per-outcome lines
+decide. (B) confirm the CSD fix with real apps (title bar -> MOVE
+cursor + drag, edges/corners -> resize, client area inert) on both
+stacks. (C) with the model rect == output rect and the gap still on
+screen, the XW_GEOMETRY_TRACE output-setup line (mode/CRTC/FB/pitch/
+layout/scale) is the one place left to look — one-sided gap with a
+zero-pitch/stride mismatch points at the scanout FB pitch leg.
